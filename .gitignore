@@ -1,0 +1,68 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+.coverage
+htmlcov/
+
+# ===== Node.js (MCP servers, tooling) =====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+
+# ===== Secrets & credentials =====
+# Broad on purpose: this project has a real history of credential exposure
+# incidents during interactive development. Nothing matching these patterns
+# should ever be committed, even temporarily.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*
+*secrets*
+*.pfx
+kubeconfig
+*.kubeconfig
+azure-pipelines-secrets.yml
+
+# ===== Infrastructure as Code state =====
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# ===== Local dev artifacts =====
+# Report Rendering's local output during development, before wiring to
+# Azure Blob Storage — matches singleSlide_demo's own convention of never
+# committing generated report artifacts.
+*.pptx
+*.pdf
+local_output/
+
+# ===== Docker =====
+*.log
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
