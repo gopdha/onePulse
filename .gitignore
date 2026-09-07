@@ -54,6 +54,11 @@ azure-pipelines-secrets.yml
 *.pdf
 local_output/
 
+# Full-fidelity per-run pipeline logs (Task 32) — one real log file per
+# Generate action (logs/<project>_<timestamp>.log), a per-run artifact,
+# not code.
+logs/
+
 # ===== Docker =====
 *.log
 

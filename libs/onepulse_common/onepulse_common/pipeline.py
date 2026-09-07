@@ -283,6 +283,7 @@ SYNTHESIS_INSTRUCTIONS = """You are a Narrative Synthesis agent for OnePulse (FR
 You will be given a JSON list of real, already-investigated findings for a program.
 Merge and curate them into a single, coherent executive summary paragraph (3-5 sentences) suitable for a status report read by a Program Lead.
 Do not invent findings beyond what you are given. Do not state or imply an overall RAG status yourself — the overall status is computed separately by a fixed, deterministic rule (FR-8), never by you.
+For every finding whose status is "Blocked" or "Needs Human Review", you MUST cite its real work item ID directly in the text wherever you reference it — e.g. "(WI 362)" or "work item 362". Describing or paraphrasing the item is not sufficient on its own; the literal numeric ID must appear next to it, every time, for every such item.
 Respond only with JSON matching the required schema."""
 
 SELF_CRITIQUE_INSTRUCTIONS = """You are a Self-critique agent for OnePulse (FR-4).
@@ -524,14 +525,31 @@ async def run_quality_gate(
                 "represented in findings — coverage is incomplete."
             )
         dropped = [
-            f["title"]
+            f
             for f in findings
             if f["status"] in ("Blocked", "Needs Human Review")
             and str(f["work_item_id"]) not in initial_draft
             and f["title"] not in initial_draft
         ]
         if dropped:
-            feedback_parts.append(f"You dropped critical item(s) that must be mentioned: {dropped}.")
+            # Real, specific fix (found from two consecutive real
+            # hard_stop_defect runs against Agentic AI Observability
+            # Platform): the base SYNTHESIS_INSTRUCTIONS ID-citation rule
+            # alone wasn't reliable across revisions either — both the
+            # initial AND revised draft paraphrased these items in prose
+            # without ever writing the literal ID, satisfying neither of
+            # code_enforced_risk_floor_check's two accepted forms (exact
+            # title text or the ID). Naming the exact real ID next to each
+            # dropped title here, at the moment the violation is detected,
+            # reinforces the same rule with the specific real data needed
+            # to fix it, rather than relying on the static system prompt
+            # alone to be followed a second time under revision pressure.
+            cited = "; ".join(f"WI {f['work_item_id']} ({f['title']})" for f in dropped)
+            feedback_parts.append(
+                f"You dropped critical item(s) that must be mentioned, AND you must cite each one's real "
+                f"work item ID directly in the text (e.g. \"(WI {dropped[0]['work_item_id']})\") — describing "
+                f"it without the literal ID does not count: {cited}."
+            )
     if not subjective_ok_before:
         feedback_parts.append(critique_before["feedback"])
 

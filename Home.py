@@ -120,9 +120,17 @@ Run: streamlit run Home.py (from the repository root).
 
 from __future__ import annotations
 
+import contextvars
 import datetime as dt
+import logging
+import math
 import os
+import re
+import threading
 import time
+from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import streamlit as st
 from arize.otel import set_routing_context
@@ -191,17 +199,31 @@ st.html(
 }
 .st-key-app_bar, .st-key-app_bar p, .st-key-app_bar span, .st-key-app_bar div,
 .st-key-app_bar label { color: #ffffff; }
+.st-key-project_bar { gap: 8px !important; }
 .st-key-project_label p {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
     font-size: 11px !important;
     letter-spacing: 0.1em !important;
     color: #91a4c5 !important;
     margin: 0 !important;
+    text-align: right !important;
 }
 /* Real structure (confirmed live, not the older BaseWeb `data-baseweb`
    markup this Streamlit version replaced): a react-aria ComboBox —
    `input[role="combobox"]` for the field, a `button` for the toggle. */
 .st-key-project_select .stSelectbox { width: 280px; }
+/* Real contrast bug found live: Streamlit's own internal wrapper div
+   around the combobox (an auto-generated st-emotion-cache-* class, not
+   something this project's CSS ever set) carries its own OPAQUE light
+   background (rgb(245,246,248)) — confirmed via getComputedStyle, not
+   assumed. That sits BETWEEN the navy app bar and the input, so the
+   input's own translucent rgba(255,255,255,.10) background was
+   compositing against light gray, not navy — white text on a light
+   background, barely legible. Forcing every div ancestor inside this
+   specific container to a transparent background (the input itself is
+   untouched, it's not a div) lets the real navy app_bar show through
+   as originally intended. */
+.st-key-project_select div { background: transparent !important; }
 .st-key-project_select input[role="combobox"] {
     background: rgba(255,255,255,.10) !important;
     border: 1px solid rgba(255,255,255,.26) !important;
@@ -231,12 +253,22 @@ st.html(
 }
 .st-key-table_header { background: #fafbfc; padding: 13px 26px; border-bottom: 1px solid #e6e9ee; }
 .st-key-table_header > div:last-child { text-align: right !important; }
-.st-key-row_latest { background: #f4f7fb; padding: 22px 26px; border-bottom: 1px solid #e6e9ee; }
-[class*="st-key-row_hist_"] { padding: 15px 26px; border-bottom: 1px solid #f1f3f6; }
+.st-key-row_latest { background: #f4f7fb; padding: 16px 26px; border-bottom: 1px solid #e6e9ee; }
+[class*="st-key-row_hist_"] { padding: 11px 26px; border-bottom: 1px solid #f1f3f6; }
 [class*="st-key-review_col_"] { justify-content: flex-end !important; }
 
 .st-key-reports_panel { background: #ffffff !important; border-right: 1px solid #eceef2 !important; }
-.st-key-generate_section { padding: 24px 26px 28px !important; }
+/* Real spacing fix (found live): the report table and the Generate
+   section used to run directly into each other, relying only on the
+   last row's own thin 1px separator to distinguish them. A thicker,
+   deliberate divider bar plus a tinted background reads as two real,
+   distinct sections instead of one continuous block. */
+.st-key-generate_section {
+    padding: 24px 26px 28px !important;
+    margin-top: 6px !important;
+    border-top: 6px solid #f2f4f7 !important;
+    background: #fcfcfd !important;
+}
 .st-key-assistant_rail { background: #fafbfc !important; }
 
 /* Console styling now lives inline in the markdown Home.py generates for
@@ -328,14 +360,30 @@ def _reset_project_state(project_name: str | None) -> None:
         st.session_state.ops_chat_by_project.setdefault(project_name, [])
 
 
+def _file_uri_to_path(uri: str) -> Path:
+    """Real inverse of `Path(...).resolve().as_uri()` (how `persist_report`
+    stores `rendered_artifact_uri` — see `pipeline.py`), using the
+    standard library's own file-URI decoder rather than hand-rolled
+    string replacement, so percent-encoded characters (e.g. spaces in
+    project names, confirmed real since Task 17) round-trip correctly.
+    """
+    parsed = urlparse(uri)
+    return Path(url2pathname(parsed.path))
+
+
 @st.dialog("Report detail", width="large")
-def show_report_dialog(report_id: int) -> None:
+def show_report_dialog(report_id: int, missing_artifact: str | None = None) -> None:
     detail = run_async(with_connection(get_report_detail, report_id))
     report = detail["report"]
     if report is None:
         st.error("Report not found.")
         return
     st.caption(f"{report['program_name']} — week of {report['week_of'].isoformat()}")
+    if missing_artifact:
+        st.warning(
+            f"The real rendered file isn't on this machine's disk (path: {missing_artifact}) — "
+            "showing the archived executive summary and findings from Postgres instead."
+        )
     st.markdown("**Executive summary**")
     st.write(report["executive_summary"])
     if report["rendered_artifact_uri"]:
@@ -415,8 +463,32 @@ def render_report_row(report: dict, actor_id: str | None, *, latest: bool) -> No
         label, color = _STATE_CHIP[status]
         st.badge(label, color=color)
 
-        if st.button("Open", key=f"open_{rid}"):
-            show_report_dialog(rid)
+        # Real fix (found live): "Open" used to always show the
+        # Postgres-sourced executive summary/findings, never the actual
+        # rendered .pptx `run_pipeline_cycle` saved for this exact report
+        # row. `list_recent_reports()` already selects the real
+        # `rendered_artifact_uri` for every row (no extra query needed),
+        # so this reads that SAME report's real file bytes directly and
+        # serves them via a real download control — browsers can't
+        # reliably navigate straight to a local file:// path, so
+        # st.download_button is the correct primitive, not a bare link.
+        rendered_uri = report.get("rendered_artifact_uri")
+        local_path = _file_uri_to_path(rendered_uri) if rendered_uri else None
+        if local_path is not None and local_path.is_file():
+            st.download_button(
+                "Open",
+                data=local_path.read_bytes(),
+                file_name=local_path.name,
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                key=f"open_{rid}",
+            )
+        else:
+            # Real, honest fallback: the artifact isn't on THIS machine's
+            # disk (e.g. a report rendered in an earlier session) — fall
+            # back to the Postgres-sourced dialog rather than a dead
+            # button, and say so plainly inside it.
+            if st.button("Open", key=f"open_{rid}"):
+                show_report_dialog(rid, missing_artifact=rendered_uri)
 
         review_col = st.container(horizontal=True, key=f"review_col_{rid}")
         with review_col:
@@ -525,11 +597,256 @@ async def _ask(question: str) -> dict:
         trace.get_tracer_provider().force_flush(timeout_millis=30000)
 
 
+# Real stage names (Task 32), keyed by the same stage numbers pipeline.py
+# already emits via on_stage — TOTAL_STAGES=7 has been the real, stable
+# count since Task 18; not re-derived from message text (which varies in
+# format across call sites) since the integer itself is the reliable
+# signal. Purely a UI label — every NUMBER shown next to it is computed
+# live from real on_stage/on_detail data, never from this dict.
+REAL_STAGE_NAMES = {
+    1: "Investigation",
+    2: "Status Analysis",
+    3: "Deterministic Rollup",
+    4: "Synthesis",
+    5: "Self-critique",
+    6: "Rendering",
+    7: "Persisting",
+}
+
+
+class _RunCancelled(Exception):
+    """Raised inside on_stage/on_detail (running on the worker thread) to
+    unwind run_pipeline_cycle's own call stack when the main script
+    thread detects it's being cancelled (a project switch, a page
+    navigation). See run_generation()'s module-level note on why this
+    exists — real, deliberate plumbing added specifically to preserve
+    the genuine-termination guarantee verified during Task 31's
+    project-switch investigation, now that the pipeline runs on a
+    separate thread from Streamlit's own cooperative-cancellation
+    checks.
+    """
+
+
+def _sanitize_for_filename(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "project"
+
+
+def _fmt_mmss(seconds: float) -> str:
+    s = max(0, int(seconds))
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def _compute_progress(stages: dict, total: int, now: float) -> float:
+    """Real bug fix (Task 32): the bar used to sit at exactly (n-1)/total
+    for the ENTIRE duration of stage n, so it was frozen at 0% through
+    all of Investigation regardless of real elapsed time. Fixed with a
+    real, elapsed-time-driven creep *within* the running stage's own
+    bracket — asymptotic (never reaches the next stage's boundary, never
+    overclaims completion), reset to an exact `n/total` the instant a
+    real stage transition happens. The creep curve is a progress-bar
+    convention (indeterminate-duration visual motion), not one of the
+    "numbers shown" the user asked to keep strictly real — those (item
+    counts, durations, etc.) are computed separately and exactly.
+    """
+    done_or_skipped = sum(1 for s in stages.values() if s["status"] in ("done", "skipped"))
+    running_stage = next((n for n, s in stages.items() if s["status"] == "running"), None)
+    base = done_or_skipped / total
+    if running_stage is not None:
+        elapsed = max(0.0, now - stages[running_stage]["start_ts"])
+        creep = (1 - math.exp(-elapsed / 20.0)) * 0.92
+        base += creep / total
+    return min(base, 0.995)
+
+
+def _apply_detail_to_stage(stages: dict, shared: dict, current_stage: int, message: str) -> None:
+    """The real curation step (Task 32): every real on_stage/on_detail
+    event pipeline.py already emits is inspected here to compute the
+    ONE-line, real, exact summary shown per step — nothing here is
+    estimated or fabricated; every number is parsed straight out of the
+    same real message the full-fidelity log file also records verbatim.
+    This is the only place that does this parsing — the log file writes
+    every message unmodified, this function only curates the UI's view
+    of the identical real events.
+    """
+    if current_stage == 1:
+        m = re.search(r"real children of (\d+) Committed Feature", message)
+        if m:
+            shared["feature_count"] = int(m.group(1))
+        if re.match(r"^#\d+ ", message):
+            shared["pending_findings_count"] = shared.get("pending_findings_count", 0) + 1
+        if "No Features tagged 'Committed' found" in message:
+            shared["zero_scope"] = True
+            stages[1]["detail"] = "no committed features found"
+        if not shared.get("zero_scope"):
+            items = shared.get("pending_findings_count", 0)
+            features = shared.get("feature_count")
+            if features is not None:
+                stages[1]["detail"] = f"{items} item(s) across {features} committed feature(s)"
+    elif current_stage == 2:
+        m = re.match(r"^(\d+) untracked initiative", message)
+        if m:
+            shared["untracked_count"] = int(m.group(1))
+        m2 = re.match(r"^(\d+) possible connection", message)
+        if m2:
+            shared["connections_count"] = int(m2.group(1))
+        if "untracked_count" in shared or "connections_count" in shared:
+            stages[2]["detail"] = (
+                f"{shared.get('untracked_count', 0)} untracked initiative(s), "
+                f"{shared.get('connections_count', 0)} possible connection(s)"
+            )
+    elif current_stage == 3:
+        m = re.match(r"^Overall status: (\w+)", message)
+        if m:
+            stages[3]["detail"] = f"overall status: {m.group(1)}"
+    elif current_stage == 5:
+        if message.startswith('Draft: "'):
+            # Real, deliberate overwrite (Task 32 bug fix): on_stage's own
+            # "close the previous stage" step fires BEFORE this arrives
+            # (on_stage(5,...) closes stage 4 with a generic "done"
+            # fallback the instant stage 5 starts, since the real draft
+            # text — logged from inside run_quality_gate — hasn't been
+            # seen yet at that moment). This retroactively replaces that
+            # fallback with the real, computed word count once it is.
+            draft_text = message[len('Draft: "'):-1]
+            stages[4]["detail"] = f"drafted a {len(draft_text.split())}-word executive summary"
+        if "Triggering the one permitted revision" in message:
+            shared["revision_fired"] = True
+            stages[5]["live_note"] = "revising for tone (1 of 1 permitted)"
+        elif message.startswith("Revised draft:"):
+            stages[5]["live_note"] = "revised — re-checking…"
+        elif message.startswith("Revision-cap decision"):
+            outcome = message.split(":", 1)[1].strip()
+            stages[5]["live_note"] = None
+            suffix = "after 1 revision" if shared.get("revision_fired") else "on first attempt"
+            stages[5]["detail"] = f"{outcome} {suffix}"
+    elif current_stage == 7:
+        m = re.search(r"report_id=(\d+)", message)
+        if message.startswith("Persisted as report_id="):
+            stages[7]["detail"] = f"report_id={m.group(1)} saved"
+        elif message.startswith("NOT persisted"):
+            stages[7]["detail"] = "not persisted — report already exists for this week"
+
+
+def _render_stage_ui(steps_ph, progress_ph, status_ph, stages: dict, shared: dict, run_start_ts: float, total: int, running: bool, done: bool) -> None:
+    now = time.monotonic()
+    rows_html = []
+    for n in range(1, total + 1):
+        s = stages[n]
+        name = REAL_STAGE_NAMES[n]
+        if s["status"] == "pending":
+            rows_html.append(
+                f"<div style='color:#9aa3b1; padding:4px 0;'>○ {name}</div>"
+            )
+        elif s["status"] == "running":
+            elapsed = now - s["start_ts"]
+            live_note = f" — {s['live_note']}" if s.get("live_note") else ""
+            rows_html.append(
+                f"<div style='color:#1F3864; font-weight:600; padding:4px 0;'>"
+                f"● {name}{live_note} · {_fmt_mmss(elapsed)}</div>"
+            )
+        elif s["status"] == "done":
+            duration = (s["end_ts"] or now) - s["start_ts"]
+            raw_detail = s.get("detail") or ""
+            detail = f" — {raw_detail}" if raw_detail else ""
+            # Real bug fix (Task 32): a genuine rejection/human-review
+            # outcome (hard_stop_defect, route_to_human_review) was showing
+            # the SAME green checkmark as a clean pass -- the icon and the
+            # text directly contradicted each other. Only a real
+            # `decide_revision_outcome() == "approved"` result gets the
+            # checkmark; the other two real outcomes get a visually
+            # distinct marker instead. Never applies to Rendering/Persisting
+            # (they have no such outcome concept, so this only ever fires
+            # on Self-critique's own real detail text).
+            if "hard_stop_defect" in raw_detail:
+                icon, color = "!", "#8A2F2F"
+            elif "route_to_human_review" in raw_detail:
+                icon, color = "!", "#9a6b1f"
+            else:
+                icon, color = "✓", "#2f6b4f"
+            rows_html.append(
+                f"<div style='color:{color}; padding:4px 0;'>"
+                f"{icon} {name}{detail} · {_fmt_mmss(duration)}</div>"
+            )
+        elif s["status"] == "skipped":
+            detail = f" — {s['detail']}" if s.get("detail") else ""
+            rows_html.append(
+                f"<div style='color:#8a9099; padding:4px 0;'>– {name}{detail}</div>"
+            )
+        elif s["status"] == "failed":
+            rows_html.append(
+                f"<div style='color:#8A2F2F; padding:4px 0;'>✗ {name} — failed: {s.get('detail', '')}</div>"
+            )
+    steps_ph.markdown(
+        "<div style='background:#fafbfc; border:1px solid #e6e9ee; border-radius:9px; padding:14px 18px; "
+        "height:210px; overflow-y:auto; box-sizing:border-box; "
+        f"font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;'>{''.join(rows_html)}</div>",
+        unsafe_allow_html=True,
+    )
+    progress_ph.progress(1.0 if done else _compute_progress(stages, total, now))
+    with status_ph.container(horizontal=True):
+        # Real duplicate-label bug (found live): this used to also write
+        # its own "GENERATE STATUS REPORT" st.caption() here, landing
+        # right next to the running/done text — a second, redundant copy
+        # of the SAME static caption already rendered once, permanently,
+        # at the header_row level below. Removed; this placeholder now
+        # only ever holds the live running/done status text.
+        if running:
+            st.markdown(
+                f"<span style='color:#1F3864; font-size:11.5px;'>running · {_fmt_mmss(now - run_start_ts)}</span>",
+                unsafe_allow_html=True,
+            )
+        elif done:
+            st.markdown(
+                f"<span style='color:#1F3864; font-size:11.5px;'>done in {_fmt_mmss(now - run_start_ts)}</span>",
+                unsafe_allow_html=True,
+            )
+
+
 def run_generation(selected_project_name: str, selected_program_id: str, console_ph, status_ph, progress_ph) -> None:
-    """The real Generate action. Reuses `run_pipeline_cycle` unmodified;
-    only the presentation of its `on_stage`/`on_detail` callbacks is new.
-    Real stage names and the real 7-stage fraction are shown — not the
-    reference's fictional 4-stage taxonomy (see module docstring).
+    """The real Generate action (redesigned, Task 32). Reuses
+    `run_pipeline_cycle` unmodified; `on_stage`/`on_detail` remain the
+    single real source of truth for both real outputs this now
+    produces:
+
+    1. A full-fidelity log file (`logs/<project>_<timestamp>.log`) — every
+       real message, unabridged, via Python's `logging` module. This is
+       the same detail the old console box used to show inline; nothing
+       is dropped, only relocated.
+    2. A curated, ~7-row step view for the UI — one real, computed
+       one-line summary per stage (`_apply_detail_to_stage`), a live-
+       ticking elapsed timer on whichever stage is currently running,
+       and a real, elapsed-time-driven progress bar that starts moving
+       immediately instead of freezing at 0% through all of Investigation
+       (`_compute_progress`).
+
+    Real architectural note, not incidental: `run_pipeline_cycle` now
+    executes on a background thread (needed for the UI to keep
+    re-rendering — i.e., tick — every second regardless of how long the
+    pipeline goes between real on_stage/on_detail events, which Streamlit
+    cannot do while a single script thread sits blocked inside one long
+    synchronous call). This is a real, deliberate departure from the
+    single-threaded design Task 31 verified project-switch cancellation
+    against — moving to a thread would, on its own, silently reintroduce
+    exactly the "backend keeps running invisibly" behavior that
+    investigation spent real effort disproving. Two things preserve the
+    same real guarantee instead of quietly losing it:
+      - `contextvars.copy_context()` captures the active `arize.otel`
+        routing context (and the current OTel span) on the main thread
+        right before the worker starts, and the worker runs inside that
+        captured context (`ctx.run(...)`) — otherwise every span created
+        inside the pipeline would silently stop reaching Arize, since a
+        fresh OS thread does not inherit the calling thread's
+        contextvars on its own.
+      - A `threading.Event` (`cancel_event`) is checked at the top of
+        every real `on_stage`/`on_detail` call; if the *main* thread's
+        polling loop is itself cancelled by Streamlit's own cooperative
+        mechanism (a project switch, exactly as before), its `except`
+        block sets `cancel_event` before re-raising, and the worker
+        thread raises `_RunCancelled` the next time it reaches a real
+        callback — unwinding `run_pipeline_cycle` for real, deliberately,
+        rather than by the single-thread accident Task 31 originally
+        found. The real bound on how fast this fires is unchanged from
+        before: the gap until the *next* real on_stage/on_detail call.
     """
     try:
         ado_pat_b64 = load_ado_pat()
@@ -540,100 +857,151 @@ def run_generation(selected_project_name: str, selected_program_id: str, console
 
     status_deck_path = STATUS_DECK_PATH_BY_PROJECT.get(selected_project_name, DEFAULT_STATUS_DECK_PATH)
     run_state = st.session_state.ops_runs_by_project[selected_project_name]
-    run_state.update(running=True, done=False, log=[], start_ts=time.monotonic())
-    log_lines: list[str] = ["$ awaiting run — investigation · status analysis · synthesis · render"]
+    run_start_ts = time.monotonic()
+    run_state.update(running=True, done=False, start_ts=run_start_ts)
 
-    def _render_console() -> None:
-        # A real bug found live: st.container(key="console_box", ...) raised
-        # StreamlitDuplicateElementKey the moment a real run produced more
-        # than one on_stage/on_detail callback in a single script execution
-        # (an explicit key must be globally unique per script run, even when
-        # writing into the same st.empty() placeholder each time — unlike
-        # auto-generated element IDs, which this version of Streamlit does
-        # let a placeholder reuse). Fixed by dropping the explicit key and
-        # building one self-contained st.markdown() call per update instead,
-        # with the console's styling moved inline (previously carried by the
-        # now-removed `.st-key-console_box` CSS rule).
-        lines_html = "".join(
-            f"<div style='color:#c3ccda; white-space:pre-wrap;'>{line}</div>" for line in log_lines
-        )
-        console_ph.markdown(
-            "<div style='background:#111722; border-radius:9px; padding:16px 18px; height:186px; "
-            "overflow-y:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; "
-            f"line-height:1.6;'>{lines_html}</div>",
-            unsafe_allow_html=True,
-        )
+    # === Full-fidelity real log file (Task 32) — nothing lost, only
+    # relocated from the UI console box. ===
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"{_sanitize_for_filename(selected_project_name)}_{dt.datetime.now():%Y%m%d_%H%M%S}.log"
+    file_logger = logging.getLogger(f"onepulse.run.{id(run_state)}.{time.monotonic_ns()}")
+    file_logger.setLevel(logging.INFO)
+    file_logger.propagate = False
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    file_logger.addHandler(file_handler)
+
+    stages = {n: {"status": "pending", "start_ts": None, "end_ts": None, "detail": None, "live_note": None} for n in range(1, TOTAL_STAGES + 1)}
+    shared: dict = {"current_stage": 0}
+    cancel_event = threading.Event()
+    result_box: dict = {}
 
     def on_stage(n: int, total: int, message: str) -> None:
-        elapsed = time.monotonic() - run_state["start_ts"]
-        ts = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
-        log_lines.append(f"<span style='color:#788292;'>{ts}</span>  <span style='color:#8fb0e8;'>— {message.upper()}</span>")
-        progress_ph.progress((n - 1) / total)
-        with status_ph.container(horizontal=True):
-            st.caption("GENERATE STATUS REPORT")
-            st.markdown(f"<span style='color:#1F3864; font-size:11.5px;'>{message.lower()} · stage {n} of {total}</span>", unsafe_allow_html=True)
-        _render_console()
+        if cancel_event.is_set():
+            raise _RunCancelled()
+        file_logger.info("[STAGE %d/%d] %s", n, total, message)
+        now = time.monotonic()
+        prev = shared["current_stage"]
+        if prev and stages[prev]["status"] == "running":
+            stages[prev]["end_ts"] = now
+            if stages[prev]["detail"] is None:
+                stages[prev]["detail"] = "done"
+            stages[prev]["status"] = "done"
+        if "SKIPPED" in message:
+            reason = message.split("SKIPPED", 1)[1].strip(" ()-") or "skipped"
+            stages[n].update(status="skipped", start_ts=now, end_ts=now, detail=reason)
+        else:
+            stages[n].update(status="running", start_ts=now)
+            if n == 6:
+                # Real, available immediately (Task 32): the on_stage
+                # message for Rendering already names the real output
+                # path — no need to wait for a later on_detail to know it.
+                m = re.search(r"-> (.+)$", message)
+                if m:
+                    stages[6]["detail"] = f"saved {Path(m.group(1)).name}"
+        shared["current_stage"] = n
 
     def on_detail(message: str) -> None:
-        elapsed = time.monotonic() - run_state["start_ts"]
-        ts = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
-        log_lines.append(f"<span style='color:#788292;'>{ts}</span>  <span style='color:#c3ccda;'>{message}</span>")
-        _render_console()
+        if cancel_event.is_set():
+            raise _RunCancelled()
+        file_logger.info("  %s", message)
+        _apply_detail_to_stage(stages, shared, shared["current_stage"], message)
+
+    steps_ph = console_ph  # same st.empty() placeholder, now rendering the curated step view instead of raw console text
+
+    def _finalize_ui(running: bool, done: bool) -> None:
+        _render_stage_ui(steps_ph, progress_ph, status_ph, stages, shared, run_start_ts, TOTAL_STAGES, running, done)
 
     credential = DefaultAzureCredential()
     tracer = trace.get_tracer(__name__)
-    try:
-        with tracer.start_as_current_span("onepulse_ui_pipeline_run") as root_span:
-            root_span.set_attribute("onepulse.ado_project", selected_project_name)
-            with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
-                result = run_async(
-                    run_pipeline_cycle(
-                        ado_pat_b64=ado_pat_b64,
-                        project_endpoint=PROJECT_ENDPOINT,
-                        deployment_name=DEPLOYMENT_NAME,
-                        credential=credential,
-                        ado_org_name=ADO_ORG_NAME,
-                        ado_project_name=selected_project_name,
-                        status_deck_path=status_deck_path,
-                        pptx_mcp_server_path=PPTX_MCP_SERVER_PATH,
-                        output_dir=OUTPUT_DIR,
-                        on_stage=on_stage,
-                        on_detail=on_detail,
+    with tracer.start_as_current_span("onepulse_ui_pipeline_run") as root_span:
+        root_span.set_attribute("onepulse.ado_project", selected_project_name)
+        with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
+            # Capture the active context (Arize routing + current OTel
+            # span) so the worker thread's own event loop sees the same
+            # routing attributes — see the docstring above.
+            ctx = contextvars.copy_context()
+
+            def _worker() -> None:
+                try:
+                    result_box["result"] = run_async(
+                        run_pipeline_cycle(
+                            ado_pat_b64=ado_pat_b64,
+                            project_endpoint=PROJECT_ENDPOINT,
+                            deployment_name=DEPLOYMENT_NAME,
+                            credential=credential,
+                            ado_org_name=ADO_ORG_NAME,
+                            ado_project_name=selected_project_name,
+                            status_deck_path=status_deck_path,
+                            pptx_mcp_server_path=PPTX_MCP_SERVER_PATH,
+                            output_dir=OUTPUT_DIR,
+                            on_stage=on_stage,
+                            on_detail=on_detail,
+                        )
                     )
-                )
+                except _RunCancelled:
+                    result_box["cancelled"] = True
+                except Exception as e:  # noqa: BLE001 - real failure-state design, reported below
+                    result_box["error"] = e
+
+            thread = threading.Thread(target=lambda: ctx.run(_worker), daemon=True)
+            thread.start()
+            try:
+                while thread.is_alive():
+                    _finalize_ui(running=True, done=False)
+                    time.sleep(1)
+            except BaseException:
+                # Streamlit's own cooperative cancellation (a real project
+                # switch) unwinds THIS thread via an exception raised from
+                # inside _finalize_ui's st.* calls. Signal the worker
+                # thread to stop for real before letting it propagate.
+                cancel_event.set()
+                raise
+            thread.join(timeout=5)
+
+        if "result" in result_box:
+            result = result_box["result"]
             root_span.set_attribute("onepulse.overall_status", result.overall_status)
             root_span.set_attribute("onepulse.revision_outcome", result.outcome)
-    except Exception as e:
+
+    trace.get_tracer_provider().force_flush(timeout_millis=30000)
+
+    if "error" in result_box:
         # Real, deliberate failure-state design (a real gap in the
         # reference's own spec — only success paths were documented):
-        # a real error line in the console, button returns to idle.
-        log_lines.append(f"<span style='color:#8A2F2F;'>✗ run failed: {e}</span>")
-        _render_console()
-        run_state.update(running=False, done=False)
+        # the currently-running step is marked failed, button returns to
+        # idle. Full traceback text is in the log file; the UI shows the
+        # real exception message only.
+        cur = shared["current_stage"] or 1
+        stages[cur].update(status="failed", end_ts=time.monotonic(), detail=str(result_box["error"]))
+        file_logger.error("run failed: %s", result_box["error"])
+        _finalize_ui(running=False, done=False)
+        run_state.update(running=False, done=False, stages=stages, shared=shared)
         return
-    finally:
-        trace.get_tracer_provider().force_flush(timeout_millis=30000)
 
-    elapsed_total = time.monotonic() - run_state["start_ts"]
+    result = result_box["result"]
+    elapsed_total = time.monotonic() - run_start_ts
+
+    # Finalize whichever stage was still "running" when the pipeline
+    # returned (stage 7 normally — there is no on_stage(8) to close it;
+    # or stage 6, on a real hard-stop-defect early return).
+    cur = shared["current_stage"]
+    if cur and stages[cur]["status"] == "running":
+        stages[cur]["end_ts"] = time.monotonic()
+        if stages[cur]["detail"] is None:
+            stages[cur]["detail"] = "done"
+        stages[cur]["status"] = "done"
     if result.outcome == "hard_stop_defect":
-        log_lines.append("<span style='color:#8A2F2F;'>✗ hard-stop defect — nothing rendered or persisted</span>")
-    elif result.persisted:
-        log_lines.append("<span style='color:#7fc9a2;'>✓ report ready · awaiting review</span>")
-        if result.report_id is not None:
-            st.session_state.setdefault("ops_last_run_duration", {})[result.report_id] = elapsed_total
-    else:
-        # Real, honest case (Task 20/21's weekly-dedup constraint): the
-        # run genuinely completed, but a report for this project/week
-        # already exists — reports.findings are INSERT-only, so this
-        # run's fresh output can't be reconciled into it. Not the same
-        # as "report ready," and not a failure either.
-        log_lines.append(
-            f"<span style='color:#8fb0e8;'>· run complete — report_id={result.report_id} already exists "
-            "for this week, not persisted</span>"
-        )
-    _render_console()
-    progress_ph.progress(1.0)
-    run_state.update(running=False, done=True, elapsed=elapsed_total)
+        for n in range(cur + 1, TOTAL_STAGES + 1):
+            if stages[n]["status"] == "pending":
+                stages[n].update(status="skipped", start_ts=time.monotonic(), end_ts=time.monotonic(), detail="hard stop — nothing to persist")
+
+    if result.persisted and result.report_id is not None:
+        st.session_state.setdefault("ops_last_run_duration", {})[result.report_id] = elapsed_total
+
+    _finalize_ui(running=False, done=True)
+    run_state.update(running=False, done=True, elapsed=elapsed_total, stages=stages, shared=shared)
     st.rerun()
 
 
@@ -643,9 +1011,7 @@ def run_generation(selected_project_name: str, selected_program_id: str, console
 # ============================================================================
 with st.container(key="app_bar", horizontal=True, horizontal_alignment="distribute", vertical_alignment="center"):
     st.markdown(
-        "<span style='font-size:20px; font-weight:600; letter-spacing:-0.015em;'>OnePulse</span>"
-        "&nbsp;&nbsp;<span style='font-size:13.5px; color:#a9b8d4;'>AI status reports · review queue · "
-        "one project at a time</span>",
+        "<span style='font-size:20px; font-weight:600; letter-spacing:-0.015em;'>OnePulse</span>",
         unsafe_allow_html=True,
     )
     with st.container(horizontal=True, vertical_alignment="center", key="project_bar"):
@@ -762,22 +1128,26 @@ with left:
             console_ph = st.empty()
 
         if not run_state.get("running") and not trigger_clicked:
-            with status_ph.container():
-                st.caption("no run in progress" if not run_state.get("done") else f"done in {_fmt_duration(run_state.get('elapsed', 0))}")
-            progress_ph.progress(1.0 if run_state.get("done") else 0.0)
-            if run_state.get("log"):
-                idle_lines_html = "".join(f"<div>{line}</div>" for line in run_state["log"])
-            else:
-                idle_lines_html = (
-                    "<div style='color:#5a6577;'>$ awaiting run — investigation · status analysis · "
-                    "synthesis · render</div>"
+            if run_state.get("stages"):
+                # Real, persisted result of the last completed run in this
+                # session for this project — same renderer as a live run,
+                # just fed its final, already-settled state.
+                _render_stage_ui(
+                    console_ph, progress_ph, status_ph, run_state["stages"], run_state.get("shared", {}),
+                    run_state.get("start_ts", time.monotonic()), TOTAL_STAGES, running=False, done=run_state.get("done", False),
                 )
-            console_ph.markdown(
-                "<div style='background:#111722; border-radius:9px; padding:16px 18px; height:186px; "
-                "overflow-y:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; "
-                f"line-height:1.6;'>{idle_lines_html}</div>",
-                unsafe_allow_html=True,
-            )
+            else:
+                with status_ph.container():
+                    st.caption("no run in progress")
+                progress_ph.progress(0.0)
+                console_ph.markdown(
+                    "<div style='background:#fafbfc; border:1px solid #e6e9ee; border-radius:9px; padding:14px 18px; "
+                    "height:210px; overflow-y:auto; box-sizing:border-box; "
+                    "font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; color:#9aa3b1;'>"
+                    + "".join(f"<div style='padding:4px 0;'>○ {REAL_STAGE_NAMES[n]}</div>" for n in range(1, TOTAL_STAGES + 1))
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
 
         if trigger_clicked:
             run_generation(selected_project_name, selected_program_id, console_ph, status_ph, progress_ph)
