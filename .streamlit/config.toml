@@ -1,0 +1,44 @@
+# OnePulse UI theme — reuses the exact real visual identity already
+# established in the rendered decks (onepulse_common/report_rendering.py:
+# _NAVY = RGBColor(0x1F, 0x38, 0x64), Arial, and the same RAG status
+# colors), so the UI feels like the same product as the generated
+# reports, not a disconnected internal tool. "sans-serif" (Streamlit's
+# built-in generic font, not a Google Font) is the honest web equivalent
+# of Arial — Arial itself isn't licensed for web font hosting, and
+# report_rendering.py's own docstring already notes no separate brand
+# asset exists beyond this plain navy-accent identity.
+
+[theme]
+base = "light"
+primaryColor = "#1F3864"
+# Task 26: tightened to the design-handoff README's exact Design Tokens
+# (page bg / ink / radius) per explicit user decision — was #FFFFFF/
+# #262626/8px, a deliberate near-equivalent chosen in Task 19/23. Card
+# surfaces (bordered containers) are forced back to real white via
+# scoped CSS in Home.py, since this page bg is now off-white, not white.
+backgroundColor = "#f6f6f4"
+secondaryBackgroundColor = "#F5F6F8"
+textColor = "#17191d"
+font = "sans-serif"
+headingFont = "sans-serif"
+linkColor = "#1F3864"
+borderColor = "#D9DCE3"
+
+# Real RAG status colors, copied from report_rendering.py's _STATUS_COLORS
+# so a "Red"/"Amber"/"Green" badge in the UI matches the rendered slide.
+redColor = "#C00000"
+orangeColor = "#ED7D31"
+greenColor = "#548235"
+grayColor = "#808080"
+
+# README's Design Tokens spec 3-4px (controls/cards) — 4px is the
+# closest single global value; scoped CSS tightens buttons to 3px.
+baseRadius = "4px"
+showWidgetBorder = true
+
+[client]
+# Hides the hamburger menu/toolbar entirely once no options remain —
+# the real, current config key for this (confirmed via
+# `streamlit config show`); there is no separate "footer" key in this
+# Streamlit version to hide alongside it.
+toolbarMode = "minimal"

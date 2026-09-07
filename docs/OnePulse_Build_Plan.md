@@ -30,11 +30,13 @@ itself.
   not deferred — NFR-2 is explicitly Now-scope, not an enhancement to
   add later.
 
-- Prerequisites before Phase 1: a Neon project, a Foundry resource with
-  Claude Sonnet 5 deployed, an Azure AI Content Safety resource, and a
-  real Azure DevOps organization to investigate against — the same
-  category of real infrastructure every prior component in this whole
-  project has been held to.
+- Prerequisites before Phase 1: three Azure Database for PostgreSQL
+  Flexible Server instances, one per environment (Physical Architecture
+  Section 4, DevOps Setup Section 4), a Foundry resource with Claude
+  Sonnet 5 deployed, an Azure AI Content Safety resource, and a real
+  Azure DevOps organization to investigate against — the same category
+  of real infrastructure every prior component in this whole project has
+  been held to.
 
   
 
@@ -43,8 +45,8 @@ itself.
 |                                                       |                                                                                                             |                                                                                                                                                                                                                                                                            |
 |-------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **Phase**                                             | **Implements**                                                                                              | **Definition of Done**                                                                                                                                                                                                                                                     |
-| 1\. Repo & Shared Foundation                          | Repo scaffold; shared config loading; Managed Identity-based Postgres and Foundry client setup (NFR-2)      | A shared library that authenticates to both Neon and Foundry using Managed Identity, with zero static credentials anywhere in the codebase — verified by grep, not assumed.                                                                                                |
-| 2\. Schema & Migration Tooling                        | Full schema from Low-Level Design Section 1; migrate.py and verify_migration.py (NFR-9)                     | Every table exists in a real Neon database, and verify_migration.py independently confirms it via information_schema — not just a clean migration exit code.                                                                                                               |
+| 1\. Repo & Shared Foundation                          | Repo scaffold; shared config loading; Managed Identity-based Postgres and Foundry client setup (NFR-2)      | A shared library that authenticates to both Azure Database for PostgreSQL Flexible Server and Foundry using Managed Identity (Entra ID), with zero static credentials anywhere in the codebase — verified by grep, not assumed.                                                                                                |
+| 2\. Schema & Migration Tooling                        | Full schema from Low-Level Design Section 1; migrate.py and verify_migration.py (NFR-9)                     | Every table exists in a real Azure Database for PostgreSQL Flexible Server instance, and verify_migration.py independently confirms it via information_schema — not just a clean migration exit code.                                                                                                               |
 | 3\. Work Item Investigation & Status Update Analysis  | FR-1, FR-2; least-privilege tool scoping (NFR-3)                                                            | A real investigation against a real Azure DevOps org produces a grounded Finding with cited evidence, using only the exact tools each service is scoped to — verified by inspecting the real tool-call trace, not by reading the code.                                     |
 | 4\. Narrative Synthesis & Deterministic Status Rollup | FR-3, FR-8                                                                                                  | A real draft report is produced from real Findings, and the overall status is reproducibly computed by a pure function — same inputs, same output, verified by a repeated call, not asserted.                                                                              |
 | 5\. Quality Assurance, Revision & Content Safety      | FR-4; the revision cap decision logic (High-Level Design Section 3); mandatory content safety check (NFR-8) | A deliberately-broken draft is fed in and confirmed to trigger exactly one revision, and a forced code-enforced-check failure at the cap is confirmed to hard-stop rather than silently proceed — the single most important behavior in the whole design, tested directly. |
@@ -95,8 +97,8 @@ repository.</p></td>
 <td width="620" data-valign="top" data-bgcolor="#f5f5f0"
 style="background: #f5f5f0; border: 1px solid #000000; padding: 0.1in 0.14in"><p>Implement
 the full schema from Low-Level Design Section 1 against a</p>
-<p>real Neon database, plus migrate.py and verify_migration.py exactly
-as</p>
+<p>real Azure Database for PostgreSQL Flexible Server instance, plus
+migrate.py and verify_migration.py exactly as</p>
 <p>specified in DevOps Setup Section 2.1. Prove verify_migration.py</p>
 <p>actually queries information_schema directly and would fail if a</p>
 <p>migration silently didn't apply — write a test that proves this

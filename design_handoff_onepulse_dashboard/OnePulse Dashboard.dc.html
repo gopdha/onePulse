@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { margin: 0; background: #f6f6f4; color: #17191d; -webkit-font-smoothing: antialiased; }
+  a { color: #1F3864; text-decoration: none; }
+  a:hover { color: #16294a; text-decoration: underline; }
+  @keyframes op-pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.35 } }
+</style>
+</helmet>
+<div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; max-width: 1280px; margin: 0 auto; padding: 22px 30px 24px; min-height: 100vh; box-sizing: border-box; display: flex; flex-direction: column;">
+
+  <div style="padding-bottom: 14px; border-bottom: 1px solid #e2e2dd; margin-bottom: 16px;">
+    <h1 style="margin: 0; font-size: 29px; line-height: 1.1; letter-spacing: -0.02em; font-weight: 700; color: #1F3864;">OnePulse</h1>
+    <p style="margin: 7px 0 0; font-size: 14.5px; color: #63666d; letter-spacing: 0.005em;">AI-generated status reports, human-approved</p>
+    <div style="display: inline-flex; align-items: center; gap: 11px; margin: 18px 0 6px; background: #eef1f6; border: 1px solid #dde3ee; border-radius: 4px; padding: 10px 14px;">
+      <label style="font-size: 11.5px; font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: #1F3864;">Select Project</label>
+      <select value="{{ project }}" onChange="{{ setProject }}" style="appearance: none; border: 1px solid #dcdcd6; background: #ffffff; border-radius: 3px; color: #17191d; font: 600 13px/1 'Helvetica Neue', Helvetica, Arial, sans-serif; padding: 8px 28px 8px 10px; cursor: pointer; background-image: linear-gradient(45deg, transparent 50%, #7a7d84 50%), linear-gradient(135deg, #7a7d84 50%, transparent 50%); background-position: calc(100% - 15px) 50%, calc(100% - 11px) 50%; background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;" style-hover="border-color: #1F3864;" style-focus="outline: none; border-color: #1F3864;">
+        <sc-for list="{{ projects }}" as="p" hint-placeholder-count="2">
+          <option value="{{ p.name }}">{{ p.name }}</option>
+        </sc-for>
+      </select>
+    </div>
+  </div>
+
+  <div style="display: grid; grid-template-columns: minmax(0, 0.4fr) minmax(0, 0.6fr); gap: 18px; align-items: stretch; flex: 1; min-height: 0;">
+
+    <section style="background: #1F3864; border: 1px solid #1F3864; border-radius: 4px; padding: 16px 20px; display: flex; flex-direction: column; min-height: 0; color: #ffffff;">
+      <button type="button" onClick="{{ trigger }}" disabled="{{ running }}" style="width: 100%; border: 0; background: #ffffff; color: #1F3864; font: 700 13px/1 'Helvetica Neue', Helvetica, Arial, sans-serif; letter-spacing: 0.03em; padding: 13px 16px; border-radius: 3px; cursor: {{ triggerCursor }}; white-space: nowrap; flex: none;" style-hover="background: #e7ebf3;" style-active="background: #d3daE8;">{{ triggerLabel }}</button>
+
+      <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 24px 0 7px; flex: none;">
+        <span style="font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #cfd7e5;">{{ statusLabel }}</span>
+        <span style="font-size: 11.5px; color: #b6bfd0; white-space: nowrap;">{{ statusMeta }}</span>
+      </div>
+      <div style="height: 3px; background: rgba(255,255,255,0.22); border-radius: 2px; margin-bottom: 12px; overflow: hidden; flex: none;">
+        <div style="height: 3px; background: #ffffff; width: {{ progressPct }};"></div>
+      </div>
+
+      <div ref="{{ stepsRef }}" style="flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-right: 10px; display: flex; flex-direction: column; gap: 9px;">
+        <sc-for list="{{ log }}" as="g" hint-placeholder-count="6">
+          <div>
+            <div style="font-size: 13px; font-weight: 700; color: {{ g.color }}; letter-spacing: 0.01em;">{{ g.label }}</div>
+            <div style="display: flex; flex-direction: column; gap: 2px; margin-top: 3px;">
+              <sc-for list="{{ g.subs }}" as="sub" hint-placeholder-count="3">
+                <div style="font-size: 12px; line-height: 1.45; color: {{ sub.color }};">{{ sub.text }}</div>
+              </sc-for>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+    </section>
+
+    <div style="display: flex; flex-direction: column; gap: 14px; min-width: 0; min-height: 0;">
+
+      <section style="background: #ffffff; border: 1px solid #e2e2dd; border-radius: 4px; padding: 13px 22px 2px; flex: none;">
+        <div style="padding-bottom: 10px; border-bottom: 1px solid #eeeeea;">
+          <h2 style="margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.02em;">Previous Status Reports</h2>
+        </div>
+        <div style="overflow: hidden;">
+        <sc-for list="{{ runs }}" as="r" hint-placeholder-count="4">
+          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: nowrap; gap: 16px; padding: 6px 0; border-bottom: 1px solid #f2f2ef;">
+            <div style="display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; overflow: hidden;">
+              <a href="{{ r.deck }}" title="Open deck" style="font-size: 14px; font-weight: 600; color: #1F3864; letter-spacing: -0.005em; white-space: nowrap; text-decoration: underline; text-decoration-color: #c8cedb; text-underline-offset: 3px;" style-hover="text-decoration-color: #1F3864;">{{ r.date }}</a>
+            </div>
+            <sc-if value="{{ r.pending }}" hint-placeholder-val="{{ false }}">
+              <div style="display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex: none; height: 30px;">
+                <button type="button" onClick="{{ r.approve }}" title="Approve" aria-label="Approve" style="border: 0; background: #1F3864; color: #ffffff; width: 30px; height: 30px; border-radius: 3px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex: none;" style-hover="background: #16294a;"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M2.5 8.5 L6.2 12 L13.5 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"></path></svg></button>
+                <button type="button" onClick="{{ r.reject }}" title="Reject" aria-label="Reject" style="border: 1px solid #dcdcd6; background: #ffffff; color: #63666d; width: 30px; height: 30px; border-radius: 3px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex: none;" style-hover="border-color: oklch(0.48 0.15 25); color: oklch(0.48 0.15 25);"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M3.5 3.5 L12.5 12.5 M12.5 3.5 L3.5 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"></path></svg></button>
+              </div>
+            </sc-if>
+            <sc-if value="{{ r.decided }}" hint-placeholder-val="{{ true }}">
+              <div style="display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex: none; height: 30px; white-space: nowrap;">
+<span style="font-size: 11.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #63666d; background: #f1f1ee; padding: 5px 9px; border-radius: 3px;">Reviewed</span>
+              </div>
+            </sc-if>
+          </div>
+        </sc-for>
+        </div>
+      </section>
+
+      <section style="background: #eef1f6; border: 1px solid #d8dfeb; border-radius: 4px; padding: 14px 22px 12px; display: flex; flex-direction: column; flex: 1; min-height: 0;">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 13px; border-bottom: 1px solid #d8dfeb;">
+          <h2 style="margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.02em; flex: none; color: #1F3864;">Status Report Assistant</h2>
+          <div style="display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; overflow: hidden;">
+            <sc-for list="{{ prompts }}" as="p" hint-placeholder-count="3">
+              <button type="button" onClick="{{ p.send }}" style="border: 1px solid #e2e2dd; background: #ffffff; color: #3c3f45; font: 500 11.5px/1 'Helvetica Neue', Helvetica, Arial, sans-serif; padding: 6px 9px; border-radius: 3px; cursor: pointer; white-space: nowrap;" style-hover="border-color: #1F3864; color: #1F3864;">{{ p.label }}</button>
+            </sc-for>
+          </div>
+        </div>
+
+        <div ref="{{ scrollRef }}" style="flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; scrollbar-gutter: stable; padding: 8px 4px 0 2px; display: flex; flex-direction: column; gap: 13px;">
+          <sc-for list="{{ messages }}" as="m" hint-placeholder-count="3">
+            <div style="display: flex; flex-direction: column; gap: 4px; align-items: {{ m.align }};">
+              <div style="font-size: 11px; letter-spacing: 0.07em; text-transform: uppercase; color: #6b7386;">{{ m.who }}</div>
+              <div style="max-width: 84%; font-size: 13px; line-height: 1.45; text-wrap: pretty; border-radius: 4px; padding: 9px 11px; color: {{ m.color }}; background: {{ m.bg }}; border: 1px solid {{ m.border }};">{{ m.text }}</div>
+            </div>
+          </sc-for>
+          <sc-if value="{{ thinking }}" hint-placeholder-val="{{ false }}">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #63666d;">
+              <span style="width: 6px; height: 6px; border-radius: 50%; background: #1F3864; animation: op-pulse 1.1s ease-in-out infinite;"></span>Assistant is drafting…
+            </div>
+          </sc-if>
+        </div>
+
+
+        <form onSubmit="{{ submit }}" style="display: flex; align-items: flex-end; gap: 10px; border-top: 1px solid #d8dfeb; padding-top: 9px;">
+          <textarea value="{{ draft }}" onChange="{{ setDraft }}" onKeyDown="{{ keyDown }}" placeholder="Ask about this run, or request a revision to the narrative…" style="flex: 1; min-width: 0; box-sizing: border-box; height: 40px; min-height: 40px; max-height: 40px; resize: none; overflow: hidden; border: 1px solid #e2e2dd; border-radius: 3px; padding: 9px 12px; font: 400 13.5px/1.4 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #17191d; background: #ffffff;" style-focus="outline: none; border-color: #1F3864;"></textarea>
+          <button type="submit" style="border: 0; background: #1F3864; color: #ffffff; font: 600 12.5px/1 'Helvetica Neue', Helvetica, Arial, sans-serif; letter-spacing: 0.03em; padding: 12px 15px; border-radius: 3px; cursor: pointer; white-space: nowrap; flex: none;" style-hover="background: #16294a;">Send</button>
+        </form>
+      </section>
+
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;stepDurationMs&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:1300,&quot;min&quot;:400,&quot;max&quot;:3000,&quot;step&quot;:100,&quot;unit&quot;:&quot;ms&quot;,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Pipeline&quot;},&quot;autoStart&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Pipeline&quot;},&quot;requireRejectReason&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Review&quot;}}">
+const STEPS = ["Collect sources", "Normalize records", "Reconcile variances", "Synthesis", "Draft narrative", "QA check"];
+const SUBSTEPS = [
+  ["Pull delivery tracker", "Pull finance actuals", "Pull risk register"],
+  ["Match record keys", "Flag missing fields"],
+  ["Compare plan vs actual", "Resolve conflicts", "Compute variance"],
+  ["Cluster themes", "Rank by materiality", "Derive RAG signal"],
+  ["Compose narrative", "Apply tone rules"],
+  ["Check figures", "Check tone & length"]
+];
+const RAG = {
+  Green: { color: "oklch(0.44 0.09 150)", bg: "oklch(0.96 0.032 150)" },
+  Amber: { color: "oklch(0.48 0.1 70)", bg: "oklch(0.955 0.05 85)" },
+  Red: { color: "oklch(0.48 0.15 25)", bg: "oklch(0.955 0.03 25)" }
+};
+const BULLETS = {
+  Amber: [
+    "Delivery confidence slipped to 72% after two integration defects were reopened in the payments workstream.",
+    "Budget consumed 61% against 55% planned; variance driven by contractor extension approved on Aug 24.",
+    "Mitigation: vendor escalation opened, additional QA capacity requested for the week of Sep 14."
+  ],
+  Green: [
+    "All eight milestones for the period closed on schedule; no open critical defects.",
+    "Spend tracking within 2% of plan, with contingency untouched.",
+    "Next period focus shifts to cutover rehearsal and business readiness sign-off."
+  ],
+  Red: [
+    "Cutover date is no longer achievable; two dependencies remain unowned after three weeks.",
+    "Forecast overrun of 14% against approved budget, driven by rework in data migration.",
+    "Recommendation: escalate to the steering committee for a re-baseline decision."
+  ]
+};
+
+class Component extends DCLogic {
+  state = {
+    project: "singleSlide",
+    sub: 0,
+    draft: "",
+    thinking: false,
+    messages: [
+      { role: "assistant", text: "Draft ready — 612 words, proposed Amber. Ask me anything, or tell me what to change." }
+    ],
+    running: false,
+    step: 0,
+    startedAt: "09:04",
+    programIndex: 0,
+    runs: [
+      { id: "r3", program: "Halden Energy Transition", date: "Sep 5, 2026 · 08:41", rag: "Amber", decision: "Awaiting review", pending: true },
+      { id: "r2", program: "Northwind Logistics", date: "Sep 4, 2026 · 08:38", rag: "Green", decision: "Approved · M. Reyes" },
+      { id: "r1", program: "Kestrel Retail Platform", date: "Sep 3, 2026 · 08:36", rag: "Red", decision: "Rejected · A. Okafor" },
+      { id: "r0", date: "Sep 2, 2026 · 08:39", rag: "Green", decision: "Approved · M. Reyes" },
+      { id: "r00", date: "Sep 1, 2026 · 08:35", rag: "Amber", decision: "Approved · A. Okafor" }
+    ],
+    queue: [
+      { id: "r3", program: "Halden Energy Transition", generated: "Sep 5, 08:44", words: 612, model: "pulse-4", rag: "Amber", rejecting: false, reason: "" }
+    ],
+    lastRun: { program: "Halden Energy Transition", date: "Sep 5, 2026 · 08:41", rag: "Amber", decision: "Awaiting reviewer decision", duration: "2 min 08s" },
+    emptyNote: "Trigger the pipeline to generate the next report."
+  };
+
+  scrollRef = React.createRef();
+  stepsRef = React.createRef();
+
+  componentDidMount() {
+    if (this.props.autoStart) this.trigger();
+  }
+
+  componentDidUpdate(prevProps, prevState) {
+    const el = this.scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    const list = this.stepsRef.current;
+    if (list && this.state.running && prevState && prevState.step !== this.state.step) {
+      const row = list.children[this.state.step - 1];
+      if (row) list.scrollTop = Math.max(row.offsetTop - list.offsetTop - 4, 0);
+    }
+  }
+
+  reply(text) {
+    const s = this.state;
+    const t = text.toLowerCase();
+    if (t.indexOf("rag") >= 0 || t.indexOf("why") >= 0)
+      return "The proposed " + s.lastRun.rag + " rating is driven by two reopened integration defects in the payments workstream and a 6-point budget variance. Schedule risk is contained to one sprint, so it stops short of Red.";
+    if (t.indexOf("shorter") >= 0 || t.indexOf("tighten") >= 0 || t.indexOf("summar") >= 0)
+      return "Tightened to three lines: delivery confidence at 72% after defect reopens; spend at 61% against 55% plan; vendor escalation and added QA capacity in flight for the week of Sep 14.";
+    if (t.indexOf("risk") >= 0)
+      return "Two open risks carry into next period: unowned data-migration dependencies, and contractor extension cost not yet reflected in the forecast. Both have named owners as of this run.";
+    return "Noted for " + s.project + ". I can revise the narrative, explain the RAG rationale, or compare this run against the previous one — tell me which.";
+  }
+
+  send = text => {
+    const body = String(text || "").trim();
+    if (!body || this.state.thinking) return;
+    this.setState(s => ({ messages: s.messages.concat([{ role: "you", text: body }]), draft: "", thinking: true }));
+    const finish = answer => this.setState(s => ({ messages: s.messages.concat([{ role: "assistant", text: answer }]), thinking: false }));
+    const local = this.reply(body);
+    if (window.claude && window.claude.complete) {
+      const s = this.state;
+      const report = [
+        "PROJECT: " + s.project,
+        "RUN: " + s.lastRun.date + " · duration " + s.lastRun.duration + " · model pulse-4 · 612 words",
+        "PROPOSED RAG: " + s.lastRun.rag,
+        "DRAFT NARRATIVE:",
+        (BULLETS[s.lastRun.rag] || []).map(b => "- " + b).join("\n")
+      ].join("\n");
+      window.claude
+        .complete(
+          "You are the OnePulse status-report assistant. The full draft report is below — it is the ONLY source you need and you DO have access to it. Answer the reviewer from this body alone, in 2-3 plain sentences, no lists, no preamble. Never say you lack access or data; never suggest checking another system. If something truly is not in the body, say what the draft does cover instead.\n\n===== REPORT =====\n" +
+            report +
+            "\n==================\n\nReviewer: " +
+            body
+        )
+        .then(r => {
+          const out = String(r || "").trim();
+          finish(!out || /don'?t have access|do not have access|unable to access|check the .*platform/i.test(out) ? local : out);
+        })
+        .catch(() => finish(local));
+    } else {
+      setTimeout(() => finish(local), 700);
+    }
+  };
+  componentWillUnmount() {
+    clearInterval(this.timer);
+    clearInterval(this.subTimer);
+  }
+
+  stepMs() {
+    const v = Number(this.props.stepDurationMs);
+    return Number.isFinite(v) && v > 200 ? v : 1300;
+  }
+
+  now() {
+    const d = new Date();
+    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
+
+  trigger = () => {
+    if (this.state.running) return;
+    clearInterval(this.timer);
+    clearInterval(this.subTimer);
+    this.setState({ running: true, step: 1, sub: 0, startedAt: this.now() });
+    this.subTimer = setInterval(() => {
+      this.setState(s => {
+        const count = (SUBSTEPS[s.step - 1] || []).length;
+        return { sub: Math.min(s.sub + 1, Math.max(count - 1, 0)) };
+      });
+    }, Math.max(this.stepMs() / 3, 200));
+    this.timer = setInterval(() => {
+      this.setState(s => {
+        if (s.step >= STEPS.length) {
+          clearInterval(this.timer);
+          clearInterval(this.subTimer);
+          return this.finish(s);
+        }
+        return { step: s.step + 1, sub: 0 };
+      });
+    }, this.stepMs());
+  };
+
+  finish(s) {
+    const idx = s.programIndex % 3;
+    const program = s.project;
+    const rag = ["Amber", "Green", "Red"][idx % 3];
+    const id = "n" + Date.now();
+    const t = this.now();
+    const date = "Sep 6, 2026 · " + t;
+    const run = { id, program, date, rag, decision: "Awaiting review", pending: true };
+    const secs = Math.round((STEPS.length * this.stepMs()) / 1000);
+    return {
+      running: false,
+      step: 0,
+      programIndex: idx + 1,
+      runs: [run].concat(s.runs).slice(0, 4),
+      queue: [{ id, program, generated: "Sep 6, " + t, words: 540 + idx * 37, model: "pulse-4", rag, rejecting: false, reason: "" }].concat(s.queue),
+      lastRun: { program, date, rag, decision: "Awaiting reviewer decision", duration: secs < 60 ? secs + "s" : Math.floor(secs / 60) + " min " + String(secs % 60).padStart(2, "0") + "s" }
+    };
+  }
+
+  decide(id, verdict) {
+    this.setState(s => ({
+      queue: s.queue.filter(q => q.id !== id),
+      runs: s.runs.map(r => (r.id === id ? Object.assign({}, r, { pending: false, decision: verdict + " · you" }) : r)),
+      lastRun: s.lastRun.program === (s.queue.find(q => q.id === id) || {}).program
+        ? Object.assign({}, s.lastRun, { decision: verdict + " by you" })
+        : s.lastRun,
+      emptyNote: verdict === "Approved"
+        ? "Report published to the program workspace."
+        : "Rejection sent back to the pipeline for regeneration."
+    }));
+  }
+
+  decideRun(id, verdict) {
+    this.setState(s => ({
+      runs: s.runs.map(r => (r.id === id ? Object.assign({}, r, { pending: false, decision: verdict + " · you" }) : r)),
+      lastRun: Object.assign({}, s.lastRun, { decision: verdict + " by you" }),
+      messages: s.messages.concat([
+        { role: "assistant", text: verdict === "Approved"
+          ? "Report approved and published to the program workspace. The deck is now marked final."
+          : "Report rejected. I'll regenerate the narrative on the next run — tell me what should change." }
+      ])
+    }));
+  }
+
+  renderVals() {
+    const s = this.state;
+    const rag = k => RAG[k] || RAG.Amber;
+    const finished = !s.running;
+    const log = STEPS.map((label, i) => {
+      const n = i + 1;
+      const done = finished || n < s.step, active = !finished && n === s.step;
+      const subs = (SUBSTEPS[i] || []).map((text, j) => {
+        const shown = done || (active && j <= s.sub);
+        return { text: text, color: shown ? "#b9c3d6" : "#7f8ba4", shown: shown };
+      });
+      return {
+        label: n + ". " + label,
+        color: done ? "#d7deeb" : active ? "#ffffff" : "#7f8ba4",
+        subs: (done || active) ? subs : []
+      };
+    });
+    return {
+      syncTime: s.lastRun.date,
+      projects: ["singleSlide", "LeaveTracker"].map(name => ({ name })),
+      chatContext: "",
+      scrollRef: this.scrollRef,
+      stepsRef: this.stepsRef,
+      thinking: s.thinking,
+      draft: s.draft,
+      setDraft: e => this.setState({ draft: e.target.value }),
+      keyDown: e => {
+        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this.send(this.state.draft); }
+      },
+      submit: e => { e.preventDefault(); this.send(this.state.draft); },
+      messages: s.messages.map(m => {
+        const you = m.role === "you";
+        return {
+          text: m.text,
+          who: you ? "You" : "Assistant",
+          align: you ? "flex-end" : "flex-start",
+          color: you ? "#ffffff" : "#3c3f45",
+          bg: you ? "#1F3864" : "#ffffff",
+          border: you ? "#1F3864" : "#dde3ee"
+        };
+      }),
+      prompts: [
+        { label: "Why this RAG?", send: () => this.send("Why this RAG?") },
+        { label: "Tighten", send: () => this.send("Tighten the summary") },
+        { label: "Risks", send: () => this.send("List open risks") }
+      ],
+      project: s.project,
+      setProject: e => this.setState({ project: e.target.value }),
+      running: s.running,
+      idle: !s.running,
+      log,
+      triggerLabel: s.running ? "Generating…" : "Generate Status Report",
+      triggerCursor: s.running ? "default" : "pointer",
+      statusLabel: s.running ? "In progress" : "Last run log",
+      statusMeta: s.running ? "started " + s.startedAt : s.lastRun.date + " · " + s.lastRun.duration,
+      runningProgram: s.project,
+      startedAt: s.startedAt,
+      progressPct: s.running ? Math.round((((s.step - 1) * 3 + s.sub + 1) / (STEPS.length * 3)) * 100) + "%" : "100%",
+      lastRun: Object.assign({}, s.lastRun, { ragColor: rag(s.lastRun.rag).color, ragBg: rag(s.lastRun.rag).bg }),
+      runs: s.runs.slice(0, 4).map(r => Object.assign({}, r, {
+        ragColor: rag(r.rag).color,
+        ragBg: rag(r.rag).bg,
+        deck: "#report-" + r.id,
+        decided: !r.pending,
+        approve: () => this.decideRun(r.id, "Approved"),
+        reject: () => this.decideRun(r.id, "Rejected"),
+        decisionColor: r.pending ? "oklch(0.48 0.1 70)" : r.decision.indexOf("Rejected") === 0 ? "oklch(0.48 0.15 25)" : "oklch(0.44 0.09 150)"
+      })),
+      queue: s.queue.map(q => Object.assign({}, q, {
+        ragColor: rag(q.rag).color,
+        ragBg: rag(q.rag).bg,
+        bullets: (BULLETS[q.rag] || []).map(text => ({ text })),
+        deciding: !q.rejecting,
+        approve: () => this.decide(q.id, "Approved"),
+        reject: () => {
+          if (this.props.requireRejectReason === false) return this.decide(q.id, "Rejected");
+          this.setState(st => ({ queue: st.queue.map(x => (x.id === q.id ? Object.assign({}, x, { rejecting: true }) : x)) }));
+        },
+        cancelReject: () => this.setState(st => ({ queue: st.queue.map(x => (x.id === q.id ? Object.assign({}, x, { rejecting: false, reason: "" }) : x)) })),
+        confirmReject: () => this.decide(q.id, "Rejected"),
+        setReason: e => {
+          const v = e.target.value;
+          this.setState(st => ({ queue: st.queue.map(x => (x.id === q.id ? Object.assign({}, x, { reason: v }) : x)) }));
+        }
+      })),
+      queueEmpty: s.queue.length === 0,
+      queueLabel: s.queue.length === 1 ? "1 report" : s.queue.length + " reports",
+      emptyNote: s.emptyNote,
+      trigger: this.trigger
+    };
+  }
+}
+</script>
+</body>
+</html>

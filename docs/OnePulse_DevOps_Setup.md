@@ -143,17 +143,45 @@ secrets in YAML</p>
 
 # 4. Environments
 
-|                 |                     |                 |                                         |
-|-----------------|---------------------|-----------------|-----------------------------------------|
-| **Environment** | **AKS Namespace**   | **Neon Branch** | **Approval Required**                   |
-| Development     | onepulse-dev        | dev             | No                                      |
-| Staging         | onepulse-staging    | staging         | No                                      |
-| Production      | onepulse-production | main            | Yes — Azure DevOps environment approval |
+**Revision note (supersedes the original Step 9 choice):** The original
+version of this document isolated environments via a separate Neon branch
+per environment. Neon has been replaced by Azure Database for PostgreSQL
+Flexible Server (Physical Architecture Section 4 revision note) because
+Neon cannot authenticate the database connection itself via Managed
+Identity. Flexible Server has no branch primitive; the replacement is a
+fully separate server instance per environment, not a shared instance
+with separate databases — deliberately, so that a Staging-triggered event
+(a bad migration, a load test, resource contention, a patching failover)
+shares no compute, storage, or failover domain with Production and so
+cannot reach it. This directly protects the purpose of the Migration
+Verification gate (NFR-9): the gate exists because of two real prior
+migration-drift incidents, and it is only as meaningful as the isolation
+between the environment it verifies in and the environment it protects. A
+shared instance would have quietly reintroduced the same category of risk
+the gate exists to catch.
 
-Each Neon branch is a real, isolated copy of the schema — a migration is
-proven safe in Development and Staging before ever touching Production's
-branch, and the Migration Verification gate runs independently in every
-environment it is promoted to, not just once.
+|                 |                     |                                                                                            |                                         |
+|-----------------|---------------------|--------------------------------------------------------------------------------------------|-----------------------------------------|
+| **Environment** | **AKS Namespace**   | **Postgres Instance — Azure Database for PostgreSQL Flexible Server**                     | **Approval Required**                   |
+| Development     | onepulse-dev        | `onepulse-pg-dev` — Burstable B1ms (1 vCore / 2 GiB), no HA                               | No                                      |
+| Staging         | onepulse-staging    | `onepulse-pg-staging` — Burstable B2s (2 vCore / 4 GiB), no HA                             | No                                      |
+| Production      | onepulse-production | `onepulse-pg-production` — General Purpose D2ds_v5 (2 vCore / 8 GiB), zone-redundant HA   | Yes — Azure DevOps environment approval |
+
+Proposed tiers — for your review before anything is provisioned, not a
+final decision made unilaterally: Development and Staging use Burstable
+SKUs to keep steady-state cost low, since neither carries production
+traffic. Production uses General Purpose with zone-redundant high
+availability, extending the same availability-zone redundancy already
+applied to AKS compute (High-Level Design Section 6) down to the database
+layer — a configuration choice this design must now make explicitly,
+where Neon's own multi-AZ handling had previously made it implicit.
+Server names above are a proposed naming convention only; actual Azure
+resource names must be confirmed globally unique at provisioning time.
+
+Each environment has its own fully separate Postgres server instance — a
+migration is proven safe in Development and Staging before ever touching
+Production's own instance, and the Migration Verification gate runs
+independently against each instance it is promoted to, not just once.
 
 # 5. Secrets & Identity
 

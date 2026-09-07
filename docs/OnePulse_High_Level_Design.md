@@ -154,7 +154,7 @@ The composite design here justifies it:
 |---------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **Layer**                                   | **Approach**                                                                                                                                                       |
 | Compute (AKS)                               | Every service runs multiple replicas spread across availability zones. A single pod or node failure does not cause downtime; Kubernetes reschedules automatically. |
-| Database (Neon)                             | A managed service with its own published availability commitment, independent of anything this design builds.                                                      |
+| Database (Azure DB for PostgreSQL Flexible Server) | Zone-redundant HA configured explicitly for Production (DevOps Setup Section 4) — unlike the original Neon choice, this is a provisioning decision this design now makes directly, backed by Flexible Server's own published SLA for that configuration. |
 | Workflow (Temporal Cloud)                   | A managed service with its own published availability commitment.                                                                                                  |
 | Model access (Foundry) and Gateway (Apigee) | Both managed services with their own published availability commitments.                                                                                           |
 
