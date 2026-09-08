@@ -110,11 +110,31 @@ async def main() -> None:
     # "Observability Scope" for the full real-findings trail.
     tracer = trace.get_tracer(__name__)
     try:
-        with tracer.start_as_current_span("onepulse_pipeline_run") as root_span:
-            root_span.set_attribute("onepulse.ado_org", ADO_ORG_NAME)
-            root_span.set_attribute("onepulse.ado_project", ADO_PROJECT_NAME)
+        # Real ordering bug fixed (Task 35, found live from a real Arize
+        # screenshot showing scattered top-level siblings instead of one
+        # nested tree — traced to real Application Insights
+        # customDimensions data, not assumed): this used to nest
+        # set_routing_context() INSIDE the root span, so the root span
+        # was created before arize.space_id ever existed in the ambient
+        # context — ArizeRoutingSpanProcessor.on_start() had nothing to
+        # read, and on_end() then silently dropped this span entirely
+        # (its own "No 'arize.space_id' attribute found" warning). The
+        # span's real children still correctly carried its real span ID
+        # as their own parent (confirmed directly — the OTel data itself
+        # was never broken), but since Arize never received the parent
+        # they pointed to, they rendered as scattered, disconnected
+        # top-level siblings. This exact gap existed here too, in the
+        # single-threaded CLI path — confirming it predates and is
+        # unrelated to Task 32's UI threading change. Swapping the
+        # nesting so the routing context is the OUTER manager means it's
+        # already active by the time the root span is created, so it
+        # genuinely gets arize.space_id set on itself and is no longer
+        # skipped.
+        with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
+            with tracer.start_as_current_span("onepulse_pipeline_run") as root_span:
+                root_span.set_attribute("onepulse.ado_org", ADO_ORG_NAME)
+                root_span.set_attribute("onepulse.ado_project", ADO_PROJECT_NAME)
 
-            with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
                 result = await run_pipeline_cycle(
                     ado_pat_b64=ado_pat_b64,
                     project_endpoint=PROJECT_ENDPOINT,
@@ -129,13 +149,13 @@ async def main() -> None:
                     on_detail=print_detail,
                 )
 
-            root_span.set_attribute("onepulse.overall_status", result.overall_status)
-            root_span.set_attribute("onepulse.revision_outcome", result.outcome)
-            if result.report_id is not None:
-                root_span.set_attribute("onepulse.report_id", result.report_id)
+                root_span.set_attribute("onepulse.overall_status", result.overall_status)
+                root_span.set_attribute("onepulse.revision_outcome", result.outcome)
+                if result.report_id is not None:
+                    root_span.set_attribute("onepulse.report_id", result.report_id)
 
-            if result.rendered_path:
-                print(f"\nDone. Report saved to: {os.path.abspath(result.rendered_path)}")
+                if result.rendered_path:
+                    print(f"\nDone. Report saved to: {os.path.abspath(result.rendered_path)}")
     finally:
         # Real fix (Task 12): relying on azure-monitor-opentelemetry's
         # implicit shutdown_on_exit=True atexit hook was NOT reliable for

@@ -76,9 +76,10 @@ from mcp.client.stdio import stdio_client
 from onepulse_common.config import PostgresSettings
 from onepulse_common.db import PostgresClient
 from onepulse_common.quality_gate import code_enforced_risk_floor_check, decide_revision_outcome
-from onepulse_common.report_rendering import Finding, render_status_report
+from onepulse_common.report_rendering import Finding, render_status_report, render_tower_report
 from onepulse_common.report_rendering import week_of as monday_of_week
 from onepulse_common.status_rollup import compute_overall_status
+from onepulse_common.tower_rollup import build_tower_rollups, program_health as compute_program_health
 
 # Real persistence target (Phase 2's schema, onepulse-pg-dev) — same
 # host/database/role convention every other script in this project uses
@@ -221,9 +222,29 @@ def _extract_work_item_ids(raw_tool_text: str) -> list[int]:
     return [item["id"] for item in parsed.get("workItems", [])]
 
 
+def _extract_work_item_fields(raw_tool_text: str) -> list[dict]:
+    """Parses the real MCP wit_work_item 'get_batch' action result.
+    Confirmed live against real data (not assumed) — Task 36: this
+    action's response shape is genuinely different from wit_query's WIQL
+    result above — a plain JSON array of `{id, fields: {...}, url}`
+    objects, no guard markers wrapping it.
+    """
+    items = json.loads(raw_tool_text)
+    return [
+        {
+            "id": item["id"],
+            "title": item["fields"].get("System.Title"),
+            "state": item["fields"].get("System.State"),
+            "parent": item["fields"].get("System.Parent"),
+            "type": item["fields"].get("System.WorkItemType"),
+        }
+        for item in items
+    ]
+
+
 async def _query_committed_scope(
     mcp_session: ClientSession, ado_project_name: str, on_detail: Callable[[str], None]
-) -> list[int]:
+) -> tuple[list[int], list[int]]:
     """Task 28/Part 2: the real committed-investigation scope, computed
     DETERMINISTICALLY in code, not left to the investigation agent's own
     judgment. Real motivation, not hypothetical: Task 27's stress test
@@ -235,6 +256,11 @@ async def _query_committed_scope(
     issued directly against the same open MCP session before the
     investigation Agent is even constructed, so the scope handed to the
     agent is fixed, small, and auditable up front.
+
+    Returns `(feature_ids, child_ids)` separately, not one merged list
+    (Task 36) — the split is needed to build the real Tower (Epic)
+    hierarchy afterward; callers that just want the flat combined scope
+    can still do `feature_ids + child_ids` themselves.
     """
     on_detail(f"· real tool call (deterministic scoping): wit_query(Committed Features in '{ado_project_name}')")
     features_result = await mcp_session.call_tool(
@@ -250,7 +276,7 @@ async def _query_committed_scope(
         "\n".join(block.text for block in features_result.content if hasattr(block, "text"))
     )
     if not feature_ids:
-        return []
+        return [], []
 
     on_detail(
         f"· real tool call (deterministic scoping): wit_query(real children of {len(feature_ids)} "
@@ -268,7 +294,86 @@ async def _query_committed_scope(
     child_ids = _extract_work_item_ids(
         "\n".join(block.text for block in children_result.content if hasattr(block, "text"))
     )
-    return feature_ids + child_ids
+    return feature_ids, child_ids
+
+
+async def _query_tower_hierarchy(
+    mcp_session: ClientSession, feature_ids: list[int], child_ids: list[int], on_detail: Callable[[str], None]
+) -> dict:
+    """Task 36: the real, deterministic Tower (Epic) hierarchy and real
+    delivery-state lookup, computed entirely independently of the
+    Investigation agent's own narrative judgment — same discipline as
+    `_query_committed_scope` above. Real motivation: the agent's FR-1
+    classification (On Track/At Risk/Blocked/Needs Human Review) is a
+    judgment about whether a Program Lead should worry about an item —
+    not a measure of real delivery progress. Computing "N of M items
+    delivered" needs each item's real ADO workflow state
+    (`System.State`), which nothing upstream captures as structured
+    data today; fetched here directly via one real `get_batch` call
+    covering every committed-scope item (features + children), reusing
+    the already-open MCP session `investigate()` owns.
+
+    Returns `{"features": {id: {title, state, epic_id}}, "children":
+    {id: {state, feature_id}}, "epics": {id: {title}}}`. `epics` is
+    empty when no Committed Feature has a real Epic parent — the
+    genuine, honest "no tower structure" case (Leave Tracker today) —
+    callers use this to decide whether the Tower View applies at all,
+    not a separate boolean flag.
+
+    Real bug found and fixed live (Task 36 verification): a Feature's
+    `System.Parent` is not reliably an Epic — singleSlide's Feature #8
+    has `System.Parent = 10`, and #10 is a real Task, not an Epic
+    (confirmed live via `az boards work-item show`), almost certainly
+    stray/malformed data from this project's earliest seeding (Task 5),
+    not a real tower structure. Treating any non-null parent as a tower
+    would have wrongly forced singleSlide into the Tower View. The real,
+    correct rule: a parent only counts as a tower Epic when its own
+    `System.WorkItemType` is literally `"Epic"` — checked here via a
+    second real field fetch, not inferred from the mere presence of a
+    parent ID.
+    """
+    all_ids = feature_ids + child_ids
+    on_detail(
+        f"· real tool call (deterministic tower lookup): wit_work_item(get_batch, {len(all_ids)} "
+        "item(s), fields=[System.Title, System.Parent, System.State])"
+    )
+    items_result = await mcp_session.call_tool(
+        "wit_work_item",
+        {"action": "get_batch", "ids": all_ids, "fields": ["System.Id", "System.Title", "System.Parent", "System.State"]},
+    )
+    raw_items = _extract_work_item_fields(
+        "\n".join(block.text for block in items_result.content if hasattr(block, "text"))
+    )
+
+    feature_id_set = set(feature_ids)
+    features: dict[int, dict] = {}
+    children: dict[int, dict] = {}
+    epic_ids: set[int] = set()
+    for item in raw_items:
+        if item["id"] in feature_id_set:
+            features[item["id"]] = {"title": item["title"], "state": item["state"], "epic_id": item["parent"]}
+            if item["parent"] is not None:
+                epic_ids.add(item["parent"])
+        else:
+            children[item["id"]] = {"state": item["state"], "feature_id": item["parent"]}
+
+    epics: dict[int, dict] = {}
+    if epic_ids:
+        on_detail(
+            f"· real tool call (deterministic tower lookup): wit_work_item(get_batch, {len(epic_ids)} "
+            "real Epic parent(s))"
+        )
+        epics_result = await mcp_session.call_tool(
+            "wit_work_item",
+            {"action": "get_batch", "ids": sorted(epic_ids), "fields": ["System.Id", "System.Title", "System.WorkItemType"]},
+        )
+        raw_epics = _extract_work_item_fields(
+            "\n".join(block.text for block in epics_result.content if hasattr(block, "text"))
+        )
+        # Only a real Epic-typed parent counts as a tower — see docstring.
+        epics = {item["id"]: {"title": item["title"]} for item in raw_epics if item["type"] == "Epic"}
+
+    return {"features": features, "children": children, "epics": epics}
 
 
 STATUS_ANALYSIS_INSTRUCTIONS = """You are a Status Update Analysis agent for OnePulse (FR-2).
@@ -384,12 +489,15 @@ async def investigate(
     ado_org_name: str,
     ado_project_name: str,
     on_detail: Callable[[str], None] = _noop_detail,
-) -> tuple[list[dict], int]:
-    """Returns (findings, queried_item_count). `queried_item_count` is
-    the real, deterministic Committed-scope size (see
-    `_query_committed_scope`) — required by `run_quality_gate`/
+) -> tuple[list[dict], int, dict]:
+    """Returns (findings, queried_item_count, tower_hierarchy).
+    `queried_item_count` is the real, deterministic Committed-scope size
+    (see `_query_committed_scope`) — required by `run_quality_gate`/
     `code_enforced_risk_floor_check` (Task 28/Part 1) to tell a genuine
     coverage shortfall apart from a legitimate zero-scope run.
+    `tower_hierarchy` (Task 36) is the real, deterministic Epic/Feature
+    structure from `_query_tower_hierarchy` — `{"epics": {}, ...}` (empty)
+    when there is no real tower structure to report against.
 
     See `_ado_mcp_server_params`'s own docstring for a real, unrelated
     bug (Task 29) found and fixed in how this MCP server is spawned —
@@ -400,10 +508,13 @@ async def investigate(
         async with ClientSession(read, write) as mcp_session:
             await mcp_session.initialize()
 
-            scope_ids = await _query_committed_scope(mcp_session, ado_project_name, on_detail)
+            feature_ids, child_ids = await _query_committed_scope(mcp_session, ado_project_name, on_detail)
+            scope_ids = feature_ids + child_ids
             if not scope_ids:
                 on_detail(f"No Features tagged 'Committed' found for '{ado_project_name}' — nothing to investigate.")
-                return [], 0
+                return [], 0, {"features": {}, "children": {}, "epics": {}}
+
+            tower_hierarchy = await _query_tower_hierarchy(mcp_session, feature_ids, child_ids, on_detail)
 
             tools = await build_mcp_function_tools(mcp_session, on_detail)
 
@@ -420,7 +531,7 @@ async def investigate(
                     f"them: {scope_ids}"
                 )
 
-    return json.loads(result.text)["findings"], len(scope_ids)
+    return json.loads(result.text)["findings"], len(scope_ids), tower_hierarchy
 
 
 async def analyze_status_deck(
@@ -835,7 +946,9 @@ async def run_pipeline_cycle(
     on_stage(
         1, TOTAL_STAGES, f"Investigation — querying real Committed-tagged Features + children in '{ado_project_name}'"
     )
-    findings, queried_item_count = await investigate(chat_client, ado_pat_b64, ado_org_name, ado_project_name, on_detail)
+    findings, queried_item_count, tower_hierarchy = await investigate(
+        chat_client, ado_pat_b64, ado_org_name, ado_project_name, on_detail
+    )
     for f in findings:
         on_detail(f"#{f['work_item_id']} {f['title']} — {f['status']}")
 
@@ -900,15 +1013,34 @@ async def run_pipeline_cycle(
     # second copy of "Monday of the week" logic here.
     report_week_of = monday_of_week(as_of)
     output_path = build_output_path(ado_project_name, as_of, output_dir)
+
+    # Task 36: real, deterministic Tower (Epic) rollup — empty when this
+    # project's Committed Features have no real Epic parent above them
+    # (singleSlide, Leave Tracker today). Computed here, not inside
+    # investigate(), since it needs `findings` (the agent's own real FR-1
+    # classification), which only exists after Investigation returns.
+    towers = build_tower_rollups(findings, tower_hierarchy)
+
     on_stage(6, TOTAL_STAGES, f"Rendering final report -> {output_path}")
-    render_status_report(
-        program_name=ado_project_name,
-        as_of=as_of,
-        overall_status=overall_status,
-        executive_summary=final_summary,
-        findings=[Finding(**f) for f in findings],
-        output_path=output_path,
-    )
+    if towers:
+        on_detail(f"Real Tower View: {len(towers)} real Epic tower(s) found — using the executive Tower layout.")
+        render_tower_report(
+            program_name=ado_project_name,
+            as_of=as_of,
+            program_health_status=compute_program_health(towers),
+            towers=towers,
+            untracked_initiatives=status_analysis["untracked_initiatives"],
+            output_path=output_path,
+        )
+    else:
+        render_status_report(
+            program_name=ado_project_name,
+            as_of=as_of,
+            overall_status=overall_status,
+            executive_summary=final_summary,
+            findings=[Finding(**f) for f in findings],
+            output_path=output_path,
+        )
     if outcome == "route_to_human_review":
         on_detail(
             "NOTE: subjective check still failed at the revision cap. This artifact requires human "

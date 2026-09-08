@@ -587,9 +587,25 @@ async def _ask(question: str) -> dict:
     tracer = trace.get_tracer(__name__)
     try:
         arize_space_id = _get_arize_space_id()
-        with tracer.start_as_current_span("onepulse_ui_chat_query") as root_span:
-            root_span.set_attribute("onepulse.question", question)
-            with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
+        # Real ordering bug fixed (found live, traced to real Application
+        # Insights customDimensions data, not assumed): this used to nest
+        # set_routing_context() INSIDE the root span, so the root span
+        # itself was created before arize.space_id was ever in the ambient
+        # context — ArizeRoutingSpanProcessor.on_start() had nothing to
+        # read, the span's own attributes never got arize.space_id set,
+        # and on_end() then silently dropped it (its own "No 'arize.
+        # space_id' attribute found" warning). The span's real children
+        # still correctly carried its real span ID as their own parent
+        # (confirmed directly — the OTel data itself was never broken),
+        # but since Arize never received the parent they pointed to, they
+        # rendered as scattered, disconnected top-level siblings instead
+        # of one real nested tree. Swapping the nesting so the routing
+        # context is the OUTER manager means it's already active by the
+        # time the root span is created, so it gets arize.space_id set on
+        # itself for real, and is no longer skipped.
+        with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
+            with tracer.start_as_current_span("onepulse_ui_chat_query") as root_span:
+                root_span.set_attribute("onepulse.question", question)
                 return await ask_question(chat_client, search_client, embedding_client, question)
     finally:
         await search_client.close()
@@ -915,9 +931,30 @@ def run_generation(selected_project_name: str, selected_program_id: str, console
 
     credential = DefaultAzureCredential()
     tracer = trace.get_tracer(__name__)
-    with tracer.start_as_current_span("onepulse_ui_pipeline_run") as root_span:
-        root_span.set_attribute("onepulse.ado_project", selected_project_name)
-        with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
+    # Real ordering bug fixed (found live from a real Arize screenshot
+    # showing scattered top-level siblings instead of one nested tree,
+    # traced to real Application Insights customDimensions data — the
+    # root span's own attributes never included arize.space_id at all).
+    # This used to nest set_routing_context() INSIDE the root span, so
+    # the root span was created before arize.space_id ever existed in
+    # the ambient context; ArizeRoutingSpanProcessor.on_start() had
+    # nothing to read, and on_end() then silently dropped it (its own
+    # "No 'arize.space_id' attribute found" warning — a real, pre-
+    # existing gap since Task 10-13, not a Task 32 threading regression:
+    # confirmed directly by checking `scripts/run_pipeline.py`'s
+    # single-threaded CLI path too, which has the exact same nesting bug
+    # and the exact same missing attribute on its own root span). The
+    # span's real children still correctly carried its real span ID as
+    # their own parent — the OTel data itself was never broken — but
+    # since Arize never received the parent they pointed to, they
+    # rendered as scattered, disconnected top-level siblings. Swapping
+    # the nesting so the routing context is the OUTER manager means it's
+    # already active by the time the root span is created, so it
+    # genuinely gets arize.space_id set on itself and is no longer
+    # skipped.
+    with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
+        with tracer.start_as_current_span("onepulse_ui_pipeline_run") as root_span:
+            root_span.set_attribute("onepulse.ado_project", selected_project_name)
             # Capture the active context (Arize routing + current OTel
             # span) so the worker thread's own event loop sees the same
             # routing attributes — see the docstring above.
@@ -960,10 +997,10 @@ def run_generation(selected_project_name: str, selected_program_id: str, console
                 raise
             thread.join(timeout=5)
 
-        if "result" in result_box:
-            result = result_box["result"]
-            root_span.set_attribute("onepulse.overall_status", result.overall_status)
-            root_span.set_attribute("onepulse.revision_outcome", result.outcome)
+            if "result" in result_box:
+                result = result_box["result"]
+                root_span.set_attribute("onepulse.overall_status", result.overall_status)
+                root_span.set_attribute("onepulse.revision_outcome", result.outcome)
 
     trace.get_tracer_provider().force_flush(timeout_millis=30000)
 
