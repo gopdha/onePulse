@@ -1,0 +1,75 @@
+# OnePulse — Governance & Security Reference
+
+This document describes guarantees that have been **proven through real, adversarial testing** — not just designed. Where a guarantee has a known limitation, it's stated plainly.
+
+---
+
+## 1. Zero Static Secrets
+
+Every credential in this system is obtained dynamically via Managed Identity / Entra ID — there is no API key, password, or connection string stored anywhere in code or configuration, with one explicitly-tracked, time-boxed exception (see §4).
+
+- **Postgres**: Entra-ID-only authentication (password auth is not even possible on the server)
+- **Foundry**: `DefaultAzureCredential`, falling back to `az login` locally
+- **Azure AI Search**: API-key auth disabled service-wide; RBAC-only, Entra ID token provider
+
+---
+
+## 2. The Append-Only Guarantee on `approval_records`
+
+**This is the most rigorously tested guarantee in the entire system.** It has survived:
+
+1. **A direct application-role `DELETE`/`UPDATE` attempt** — blocked by an explicit `REVOKE UPDATE, DELETE`, verified via a real `InsufficientPrivilegeError`.
+2. **A parent-row deletion attempt** — deleting a `reports` row that has a real `approval_records` reference also fails, because Postgres's internal foreign-key integrity check itself requires privilege on the referenced table. This is *stronger* protection than the original design anticipated.
+3. **A genuinely-executed privilege-escalation workaround** — a transient `GRANT SELECT` (not DELETE) was actually applied to see if it would satisfy the internal FK check. It did not — Postgres's real internal check uses `FOR KEY SHARE OF x`, which requires `UPDATE` privilege, not `SELECT`. The grant was immediately reverted and confirmed back to baseline.
+4. **A principled stop before the one path that would have worked** — extending the grant to `UPDATE` was recognized as touching the exact privilege the guarantee exists to withhold, and was declined rather than executed, even though it was technically available.
+
+**Conclusion**: this guarantee is not just designed correctly — it has been adversarially tested against real, escalating attempts to defeat it, and held.
+
+---
+
+## 3. Row-Level Security (RLS)
+
+- Enabled on `reports` (built ahead of its originally Next-scope timeline, per explicit instruction — a documented deviation, not silent scope creep)
+- **Not** enabled on `approval_records`, `findings`, or `untracked_items` — the append-only guarantee on `approval_records` comes from the `REVOKE`, not RLS
+- The project's Entra Administrator role does **not** automatically have `BYPASSRLS` — confirmed via direct query (`rolbypassrls = False`). It already bypasses `reports`' RLS via table-ownership membership instead, a different and narrower mechanism.
+- **Explicit decision**: `BYPASSRLS` was *not* granted to the admin role, even though doing so would have resolved a real, encountered friction point. Reasoning: it was confirmed via direct testing to be a complete no-op for the actual problem encountered, and represents standing future risk (a blanket bypass that could silently defeat RLS's guarantee once real multi-tenant enforcement matters) with zero present benefit.
+
+---
+
+## 4. The One Known, Time-Boxed Exception: The ADO Personal Access Token
+
+**What it is**: A Personal Access Token scoped to Work Items (Read-only), 7-day expiration, used to work around an unresolved Azure DevOps tenant-identity issue (see Challenges & Real-World Findings #2).
+
+**Why it exists**: Four real, distinct Managed-Identity-based authentication attempts against the `gopdha` ADO org failed with four different errors, tracing back to a genuine MSA/AAD tenant-duality issue in how that specific org is configured. Rather than block all further work indefinitely, a narrowly-scoped, explicitly-labeled exception was adopted.
+
+**What makes this acceptable, not a silent violation of the zero-secrets principle**:
+- Scoped to the minimum real permission needed (read-only, one resource type)
+- Time-boxed (7-day expiry, not indefinite)
+- Explicitly documented, in code comments and in the project's own tracking, as a diagnostic exception — not presented as the intended production pattern
+- The underlying issue remains tracked as open technical debt, not abandoned
+
+**Current status**: Still in use. The proper fix (resolving the Entra-ID identity duality) remains open.
+
+---
+
+## 5. Reviewer Identity — An Honest, Stated Placeholder
+
+The Human Governance API (`approve_report`, `reject_report`) requires an `actor_id`, correctly enforcing reviewer attribution at the database level. However, **there is currently no real authentication verifying that the caller genuinely is the actor they claim to be** — it's a trusted CLI argument / UI selection, not a verified identity.
+
+This is stated plainly, both in code comments and in this document, rather than allowed to look more complete than it is. A real fix would resolve identity from a verified Entra ID token and match it against `actors.entra_object_id` — never trust a caller-supplied value.
+
+---
+
+## 6. Least-Privilege Investigation Scoping
+
+Investigation's real ADO access is scoped via the MCP server's own tool catalog (`wit_query`, `wit_work_item`, etc.) — it cannot write to ADO. Combined with the deterministic Committed-Feature pre-scoping (see ADR-007), the system's real blast radius against a source ADO project is: read-only, limited to a specific, tag-defined subset of work items.
+
+**Not yet formalized**: a complete, explicit mapping of least-privilege tool scoping against the full FR-1/FR-2 specification remains a real, open item (see Project Plan).
+
+---
+
+## 7. Secret Handling Discipline — Real Incidents, Real Response
+
+Two real credentials were exposed directly in conversation during development (an ADO PAT, an Arize API key). Both were treated as compromised the moment exposure occurred — rotated immediately, not just "avoided going forward." This project's `.gitignore` includes an explicit, unusually broad set of secret-pattern exclusions (`.env*`, `*credentials*`, `*secrets*`, `*.pem`, `*.key`, etc.) with a comment directly acknowledging this real history, rather than a generic template.
+
+Before any `git push`, this project's discipline is to explicitly verify `.env` was never committed at any point in history (`git log --all --full-history -- .env`), not just that it's currently ignored.
