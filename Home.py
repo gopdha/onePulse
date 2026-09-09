@@ -3,17 +3,31 @@ single-page layout from Tasks 19-30, against `design_handoff_
 onepulse_ops_console/`: README.md + a self-contained `.dc.html`
 reference + 8 real screenshots).
 
+Rewired for Migration Plan Phase 1 (Task 40): reviews (pending/approve/
+reject), report list/detail, and chat now go over real HTTP to the
+FastAPI service in `api/main.py` (`api_client.py` is the thin client
+that makes those calls), not direct `onepulse_common` imports — the LLD
+Section 2 endpoint contract, specified but never built until this phase.
+Deliberately **not** rewired: generation. `run_pipeline_cycle` is still
+called directly, in-process — the real `202`-returning trigger endpoint
+only becomes real in Phase 3, once execution moves to a worker with a
+real status table behind it; building an in-memory cycle registry now
+would be pure throwaway work. This split is intentional, not an
+oversight — see `api/main.py`'s own module docstring for the full
+reasoning behind all three Phase 1 decisions.
+
 CORE RULE unchanged since Task 18: this is a visual/UX redesign over
-already-proven functions — `run_pipeline_cycle`, `list_recent_reports`,
-`approve_report`, `reject_report`, `ask_question`, the Task 30
-observability wiring (`_get_arize_space_id`, the `onepulse_ui_*` root
-spans). No logic reimplementation. One real, minimal, additive SQL
-enhancement was needed and made directly in `onepulse_common.pipeline.
-list_recent_reports` (see its own docstring): the new design needs the
-real approve/reject *decision*, not just the existing `reviewed`
-boolean, and a real "N sources" count — both now come from a real
-`LEFT JOIN LATERAL` on `approval_records` and a real subquery count on
-`findings`, not fabricated or reimplemented review logic.
+already-proven functions. No logic reimplementation — `api/main.py`
+wraps the same real `onepulse_common` functions unchanged; `Home.py`
+now calls them through that HTTP layer instead of importing them
+directly, but the underlying logic itself never moved. One real,
+minimal, additive SQL enhancement was needed and made directly in
+`onepulse_common.pipeline.list_recent_reports` (see its own docstring,
+predates this phase): the design needs the real approve/reject
+*decision*, not just the existing `reviewed` boolean, and a real
+"N sources" count — both now come from a real `LEFT JOIN LATERAL` on
+`approval_records` and a real subquery count on `findings`, not
+fabricated or reimplemented review logic.
 
 Two load-bearing decisions confirmed present in the reference's own
 code (not just its prose) before implementing, exactly as asked:
@@ -137,19 +151,17 @@ from arize.otel import set_routing_context
 from azure.identity import DefaultAzureCredential
 from opentelemetry import trace
 
-from onepulse_common.chat_assistant import ask_question
-from onepulse_common.embeddings import build_embedding_client
-from onepulse_common.human_governance import (
-    ActorIdRequiredError,
-    NotesRequiredError,
-    approve_report,
-    get_report_detail,
-    reject_report,
+from api_client import (
+    approve_report_via_api,
+    ask_question_via_api,
+    get_report_detail_via_api,
+    list_recent_reports_via_api,
+    reject_report_via_api,
 )
+from onepulse_common.human_governance import ActorIdRequiredError, NotesRequiredError
 from onepulse_common.observability import ARIZE_PROJECT_NAME, enable_observability
-from onepulse_common.pipeline import TOTAL_STAGES, list_recent_reports, load_ado_pat, run_pipeline_cycle
-from onepulse_common.search_index import build_search_client
-from streamlit_app_common import fetch_actors, fetch_programs, run_async, with_connection
+from onepulse_common.pipeline import TOTAL_STAGES, load_ado_pat, run_pipeline_cycle
+from streamlit_app_common import fetch_actors, fetch_programs, run_async
 
 st.set_page_config(page_title="OnePulse", page_icon=":material/monitoring:", layout="wide")
 
@@ -388,7 +400,7 @@ def _file_uri_to_path(uri: str) -> Path:
 
 @st.dialog("Report detail", width="large")
 def show_report_dialog(report_id: int, missing_artifact: str | None = None) -> None:
-    detail = run_async(with_connection(get_report_detail, report_id))
+    detail = run_async(get_report_detail_via_api(report_id))
     report = detail["report"]
     if report is None:
         st.error("Report not found.")
@@ -558,7 +570,7 @@ def render_report_row(report: dict, actor_id: str | None, *, latest: bool) -> No
     busy_action = st.session_state.ops_busy_rows.get(rid)
     if busy_action == "approve":
         try:
-            run_async(with_connection(approve_report, rid, actor_id, ""))
+            run_async(approve_report_via_api(rid, actor_id))
         except ActorIdRequiredError as e:
             st.error(str(e))
         st.session_state.ops_busy_rows.pop(rid, None)
@@ -566,7 +578,7 @@ def render_report_row(report: dict, actor_id: str | None, *, latest: bool) -> No
     elif busy_action == "reject":
         notes = st.session_state.get(f"reject_notes_{rid}", "")
         try:
-            run_async(with_connection(reject_report, rid, actor_id, notes))
+            run_async(reject_report_via_api(rid, actor_id, notes))
         except NotesRequiredError:
             st.error("Notes are required to reject.")
         except ActorIdRequiredError as e:
@@ -597,15 +609,17 @@ def render_citations(citations: list[dict]) -> None:
 
 
 async def _ask(question: str) -> dict:
-    """Unchanged from Task 30 — real root span + Arize routing context
-    around the real `ask_question()` call. See its own docstring there.
+    """Rewired for Migration Plan Phase 1: the real chat logic now runs
+    behind the FastAPI service (`ask_question_via_api`, POST
+    /api/v1/chat/query) instead of `ask_question()` being called
+    in-process. The Arize/root-span wrapping below is unchanged,
+    Streamlit-side telemetry — it observes this UI's own request to the
+    API, independent of where the actual work now happens. `program_id`
+    stays `None` here, matching the exact pre-migration behavior (the
+    original call site never actually scoped chat to the selected
+    project either, despite the UI's own caption text implying it did —
+    not something this rewiring changes).
     """
-    from agent_framework.foundry import FoundryChatClient
-
-    credential = DefaultAzureCredential()
-    chat_client = FoundryChatClient(project_endpoint=PROJECT_ENDPOINT, model=DEPLOYMENT_NAME, credential=credential)
-    search_client = build_search_client(credential)
-    embedding_client = build_embedding_client(credential)
     tracer = trace.get_tracer(__name__)
     try:
         arize_space_id = _get_arize_space_id()
@@ -628,10 +642,8 @@ async def _ask(question: str) -> dict:
         with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
             with tracer.start_as_current_span("onepulse_ui_chat_query") as root_span:
                 root_span.set_attribute("onepulse.question", question)
-                return await ask_question(chat_client, search_client, embedding_client, question)
+                return await ask_question_via_api(question, None, default_actor_id)
     finally:
-        await search_client.close()
-        await embedding_client.close()
         trace.get_tracer_provider().force_flush(timeout_millis=30000)
 
 
@@ -1174,7 +1186,7 @@ with body_ph.container():
 
 actors = run_async(fetch_actors())
 default_actor_id = str(actors[0]["actor_id"]) if actors else None
-recent_reports = run_async(list_recent_reports(limit=4, program_id=selected_program_id))
+recent_reports = run_async(list_recent_reports_via_api(limit=4, program_id=selected_program_id))
 
 body_ph.empty()
 
