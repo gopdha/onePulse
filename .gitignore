@@ -51,6 +51,11 @@ azure-pipelines-secrets.yml
 # Azure Blob Storage — matches singleSlide_demo's own convention of never
 # committing generated report artifacts.
 *.pptx
+# Scoped exception: hand-authored architecture diagrams living alongside
+# docs/build-journey/'s own documentation set are not generated pipeline
+# output — the blanket rule above still protects every real generated
+# report artifact everywhere else in the repo.
+!docs/build-journey/*.pptx
 *.pdf
 local_output/
 

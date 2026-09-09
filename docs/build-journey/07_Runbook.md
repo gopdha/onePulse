@@ -39,9 +39,13 @@ Select a project from the dropdown (nothing loads until you do), then click Gene
 
 ### Via CLI (for scripted/headless runs)
 ```powershell
-python scripts/run_pipeline.py
+python scripts/run_pipeline.py --project "Agentic AI Observability Platform"
 ```
-**Caution**: this script currently has no argparse guard — running `run_pipeline.py --help` will actually execute the real pipeline against `singleSlide`, not print help text.
+A real `argparse` guard is in place: `-h`/`--help` prints usage text and exits before any pipeline
+logic runs, and an unrecognized flag exits with an error — neither triggers a real run against any
+project. `--project` names the real Azure DevOps project to investigate; it defaults to
+`singleSlide` (or `$ONEPULSE_ADO_PROJECT`, if set), but **singleSlide is retired as a test target**
+— pass `--project` explicitly for any real invocation rather than relying on the default.
 
 ### What "Done" Actually Means
 The pipeline can genuinely end in one of several states — don't assume "done" means "a new report was created":
