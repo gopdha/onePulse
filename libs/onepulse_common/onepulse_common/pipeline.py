@@ -57,11 +57,14 @@ plain agent_framework.FunctionTool instead.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
 import datetime as dt
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -222,14 +225,88 @@ def _extract_work_item_ids(raw_tool_text: str) -> list[int]:
     return [item["id"] for item in parsed.get("workItems", [])]
 
 
-def _extract_work_item_fields(raw_tool_text: str) -> list[dict]:
-    """Parses the real MCP wit_work_item 'get_batch' action result.
-    Confirmed live against real data (not assumed) — Task 36: this
-    action's response shape is genuinely different from wit_query's WIQL
-    result above — a plain JSON array of `{id, fields: {...}, url}`
-    objects, no guard markers wrapping it.
+class GuardMarkerParseError(ValueError):
+    """Raised by `_extract_work_item_fields` when a payload starts with
+    `<<` (so looks guard-marker-wrapped) but the expected opening/closing
+    tag structure can't actually be found — a real, named failure mode
+    distinct from a generic `json.JSONDecodeError`, so a caller (or a
+    human reading a log) can immediately tell "the wrapper shape wasn't
+    what we expected" apart from "the JSON itself was malformed."
     """
-    items = json.loads(raw_tool_text)
+
+
+def _extract_work_item_fields(raw_tool_text: str) -> list[dict]:
+    """Parses the real MCP wit_work_item 'get_batch' action result — a
+    JSON array of `{id, fields: {...}, url}` objects.
+
+    Real bug found and fixed live (2026-09-09): Task 36's docstring here
+    originally claimed this response carries "no guard markers wrapping
+    it," confirmed against the server version live at the time. That is
+    no longer true: the installed `@azure-devops/mcp` is spawned
+    unpinned (`npx -y @azure-devops/mcp`, see `_ado_mcp_server_params`),
+    and a newer real server version (confirmed live: 2.10.0, vs 2.9.0
+    when Task 36 checked) now wraps this action's payload in the same
+    `<<hash>> [UNTRUSTED ...] <<hash>>` guard markers `wit_query`
+    already handles via `_extract_work_item_ids` — real upstream
+    dependency drift, not a bug in this project's own recent changes.
+    `json.loads(raw_tool_text)` directly then failed with
+    `JSONDecodeError: Expecting value: line 1 column 1 (char 0)` on
+    every real `wit_work_item(get_batch, ...)` call, reproduced and
+    confirmed via a direct raw-result dump against the real MCP server,
+    not inferred from the exception alone.
+
+    Unlike `_extract_work_item_ids`'s `{`/`}` bracket search, a naive
+    `[`/`]` search here would incorrectly match the guard marker's own
+    `[UNTRUSTED ...]` annotation text (which uses square brackets) —
+    confirmed against the real captured payload. The real wrapper also
+    has a genuine closing tag at the very end, `<</hash>>` (note the
+    `/`, distinct from the opening `<<hash>>`) — a first attempt at this
+    fix stripped only the leading wrapper and left that trailing tag
+    attached, producing a *different* real error,
+    `JSONDecodeError: Extra data`, on the exact same real payload;
+    caught by re-running the real CLI reproduction after the first fix
+    rather than assuming it was complete.
+
+    Second real bug found and fixed (2026-09-09): the closing tag was
+    originally located via a bare `text.rindex("<<")` — matching the
+    LAST "<<" anywhere in the text. The wrapped payload's content is
+    real Azure DevOps work item data, and a title is free text — nothing
+    stops a real title from containing literal "<<"/">>" characters.
+    Empirically verified this is not actually exploitable *while a real
+    closing tag is present* (the closing tag is always textually last,
+    so `rindex` still finds it correctly even with "<<"/">>" inside a
+    title) — but the moment a closing tag is genuinely absent or
+    malformed (a future server response shape, a truncated payload),
+    `rindex("<<")` falls back to silently matching inside a title
+    instead, truncating the JSON and raising a confusing, generic
+    `JSONDecodeError: Unterminated string...` with no indication of what
+    actually went wrong. Fixed by matching the closing tag against the
+    *exact hash captured from the opening tag* (`<</{hash}>>`) rather
+    than a bare `<<` — this removes the "closing tag happens to be
+    textually last" coincidence entirely, rather than merely relying on
+    it, and any failure to find the expected structure now raises a
+    clear, named `GuardMarkerParseError` instead of an opaque
+    `JSONDecodeError` pointing at the wrong root cause.
+    """
+    text = raw_tool_text.strip()
+    if text.startswith("<<"):
+        try:
+            first_tag_end = text.index(">>") + 2
+            opening_tag = text[:first_tag_end]
+            tag_hash = opening_tag[2:-2]
+            second_tag = f"<<{tag_hash}>>"
+            second_tag_start = text.index(second_tag, first_tag_end)
+            second_tag_end = second_tag_start + len(second_tag)
+            closing_tag = f"<</{tag_hash}>>"
+            closing_tag_start = text.rindex(closing_tag)
+        except ValueError as exc:
+            raise GuardMarkerParseError(
+                f"Expected a '<<{{hash}}>> [...] <<{{hash}}>> ... <</{{hash}}>>' guard-marker-wrapped "
+                f"payload but couldn't find the matching tag structure. Raw text (first 200 chars): "
+                f"{raw_tool_text[:200]!r}"
+            ) from exc
+        text = text[second_tag_end:closing_tag_start].strip()
+    items = json.loads(text)
     return [
         {
             "id": item["id"],
@@ -408,6 +485,44 @@ def _noop_detail(message: str) -> None:
     pass
 
 
+@contextlib.asynccontextmanager
+async def _heartbeat(on_detail: Callable[[str], None], label: str, interval_seconds: float = 10.0):
+    """Real fix (2026-09-09): the completion-counter logging added to
+    `build_mcp_function_tools` only closes the silence that happens
+    WHILE tool calls are in flight. Real gaps of 30-71s remained around
+    it — a real live run against a 115-item scope showed the largest at
+    the moment the agent finishes its last tool call and composes its
+    final structured output over all 115 findings, which is real model
+    inference time with no tool call in flight to hook a completion
+    event onto at all.
+
+    `on_detail` has no hook inside `agent.run()`'s own internal
+    tool-calling/generation loop, and doesn't need one: this wraps any
+    `await agent.run(...)` (or any other real, possibly-slow awaited
+    call) with a background task that logs real elapsed time every
+    `interval_seconds` regardless of what's actually happening inside —
+    tool-call latency the framework handles internally, or the model's
+    own generation time. It is cancelled the instant the wrapped call
+    returns (success or failure), so it never logs after the real work
+    is done, and it never claims fake progress — only real elapsed
+    seconds, honestly labeled as "still running."
+    """
+    start = time.monotonic()
+
+    async def _tick() -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            on_detail(f"· {label}: still running ({time.monotonic() - start:.0f}s elapsed, no result yet)")
+
+    task = asyncio.create_task(_tick())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 def load_ado_pat(raw_pat: str | None = None) -> str:
     raw_pat = raw_pat if raw_pat is not None else os.environ.get("ONEPULSE_ADO_PAT")
     if not raw_pat:
@@ -420,19 +535,47 @@ def load_ado_pat(raw_pat: str | None = None) -> str:
 
 async def build_mcp_function_tools(
     mcp_session: ClientSession, on_detail: Callable[[str], None] = _noop_detail
-) -> list[FunctionTool]:
+) -> tuple[list[FunctionTool], dict[str, int]]:
     """This project's own proven mcp.ClientSession bridge, wrapping each
     real, dynamically discovered MCP tool as a plain
     agent_framework.FunctionTool — see module docstring for why
     agent_framework's native MCPStdioTool is bypassed entirely.
+
+    Real bug found and fixed (2026-09-09): a real run against a
+    115-item scope has the Investigation agent dispatch all 115
+    `wit_work_item(list_comments, ...)` calls concurrently within ~70ms
+    of each other, then wait up to several minutes for the real ADO API
+    responses to trickle back — but this function only ever logged on
+    DISPATCH, never on completion, so the entire multi-minute real wait
+    produced zero log output. That silence is what convinced an earlier
+    session the run had hung (it hadn't — confirmed by a later run that
+    completed normally after the same ~4m17s silent window). Fixed by
+    logging a real, exact completion counter (`N/M tool call(s)
+    resolved`) as each call actually returns, not just when it's issued
+    — this is on `on_detail`, the same single source of truth the
+    curated UI view and the full-fidelity log file both already read
+    from (no second tracking system), so both outputs get it for free.
+
+    Returns `(function_tools, progress)` — `progress` is the same
+    mutable `{"dispatched": int, "completed": int}` dict every returned
+    tool's own closure updates, so a caller can read its real final
+    counts after the agent's tool-use loop finishes and log one real
+    summary line, without a second, separate tracking mechanism.
     """
     result = await mcp_session.list_tools()
     function_tools = []
+    progress = {"dispatched": 0, "completed": 0}
     for tool in result.tools:
 
         async def call_tool(_tool_name=tool.name, **kwargs) -> str:
+            progress["dispatched"] += 1
             on_detail(f"· real tool call: {_tool_name}({kwargs})")
             call_result = await mcp_session.call_tool(_tool_name, kwargs)
+            progress["completed"] += 1
+            on_detail(
+                f"· real tool call completed: {_tool_name} "
+                f"({progress['completed']}/{progress['dispatched']} tool call(s) resolved so far)"
+            )
             return "\n".join(block.text for block in call_result.content if hasattr(block, "text"))
 
         function_tools.append(
@@ -443,7 +586,21 @@ async def build_mcp_function_tools(
                 func=call_tool,
             )
         )
-    return function_tools
+    return function_tools, progress
+
+
+def _ado_mcp_server_entry_path() -> Path:
+    """The real, locally-installed Azure DevOps MCP server entry point —
+    `node_modules/@azure-devops/mcp/dist/index.js`, the exact file this
+    repo's own `package.json`-pinned install's `bin.mcp-server-azuredevops`
+    points at (confirmed live via `npm view @azure-devops/mcp@2.10.0
+    bin`). Extracted as its own function, separate from
+    `_ado_mcp_server_params`, purely so a test can monkeypatch it to
+    exercise the "install missing" error path without needing to
+    actually delete the real local install.
+    """
+    repo_root = Path(__file__).resolve().parents[3]
+    return repo_root / "node_modules" / "@azure-devops" / "mcp" / "dist" / "index.js"
 
 
 def _ado_mcp_server_params(ado_org_name: str, ado_pat_b64: str, ado_project_name: str) -> StdioServerParameters:
@@ -475,10 +632,65 @@ def _ado_mcp_server_params(ado_org_name: str, ado_pat_b64: str, ado_project_name
     function so this specific real fix has a real regression test
     (`tests/test_pipeline_mcp_server_params.py`) without needing to spin
     up live Azure DevOps infrastructure just to prove an env var is set.
+
+    Version pinned (2026-09-09): this was the actual mechanism behind
+    the real Investigation outage `_extract_work_item_fields` fixes
+    above. `npx -y @azure-devops/mcp` (no version) resolved to 2.9.0
+    when Task 36 wrote that parser, then silently resolved to 2.10.0 by
+    the time of this fix — a real upstream response-shape change (the
+    guard-marker wrapping around `wit_work_item`'s `get_batch`/
+    `list_comments` results) reached this project with zero code change
+    on our side. Confirmed live (`npm view @azure-devops/mcp@2.10.0
+    version`) that 2.10.0 — the version this project's parsers are now
+    written and tested against — resolves cleanly. Pinning stops the
+    next silent upstream shape change from becoming the same class of
+    outage again; bumping this version is now a deliberate, reviewed
+    action instead of something that happens automatically on the next
+    `npx` cache miss.
+
+    Spawns a real local install, not `npx` (2026-09-09): even pinned,
+    `npx -y` still resolves and potentially fetches at every real spawn
+    — real, live-demonstrated risk: an interrupted install (this
+    project's own earlier diagnostic run, killed by a `timeout`) left a
+    real corrupted npm cache entry (`@azure/msal-node-extensions/dist/`
+    missing `index.mjs`) that broke the very next real pipeline run with
+    a real `ERR_MODULE_NOT_FOUND`, recovered only by deleting the
+    corrupted cache directory and letting a fresh install complete.
+    Inside a container this class of failure has no equivalent
+    recovery — a request-time `npx` fetch either needs outbound network
+    access at runtime (often disallowed) or fails outright, and a
+    corrupted cache persists across every subsequent request until the
+    container is rebuilt. The real, correct fix: install
+    `@azure-devops/mcp@2.10.0` as a normal declared dependency (this
+    repo's own `package.json`, pinned to the identical version, with
+    `package-lock.json` committed for a reproducible `npm ci`) and spawn
+    its real installed entry point (`node_modules/@azure-devops/mcp/
+    dist/index.js`, the file `bin.mcp-server-azuredevops` in the
+    package's own `package.json` points at — confirmed live via `npm
+    view @azure-devops/mcp@2.10.0 bin`) directly via `node`, never `npx`.
+    A container build runs `npm ci` once, offline-safe after that, at
+    build time — the exact same guarantee this project's Python
+    dependencies already get from `uv`/`pip` installing into the image;
+    Node dependencies were the one real gap. Confirmed live: the
+    locally-installed binary starts identically to the npx-resolved one
+    (same real `"version":"2.10.0"` startup banner, same behavior).
+    Fails loudly with a clear, actionable error if the local install is
+    missing, rather than silently falling back to `npx` — a silent
+    fallback would just reintroduce the exact runtime-fetch risk this
+    fix exists to remove.
     """
+    server_entry = _ado_mcp_server_entry_path()
+    if not server_entry.exists():
+        raise RuntimeError(
+            f"Local Azure DevOps MCP server install not found at {server_entry}. "
+            "Run `npm install` at the repo root first (see package.json) — this project spawns "
+            "the locally installed binary directly rather than resolving it via `npx` at request "
+            "time (2026-09-09: an interrupted `npx` install once corrupted its own cache and broke "
+            "a real pipeline run; a container has no recovery path for that at request time)."
+        )
     return StdioServerParameters(
-        command="npx",
-        args=["-y", "@azure-devops/mcp", ado_org_name, "--authentication", "pat", "-d", "core", "work-items"],
+        command="node",
+        args=[str(server_entry), ado_org_name, "--authentication", "pat", "-d", "core", "work-items"],
         env={"PERSONAL_ACCESS_TOKEN": ado_pat_b64, "ado_mcp_project": ado_project_name},
     )
 
@@ -516,7 +728,7 @@ async def investigate(
 
             tower_hierarchy = await _query_tower_hierarchy(mcp_session, feature_ids, child_ids, on_detail)
 
-            tools = await build_mcp_function_tools(mcp_session, on_detail)
+            tools, tool_call_progress = await build_mcp_function_tools(mcp_session, on_detail)
 
             async with Agent(
                 client=chat_client,
@@ -525,11 +737,16 @@ async def investigate(
                 tools=tools,
                 default_options={"response_format": INVESTIGATION_SCHEMA},
             ) as agent:
-                result = await agent.run(
-                    f"Investigate exactly these {len(scope_ids)} real work item ID(s) — the already-confirmed "
-                    f"Committed scope for '{ado_project_name}' — and report your findings for every one of "
-                    f"them: {scope_ids}"
-                )
+                async with _heartbeat(on_detail, "Investigation agent"):
+                    result = await agent.run(
+                        f"Investigate exactly these {len(scope_ids)} real work item ID(s) — the already-confirmed "
+                        f"Committed scope for '{ado_project_name}' — and report your findings for every one of "
+                        f"them: {scope_ids}"
+                    )
+            on_detail(
+                f"Investigation tool calls complete: {tool_call_progress['completed']} of "
+                f"{tool_call_progress['dispatched']} real tool call(s) resolved."
+            )
 
     return json.loads(result.text)["findings"], len(scope_ids), tower_hierarchy
 
@@ -545,7 +762,7 @@ async def analyze_status_deck(
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as mcp_session:
             await mcp_session.initialize()
-            tools = await build_mcp_function_tools(mcp_session, on_detail)
+            tools, tool_call_progress = await build_mcp_function_tools(mcp_session, on_detail)
 
             async with Agent(
                 client=chat_client,
@@ -554,16 +771,25 @@ async def analyze_status_deck(
                 tools=tools,
                 default_options={"response_format": STATUS_ANALYSIS_SCHEMA},
             ) as agent:
-                result = await agent.run(
-                    f"Analyze the status deck at '{status_deck_path}' against these tracked work items:\n"
-                    f"{json.dumps(findings, indent=2)}"
-                )
+                async with _heartbeat(on_detail, "Status Update Analysis agent"):
+                    result = await agent.run(
+                        f"Analyze the status deck at '{status_deck_path}' against these tracked work items:\n"
+                        f"{json.dumps(findings, indent=2)}"
+                    )
+            on_detail(
+                f"Status Update Analysis tool calls complete: {tool_call_progress['completed']} of "
+                f"{tool_call_progress['dispatched']} real tool call(s) resolved."
+            )
 
     return json.loads(result.text)
 
 
 async def synthesize(
-    chat_client: FoundryChatClient, findings: list[dict], ado_project_name: str, feedback: str | None = None
+    chat_client: FoundryChatClient,
+    findings: list[dict],
+    ado_project_name: str,
+    feedback: str | None = None,
+    on_detail: Callable[[str], None] = _noop_detail,
 ) -> str:
     content = (
         f"Real investigated findings for program '{ado_project_name}':\n"
@@ -579,19 +805,23 @@ async def synthesize(
         instructions=SYNTHESIS_INSTRUCTIONS,
         default_options={"response_format": SYNTHESIS_SCHEMA},
     ) as agent:
-        result = await agent.run(content)
+        async with _heartbeat(on_detail, "Synthesis agent"):
+            result = await agent.run(content)
 
     return json.loads(result.text)["executive_summary"]
 
 
-async def self_critique(chat_client: FoundryChatClient, draft: str) -> dict:
+async def self_critique(
+    chat_client: FoundryChatClient, draft: str, on_detail: Callable[[str], None] = _noop_detail
+) -> dict:
     async with Agent(
         client=chat_client,
         name="onepulse-self-critique-agent",
         instructions=SELF_CRITIQUE_INSTRUCTIONS,
         default_options={"response_format": SELF_CRITIQUE_SCHEMA},
     ) as agent:
-        result = await agent.run(f"Draft executive summary:\n{draft}")
+        async with _heartbeat(on_detail, "Self-critique agent"):
+            result = await agent.run(f"Draft executive summary:\n{draft}")
 
     return json.loads(result.text)
 
@@ -618,7 +848,7 @@ async def run_quality_gate(
     See quality_gate.py's own docstring for the real bug this closes.
     """
     code_ok_before = code_enforced_risk_floor_check(findings, initial_draft, queried_item_count)
-    critique_before = await self_critique(chat_client, initial_draft)
+    critique_before = await self_critique(chat_client, initial_draft, on_detail)
     subjective_ok_before = critique_before["tone_conciseness_pass"]
 
     on_detail(f'Draft: "{initial_draft}"')
@@ -665,10 +895,12 @@ async def run_quality_gate(
         feedback_parts.append(critique_before["feedback"])
 
     on_detail("Triggering the one permitted revision (HLD Section 3 / FR-4)...")
-    revised_draft = await synthesize(chat_client, findings, ado_project_name, feedback=" ".join(feedback_parts))
+    revised_draft = await synthesize(
+        chat_client, findings, ado_project_name, feedback=" ".join(feedback_parts), on_detail=on_detail
+    )
 
     code_ok_after = code_enforced_risk_floor_check(findings, revised_draft, queried_item_count)
-    critique_after = await self_critique(chat_client, revised_draft)
+    critique_after = await self_critique(chat_client, revised_draft, on_detail)
     subjective_ok_after = critique_after["tone_conciseness_pass"]
 
     on_detail(f'Revised draft: "{revised_draft}"')
@@ -985,7 +1217,7 @@ async def run_pipeline_cycle(
         on_detail(f"Overall status: {overall_status.upper()}")
 
         on_stage(4, TOTAL_STAGES, "Synthesis — drafting executive summary")
-        initial_summary = await synthesize(chat_client, findings, ado_project_name)
+        initial_summary = await synthesize(chat_client, findings, ado_project_name, on_detail=on_detail)
 
         on_stage(5, TOTAL_STAGES, "Self-critique — evaluating draft against the revision-cap gate")
         outcome, final_summary, attempts = await run_quality_gate(

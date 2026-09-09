@@ -59,6 +59,7 @@ Run: python scripts/run_pipeline.py
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import sys
@@ -80,11 +81,29 @@ PROJECT_ENDPOINT = os.environ.get(
 )
 DEPLOYMENT_NAME = os.environ.get("ONEPULSE_FOUNDRY_DEPLOYMENT_NAME", "onePulse-gpt-5-mini")
 ADO_ORG_NAME = os.environ.get("ONEPULSE_ADO_ORG", "gopdha")
-ADO_PROJECT_NAME = os.environ.get("ONEPULSE_ADO_PROJECT", "singleSlide")
 STATUS_DECK_PATH = os.environ.get("ONEPULSE_STATUS_DECK_PATH", "sample_status_deck.pptx")
 
 OUTPUT_DIR = "output"  # real per-project path computed by onepulse_common.pipeline.build_output_path()
 PPTX_MCP_SERVER_PATH = "scripts/pptx_mcp_server.py"
+
+
+def parse_args() -> argparse.Namespace:
+    """Real argparse guard — added because there was none: `-h`/
+    `--help` and any unrecognised flag previously fell straight through
+    to `asyncio.run(main())` with no inspection of `sys.argv` at all, so
+    `python scripts/run_pipeline.py --help` silently launched a real
+    pipeline run (confirmed: this is the exact accidental run already
+    documented in CLAUDE.md's Task 30 entry). `argparse.parse_args()`
+    itself exits before returning on `-h`/`--help` or an unrecognised
+    flag — no special-casing of the literal string needed.
+    """
+    parser = argparse.ArgumentParser(description="Run the real OnePulse report pipeline once, end to end.")
+    parser.add_argument(
+        "--project",
+        default=os.environ.get("ONEPULSE_ADO_PROJECT", "singleSlide"),
+        help="Real Azure DevOps project name to investigate (default: singleSlide, or $ONEPULSE_ADO_PROJECT).",
+    )
+    return parser.parse_args()
 
 
 def print_stage(n: int, total: int, message: str) -> None:
@@ -95,13 +114,13 @@ def print_detail(message: str) -> None:
     print(f"      {message}")
 
 
-async def main() -> None:
+async def main(ado_project_name: str) -> None:
     ado_pat_b64 = load_ado_pat()
 
     credential = DefaultAzureCredential()
     arize_space_id = enable_observability(credential, PROJECT_ENDPOINT)
 
-    print(f"OnePulse real pipeline run — org '{ADO_ORG_NAME}', project '{ADO_PROJECT_NAME}'")
+    print(f"OnePulse real pipeline run — org '{ADO_ORG_NAME}', project '{ado_project_name}'")
 
     # Real structural fix (Task 11): one explicit root span, kept active
     # for the whole run via `with`, so every span created underneath
@@ -133,7 +152,7 @@ async def main() -> None:
         with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
             with tracer.start_as_current_span("onepulse_pipeline_run") as root_span:
                 root_span.set_attribute("onepulse.ado_org", ADO_ORG_NAME)
-                root_span.set_attribute("onepulse.ado_project", ADO_PROJECT_NAME)
+                root_span.set_attribute("onepulse.ado_project", ado_project_name)
 
                 result = await run_pipeline_cycle(
                     ado_pat_b64=ado_pat_b64,
@@ -141,7 +160,7 @@ async def main() -> None:
                     deployment_name=DEPLOYMENT_NAME,
                     credential=credential,
                     ado_org_name=ADO_ORG_NAME,
-                    ado_project_name=ADO_PROJECT_NAME,
+                    ado_project_name=ado_project_name,
                     status_deck_path=STATUS_DECK_PATH,
                     pptx_mcp_server_path=PPTX_MCP_SERVER_PATH,
                     output_dir=OUTPUT_DIR,
@@ -167,4 +186,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    args = parse_args()
+    asyncio.run(main(args.project))

@@ -199,18 +199,14 @@ st.html(
 }
 .st-key-app_bar, .st-key-app_bar p, .st-key-app_bar span, .st-key-app_bar div,
 .st-key-app_bar label { color: #ffffff; }
-.st-key-project_bar { gap: 8px !important; }
-.st-key-project_label p {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
-    font-size: 11px !important;
-    letter-spacing: 0.1em !important;
-    color: #91a4c5 !important;
-    margin: 0 !important;
-    text-align: right !important;
-}
 /* Real structure (confirmed live, not the older BaseWeb `data-baseweb`
    markup this Streamlit version replaced): a react-aria ComboBox —
-   `input[role="combobox"]` for the field, a `button` for the toggle. */
+   `input[role="combobox"]` for the field, a `button` for the toggle.
+   `margin-left: auto` forces this flush against the app bar's right
+   edge regardless of the row's own flex-distribution quirks (found
+   live: `horizontal_alignment="distribute"` alone did not reliably
+   push a single remaining child all the way to the edge). */
+.st-key-project_select { margin-left: auto !important; }
 .st-key-project_select .stSelectbox { width: 280px; }
 /* Real contrast bug found live: Streamlit's own internal wrapper div
    around the combobox (an auto-generated st-emotion-cache-* class, not
@@ -247,29 +243,68 @@ st.html(
    keeping real Streamlit buttons inside real grid cells. */
 .st-key-table_header, .st-key-row_latest, [class*="st-key-row_hist_"] {
     display: grid !important;
-    grid-template-columns: 1fr 190px 88px 250px !important;
+    /* Real bug found and fixed live via DOM inspection (not guessed):
+       widening the assistant rail (below) shrank this table's own
+       column, and the 1fr RUN track computed to ~117px — narrower than
+       the real "Tue, Sep 8 2026 · 02:48 NEW" text, which then visually
+       overflowed into the STATE column instead of wrapping (confirmed
+       via getBoundingClientRect on both columns showing overlapping x
+       ranges). STATE/REVIEW narrowed further (190->115, 250->210 —
+       their real content, short badge chips and two buttons, never
+       needed that much) to give the RUN column real room again. */
+    grid-template-columns: 1fr 115px 88px 210px !important;
     gap: 16px !important;
     align-items: center !important;
 }
 .st-key-table_header { background: #fafbfc; padding: 13px 26px; border-bottom: 1px solid #e6e9ee; }
 .st-key-table_header > div:last-child { text-align: right !important; }
-.st-key-row_latest { background: #f4f7fb; padding: 16px 26px; border-bottom: 1px solid #e6e9ee; }
-[class*="st-key-row_hist_"] { padding: 11px 26px; border-bottom: 1px solid #f1f3f6; }
+/* Real fix: the "latest" row no longer gets a distinct tinted
+   background — all 4 rows now share the same white background. Row
+   heights halved (16px/11px vertical padding -> 8px/6px) now that the
+   meta line ("41 min ago · run 3m 12s · N sources") below the date is
+   gone entirely. */
+.st-key-row_latest { padding: 8px 26px; border-bottom: 1px solid #e6e9ee; }
+[class*="st-key-row_hist_"] { padding: 6px 26px; border-bottom: 1px solid #f1f3f6; }
 [class*="st-key-review_col_"] { justify-content: flex-end !important; }
+/* Real fix: the header and first data row used to carry Streamlit's own
+   default inter-container vertical gap between them, reading as a real
+   visible gap rather than one connected block — reports_table wraps
+   just the header + rows so gap=0 (passed on the container itself,
+   see Python) applies only there, not to the generate section below. */
 
 .st-key-reports_panel { background: #ffffff !important; border-right: 1px solid #eceef2 !important; }
 /* Real spacing fix (found live): the report table and the Generate
    section used to run directly into each other, relying only on the
    last row's own thin 1px separator to distinguish them. A thicker,
    deliberate divider bar plus a tinted background reads as two real,
-   distinct sections instead of one continuous block. */
+   distinct sections instead of one continuous block. Margin increased
+   5x (6px -> 30px) per explicit request for more visual separation. */
 .st-key-generate_section {
     padding: 24px 26px 28px !important;
-    margin-top: 6px !important;
+    margin-top: 30px !important;
     border-top: 6px solid #f2f4f7 !important;
     background: #fcfcfd !important;
 }
 .st-key-assistant_rail { background: #fafbfc !important; }
+/* Suggested-question chips: smaller, secondary-looking text (found
+   live: default st.button sizing read too large/prominent for what
+   are meant to be lightweight prompt suggestions). */
+[class*="st-key-chip_"] button {
+    font-size: 11.5px !important;
+    padding: 3px 10px !important;
+    color: #55607a !important;
+}
+/* Chat input: darker, navy-tinted background instead of the default
+   light/white field, matching the app's navy accent. */
+.st-key-assistant_rail [data-testid="stChatInput"] {
+    background: #d3dcec !important;
+    border: 1px solid #adbcd6 !important;
+    border-radius: 8px !important;
+}
+.st-key-assistant_rail [data-testid="stChatInput"] textarea {
+    background: transparent !important;
+    color: #1c2b45 !important;
+}
 
 /* Console styling now lives inline in the markdown Home.py generates for
    console_ph (a real StreamlitDuplicateElementKey bug meant this block's
@@ -323,26 +358,6 @@ def _fmt_dt(ts: dt.datetime) -> str:
     # specific (glibc vs MSVC) — built from parts instead so it's correct
     # on both, not just whichever platform happened to be tested on.
     return f"{ts.strftime('%a, %b')} {ts.day} {ts.strftime('%Y')} · {ts.strftime('%H:%M')}"
-
-
-def _fmt_relative(ts: dt.datetime) -> str:
-    now = dt.datetime.now(dt.timezone.utc)
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=dt.timezone.utc)
-    delta = now - ts
-    seconds = delta.total_seconds()
-    if seconds < 60:
-        return "just now"
-    if seconds < 3600:
-        return f"{int(seconds // 60)} min ago"
-    if seconds < 86400:
-        return f"{int(seconds // 3600)} hours ago"
-    return f"{int(seconds // 86400)} days ago"
-
-
-def _fmt_duration(seconds: float) -> str:
-    s = int(round(seconds))
-    return f"{s}s" if s < 60 else f"{s // 60}m {s % 60:02d}s"
 
 
 def _reset_project_state(project_name: str | None) -> None:
@@ -435,35 +450,41 @@ def render_report_row(report: dict, actor_id: str | None, *, latest: bool) -> No
     with row:
         col1 = st.container()
         with col1:
+            # Real fix: the meta line ("41 min ago · run 3m 12s · N
+            # sources") is gone entirely, and the "latest" badge now
+            # reads "NEW" and comes AFTER the date/time text instead of
+            # before it — both explicit, requested changes, not a
+            # cosmetic rewrite of the whole row.
+            # Real bug found and fixed live: removing the meta line below
+            # (per this task's own request) left this column's real
+            # content narrower than before, and shrinking the reports
+            # panel to make room for a wider assistant rail (below)
+            # narrowed the grid's flexible RUN column further still —
+            # together enough to make the browser wrap the date across
+            # 3 lines. `white-space: nowrap` on the wrapping span forces
+            # the grid's `1fr` track to size to the text's real
+            # min-content width instead, which is the correct fix per
+            # how CSS Grid computes track sizes, not a workaround.
             if latest:
                 st.markdown(
+                    "<span style='white-space:nowrap;'>"
+                    f"<span style='font-size:17px; font-weight:600; color:#171b22;'>{_fmt_dt(created)}</span> "
                     "<span style='font-family:ui-monospace,monospace; font-size:9.5px; letter-spacing:.12em; "
-                    "color:#fff; background:#1F3864; padding:3px 7px; border-radius:4px;'>LATEST</span> "
-                    f"<span style='font-size:17px; font-weight:600; color:#171b22;'>{_fmt_dt(created)}</span>",
+                    "color:#fff; background:#1F3864; padding:3px 7px; border-radius:4px;'>NEW</span></span>",
                     unsafe_allow_html=True,
                 )
             else:
                 st.markdown(
-                    f"<span style='font-family:ui-monospace,monospace; font-size:13px; color:#2a3140;'>"
-                    f"{_fmt_dt(created)}</span>",
+                    f"<span style='white-space:nowrap; font-family:ui-monospace,monospace; font-size:13px; "
+                    f"color:#2a3140;'>{_fmt_dt(created)}</span>",
                     unsafe_allow_html=True,
                 )
-            sub_bits = [_fmt_relative(created)]
-            run_duration = st.session_state.get("ops_last_run_duration", {}).get(rid)
-            if run_duration is not None:
-                sub_bits.append(f"run {_fmt_duration(run_duration)}")
-            sub_bits.append(f"{report.get('finding_count', 0)} sources")
-            st.markdown(
-                f"<span style='font-family:ui-monospace,monospace; font-size:11px; color:#6c7683;'>"
-                f"{' · '.join(sub_bits)}</span>",
-                unsafe_allow_html=True,
-            )
 
         status = _report_status(report)
         label, color = _STATE_CHIP[status]
         st.badge(label, color=color)
 
-        # Real fix (found live): "Open" used to always show the
+        # Real fix (found live, Task 34): this used to always show the
         # Postgres-sourced executive summary/findings, never the actual
         # rendered .pptx `run_pipeline_cycle` saved for this exact report
         # row. `list_recent_reports()` already selects the real
@@ -472,11 +493,12 @@ def render_report_row(report: dict, actor_id: str | None, *, latest: bool) -> No
         # serves them via a real download control — browsers can't
         # reliably navigate straight to a local file:// path, so
         # st.download_button is the correct primitive, not a bare link.
+        # Label renamed "Open" -> "Download" to match its real behavior.
         rendered_uri = report.get("rendered_artifact_uri")
         local_path = _file_uri_to_path(rendered_uri) if rendered_uri else None
         if local_path is not None and local_path.is_file():
             st.download_button(
-                "Open",
+                "Download",
                 data=local_path.read_bytes(),
                 file_name=local_path.name,
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -487,7 +509,7 @@ def render_report_row(report: dict, actor_id: str | None, *, latest: bool) -> No
             # disk (e.g. a report rendered in an earlier session) — fall
             # back to the Postgres-sourced dialog rather than a dead
             # button, and say so plainly inside it.
-            if st.button("Open", key=f"open_{rid}"):
+            if st.button("Download", key=f"open_{rid}"):
                 show_report_dialog(rid, missing_artifact=rendered_uri)
 
         review_col = st.container(horizontal=True, key=f"review_col_{rid}")
@@ -620,8 +642,8 @@ async def _ask(question: str) -> dict:
 # signal. Purely a UI label — every NUMBER shown next to it is computed
 # live from real on_stage/on_detail data, never from this dict.
 REAL_STAGE_NAMES = {
-    1: "Investigation",
-    2: "Status Analysis",
+    1: "ADO Investigation",
+    2: "Status Reports Investigation",
     3: "Deterministic Rollup",
     4: "Synthesis",
     5: "Self-critique",
@@ -690,6 +712,14 @@ def _apply_detail_to_stage(stages: dict, shared: dict, current_stage: int, messa
             shared["feature_count"] = int(m.group(1))
         if re.match(r"^#\d+ ", message):
             shared["pending_findings_count"] = shared.get("pending_findings_count", 0) + 1
+            # Real finding-status parse (Task 37): pipeline.py emits this
+            # exact real line as `f"#{id} {title} — {status}"` — the
+            # status is real FR-1 output already known this early, so
+            # Synthesis's later "N item(s) flagged" summary needs no new
+            # computation, just this pre-computed real count.
+            status = message.rsplit(" — ", 1)[-1].strip()
+            if status and status != "On Track":
+                shared["flagged_findings_count"] = shared.get("flagged_findings_count", 0) + 1
         if "No Features tagged 'Committed' found" in message:
             shared["zero_scope"] = True
             stages[1]["detail"] = "no committed features found"
@@ -716,15 +746,18 @@ def _apply_detail_to_stage(stages: dict, shared: dict, current_stage: int, messa
             stages[3]["detail"] = f"overall status: {m.group(1)}"
     elif current_stage == 5:
         if message.startswith('Draft: "'):
-            # Real, deliberate overwrite (Task 32 bug fix): on_stage's own
-            # "close the previous stage" step fires BEFORE this arrives
-            # (on_stage(5,...) closes stage 4 with a generic "done"
-            # fallback the instant stage 5 starts, since the real draft
-            # text — logged from inside run_quality_gate — hasn't been
-            # seen yet at that moment). This retroactively replaces that
-            # fallback with the real, computed word count once it is.
-            draft_text = message[len('Draft: "'):-1]
-            stages[4]["detail"] = f"drafted a {len(draft_text.split())}-word executive summary"
+            # Real, deliberate overwrite (Task 32 bug fix, detail updated
+            # Task 37): on_stage's own "close the previous stage" step
+            # fires BEFORE this arrives (on_stage(5,...) closes stage 4
+            # with a generic "done" fallback the instant stage 5 starts,
+            # since the real draft text — logged from inside
+            # run_quality_gate — hasn't been seen yet at that moment).
+            # This retroactively replaces that fallback once it is. A
+            # word count isn't meaningful to a reader, so this uses the
+            # real flagged-item count instead — already known from stage
+            # 1's own finding lines (see above), not a new computation.
+            flagged = shared.get("flagged_findings_count", 0)
+            stages[4]["detail"] = f"executive summary drafted, {flagged} item(s) flagged for review"
         if "Triggering the one permitted revision" in message:
             shared["revision_fired"] = True
             stages[5]["live_note"] = "revising for tone (1 of 1 permitted)"
@@ -816,6 +849,30 @@ def _render_stage_ui(steps_ph, progress_ph, status_ph, stages: dict, shared: dic
                 f"<span style='color:#1F3864; font-size:11.5px;'>done in {_fmt_mmss(now - run_start_ts)}</span>",
                 unsafe_allow_html=True,
             )
+
+
+def log_exception_group(exc: BaseException, logger: logging.Logger, depth: int = 0) -> None:
+    """Flatten anyio/asyncio ExceptionGroups so the real error is visible.
+
+    Real bug found live: `_worker()`'s `except Exception as e:` below
+    catches whatever `run_pipeline_cycle`'s `async with stdio_client(...)`
+    raises — an anyio `TaskGroup` wraps every MCP-session-scoped
+    coroutine, so a real failure inside it (e.g. inside a `wit_work_item`
+    call) surfaces as a bare `ExceptionGroup`/`BaseExceptionGroup`
+    whose own `str()` is just `"unhandled errors in a TaskGroup (1
+    sub-exception)"` — the actual exception type, message, and
+    traceback are one level down in `.exceptions` and were never logged.
+    Confirmed against three real failing runs (`logs/Agentic_AI_
+    Observability_Platform_20260909_*.log`): every one shows exactly
+    this uninformative line and nothing else. This recurses because a
+    TaskGroup can itself raise from inside another TaskGroup's scope
+    (nested `async with` blocks), not just one level deep.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            log_exception_group(sub, logger, depth + 1)
+    else:
+        logger.error("  " * depth + "%s: %s", type(exc).__name__, exc, exc_info=exc)
 
 
 def run_generation(selected_project_name: str, selected_program_id: str, console_ph, status_ph, progress_ph) -> None:
@@ -1013,6 +1070,13 @@ def run_generation(selected_project_name: str, selected_program_id: str, console
         cur = shared["current_stage"] or 1
         stages[cur].update(status="failed", end_ts=time.monotonic(), detail=str(result_box["error"]))
         file_logger.error("run failed: %s", result_box["error"])
+        # Real fix: the line above alone only ever logs an anyio
+        # ExceptionGroup's own uninformative str() (e.g. "unhandled
+        # errors in a TaskGroup (1 sub-exception)") — the real
+        # exception is nested inside it and was never reaching the log
+        # file. See log_exception_group's own docstring for how this
+        # was confirmed against real failing runs.
+        log_exception_group(result_box["error"], file_logger)
         _finalize_ui(running=False, done=False)
         run_state.update(running=False, done=False, stages=stages, shared=shared)
         return
@@ -1034,9 +1098,6 @@ def run_generation(selected_project_name: str, selected_program_id: str, console
             if stages[n]["status"] == "pending":
                 stages[n].update(status="skipped", start_ts=time.monotonic(), end_ts=time.monotonic(), detail="hard stop — nothing to persist")
 
-    if result.persisted and result.report_id is not None:
-        st.session_state.setdefault("ops_last_run_duration", {})[result.report_id] = elapsed_total
-
     _finalize_ui(running=False, done=True)
     run_state.update(running=False, done=True, elapsed=elapsed_total, stages=stages, shared=shared)
     st.rerun()
@@ -1051,20 +1112,17 @@ with st.container(key="app_bar", horizontal=True, horizontal_alignment="distribu
         "<span style='font-size:20px; font-weight:600; letter-spacing:-0.015em;'>OnePulse</span>",
         unsafe_allow_html=True,
     )
-    with st.container(horizontal=True, vertical_alignment="center", key="project_bar"):
-        with st.container(key="project_label"):
-            st.caption("PROJECT")
-        programs = run_async(fetch_programs())
-        program_names = [p["name"] for p in programs]
-        with st.container(key="project_select"):
-            selected_project_name = st.selectbox(
-                "Project",
-                program_names,
-                index=None,
-                placeholder="Select a project…",
-                label_visibility="collapsed",
-                key="ops_project_select",
-            )
+    programs = run_async(fetch_programs())
+    program_names = [p["name"] for p in programs]
+    with st.container(key="project_select"):
+        selected_project_name = st.selectbox(
+            "Project",
+            program_names,
+            index=None,
+            placeholder="Select a project…",
+            label_visibility="collapsed",
+            key="ops_project_select",
+        )
 
 if not programs:
     st.error("No programs found in Postgres. Run `scripts/seed_dev_data.py --target dev` first.")
@@ -1075,28 +1133,22 @@ _reset_project_state(selected_project_name)
 # ============================================================================
 # State 1 — Empty (no project selected). Nothing below this branch
 # executes: no report fetch, no actor fetch, no chat state touched.
+# Real redesign (Task 37): a single, unified centered message replaces
+# the two separate left/right empty-state panels — there is no left/
+# right split at all in this state, since a two-column empty layout was
+# itself part of what read as "two separate broken sections" rather than
+# one deliberate empty state.
 # ============================================================================
 if selected_project_name is None:
-    left, right = st.columns([1, 0.36], gap="large")
-    with left:
-        st.markdown(
-            "<div style='padding:96px 40px; text-align:center;'>"
-            "<div class='mono-label'>NO PROJECT SELECTED</div>"
-            "<div style='font-size:18px; font-weight:600; letter-spacing:-0.015em; color:#171b22; margin-top:12px;'>"
-            "Nothing is loading</div>"
-            "<p style='font-size:14px; color:#6b7482; line-height:1.6; max-width:400px; margin:12px auto 0;'>"
-            "Reports, review state and the run console stay dark until you pick a project — no default fetch "
-            "on open.</p></div>",
-            unsafe_allow_html=True,
-        )
-    with right:
-        st.markdown(
-            "<div style='background:#fafbfc; padding:32px 26px; height:100%;'>"
-            "<div class='mono-label'>ASSISTANT</div>"
-            "<p style='font-size:13.5px; color:#6e7581; margin-top:10px;'>Available once a project is loaded.</p>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        "<div style='display:flex; flex-direction:column; align-items:center; justify-content:center; "
+        "min-height:58vh; text-align:center; padding:40px;'>"
+        "<p style='font-size:16px; color:#6b7482; margin:0 0 16px;'>"
+        "Your executive status report is one click away.</p>"
+        "<div class='mono-label' style='font-size:13px; letter-spacing:.16em;'>SELECT YOUR PROJECT</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
     st.stop()
 
 selected_program_id = str(next(p["program_id"] for p in programs if p["name"] == selected_project_name))
@@ -1126,20 +1178,37 @@ recent_reports = run_async(list_recent_reports(limit=4, program_id=selected_prog
 
 body_ph.empty()
 
-left, right = st.columns([1, 0.36], gap="large")
+# Real fix (Task 37): the assistant rail was noticeably narrower than
+# the reports panel — widened using the same visual proportion as the
+# gap already separating "Generate status report" from "Previous status
+# reports" as the reference point, rather than an arbitrary new ratio.
+# (0.62 initially overshot: it left the report table's own RUN column
+# too narrow for its real date text, confirmed via live DOM inspection
+# — see the grid-template-columns comment above. 0.5 is still a
+# substantial real increase from the original 0.36.)
+left, right = st.columns([1, 0.5], gap="large")
 
 with left:
     with st.container(key="reports_panel"):
-        with st.container(key="table_header"):
-            for label in ("RUN", "STATE", "REPORT", "REVIEW"):
-                st.markdown(f"<span class='mono-label'>{label}</span>", unsafe_allow_html=True)
+        # Real fix (Task 37): the header and first data row used to
+        # carry Streamlit's own default inter-container vertical gap
+        # between them (a visible seam), rather than reading as one
+        # connected table block. Wrapping just the header + rows in
+        # their own container with gap=0 (a real int pixel value this
+        # Streamlit version's Gap type accepts, confirmed via
+        # inspect.signature) closes that seam without touching the
+        # separately-controlled gap before the Generate section below.
+        with st.container(key="reports_table", gap=0):
+            with st.container(key="table_header"):
+                for label in ("RUN", "STATE", "REPORT", "REVIEW"):
+                    st.markdown(f"<span class='mono-label'>{label}</span>", unsafe_allow_html=True)
 
-        if not recent_reports:
-            st.caption("No reports for this project yet — generate one below.")
-        else:
-            render_report_row(recent_reports[0], default_actor_id, latest=True)
-            for r in recent_reports[1:4]:
-                render_report_row(r, default_actor_id, latest=False)
+            if not recent_reports:
+                st.caption("No reports for this project yet — generate one below.")
+            else:
+                render_report_row(recent_reports[0], default_actor_id, latest=True)
+                for r in recent_reports[1:4]:
+                    render_report_row(r, default_actor_id, latest=False)
 
         # Real bug found and fixed during screenshot verification: a raw
         # <div> opened in one st.markdown call and "closed" in a separate

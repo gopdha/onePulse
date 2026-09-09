@@ -1,0 +1,9 @@
+{
+  "name": "onepulse-mcp-servers",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Real, pinned local install of the Azure DevOps MCP server this project spawns directly (see onepulse_common/pipeline.py's _ado_mcp_server_params). Installed as a normal dependency rather than resolved at spawn time via `npx -y` so a container build can `npm ci` it once, offline, at build time -- avoiding the runtime-fetch failure class found live 2026-09-09 (an interrupted npx install corrupted its own cache and broke the next real pipeline run; a container has no equivalent recovery path since it can't assume outbound network access at request time).",
+  "dependencies": {
+    "@azure-devops/mcp": "2.10.0"
+  }
+}
