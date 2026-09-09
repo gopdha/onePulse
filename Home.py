@@ -4,17 +4,27 @@ onepulse_ops_console/`: README.md + a self-contained `.dc.html`
 reference + 8 real screenshots).
 
 Rewired for Migration Plan Phase 1 (Task 40): reviews (pending/approve/
-reject), report list/detail, and chat now go over real HTTP to the
-FastAPI service in `api/main.py` (`api_client.py` is the thin client
-that makes those calls), not direct `onepulse_common` imports — the LLD
-Section 2 endpoint contract, specified but never built until this phase.
-Deliberately **not** rewired: generation. `run_pipeline_cycle` is still
-called directly, in-process — the real `202`-returning trigger endpoint
-only becomes real in Phase 3, once execution moves to a worker with a
-real status table behind it; building an in-memory cycle registry now
-would be pure throwaway work. This split is intentional, not an
-oversight — see `api/main.py`'s own module docstring for the full
-reasoning behind all three Phase 1 decisions.
+reject), report list/detail, and chat go over real HTTP to the core
+API, via the BFF as of Phase 2 (`api_client.py` is the thin client that
+makes those calls), not direct `onepulse_common` imports.
+
+Rewired again for Migration Plan Phase 3 (Task 42, ADR-021): generation
+too. `run_pipeline_cycle` is no longer called from this file at all —
+`api_client.trigger_report_via_api` starts a real cycle (a real `202`,
+a separate worker process — `worker/main.py` — executes it out of the
+request path entirely) and `api_client.get_cycle_via_api` polls its
+real progress from the `cycles` status table roughly every three
+seconds (ADR-021). This closes the two-path split Phase 1 deliberately
+left open — see `core_api/main.py`'s own module docstring for the full
+original Phase 1 reasoning, and `worker/main.py`'s for why execution
+belongs there now. Real, direct consequence: this file no longer needs
+`onepulse_common.pipeline` at all beyond `TOTAL_STAGES` (a display
+constant), and ADR-009's `threading.Event`/`contextvars.copy_context()`
+cancellation plumbing — built solely to compensate for running a long
+pipeline inside Streamlit's own rerun model — has no job anymore and is
+gone, not left inert. See CLAUDE.md Task 42 for the real verification
+this closes: a run now survives the client closing entirely, because
+nothing here owns the work.
 
 CORE RULE unchanged since Task 18: this is a visual/UX redesign over
 already-proven functions. No logic reimplementation — `api/main.py`
@@ -62,17 +72,22 @@ guessed at:
   switching the project selector immediately renders the *new*
   project's own state (run state is keyed per-project in
   `st.session_state`, not global), so a stale run's progress is never
-  shown again — but the real backend call already in flight for the
-  old project is not aborted mid-HTTP-request (that would need new
-  cancellation plumbing inside `onepulse_common.pipeline` itself, which
-  is logic reimplementation, not a visual redesign). It finishes and
-  persists normally in the background, untracked visually — the
-  correct, honest behavior: "stop showing me a run I've navigated away
-  from," not "corrupt or duplicate real work in flight."
+  shown again. Real, structural fact as of Migration Plan Phase 3
+  (Task 42), not merely a visual one: the real cycle is executing in a
+  separate worker process — nothing about a Streamlit rerun, or this
+  browser tab closing entirely, can reach it. It always finishes and
+  persists normally, untracked visually the moment you navigate away —
+  the correct, honest behavior: "stop showing me a run I've navigated
+  away from," not "corrupt or duplicate real work in flight." This
+  guarantee is now unconditional (survives even the client closing
+  entirely), not the bounded-by-in-flight-work version ADR-009 measured
+  when execution still lived inside this process.
 - **Generation failure state** (a real gap in the reference's own state
-  table — only success paths are specified): on any real exception
-  from `run_pipeline_cycle`, the console prints a real `✗ run failed:
-  <error>` line in the rejected-red token, and the button reverts to
+  table — only success paths are specified): a real, unexpected worker
+  exception is recorded as `cycles.status='failed'` with the real error
+  text in `error_detail`; polling picks it up like any other terminal
+  status and the currently-running step renders with the same real
+  `✗ {name} — failed: {detail}` marker, the button reverting to
   `Generate report` rather than staying stuck on `Running…`.
 - **WCAG AA fixes, independently recalculated before use, not just
   trusted** (real relative-luminance contrast, confirmed to match the
@@ -123,24 +138,24 @@ call is one opaque async call with no exposed sub-progress to reflect
 honestly; showing a second, timed caption during it would be fabricated
 progress, not real.
 
-Carried forward unchanged from Task 30: `_get_arize_space_id()`
-(`st.cache_resource`-wrapped `enable_observability()`), and the real
-`onepulse_ui_pipeline_run` / `onepulse_ui_chat_query` root spans +
-Arize routing context + explicit `force_flush()` per action. This
-redesign does not touch or regress that wiring.
+Carried forward unchanged from Task 30, now scoped to chat alone: since
+generation moved to the worker (Task 42), the `onepulse_ui_pipeline_run`
+root span this function used to create is gone from this file — its
+real successor is `worker run_pipeline_cycle`, in `worker/main.py`, with
+its own real observability lifespan (not `@st.cache_resource`, per the
+Migration Plan's own Phase 3 bullet). `_get_arize_space_id()`
+(`st.cache_resource`-wrapped `enable_observability()`) and the real
+`onepulse_ui_chat_query` root span + Arize routing context + explicit
+`force_flush()` per action still cover chat, unchanged.
 
 Run: streamlit run Home.py (from the repository root).
 """
 
 from __future__ import annotations
 
-import contextvars
 import datetime as dt
-import logging
 import math
 import os
-import re
-import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -154,13 +169,16 @@ from opentelemetry import trace
 from api_client import (
     approve_report_via_api,
     ask_question_via_api,
+    get_cycle_via_api,
     get_report_detail_via_api,
     list_recent_reports_via_api,
     reject_report_via_api,
+    trigger_report_via_api,
 )
+from onepulse_common.cycle_progress import new_stage_state
 from onepulse_common.human_governance import ActorIdRequiredError, NotesRequiredError
 from onepulse_common.observability import ARIZE_PROJECT_NAME, enable_observability
-from onepulse_common.pipeline import TOTAL_STAGES, load_ado_pat, run_pipeline_cycle
+from onepulse_common.pipeline import TOTAL_STAGES
 from streamlit_app_common import fetch_actors, fetch_programs, run_async
 
 st.set_page_config(page_title="OnePulse", page_icon=":material/monitoring:", layout="wide")
@@ -168,16 +186,14 @@ st.set_page_config(page_title="OnePulse", page_icon=":material/monitoring:", lay
 PROJECT_ENDPOINT = os.environ.get(
     "ONEPULSE_FOUNDRY_PROJECT_ENDPOINT", "https://onepulse-resource.services.ai.azure.com/api/projects/onepulse"
 )
-DEPLOYMENT_NAME = os.environ.get("ONEPULSE_FOUNDRY_DEPLOYMENT_NAME", "onePulse-gpt-5-mini")
-ADO_ORG_NAME = os.environ.get("ONEPULSE_ADO_ORG", "gopdha")
-OUTPUT_DIR = "output"
-PPTX_MCP_SERVER_PATH = "scripts/pptx_mcp_server.py"
+# Real, deliberate scope reduction (Migration Plan Phase 3): Home.py no
+# longer calls run_pipeline_cycle itself, so DEPLOYMENT_NAME/ADO_ORG_NAME/
+# OUTPUT_DIR/PPTX_MCP_SERVER_PATH/STATUS_DECK_PATH_BY_PROJECT all moved
+# to worker/main.py, the only real caller left. PROJECT_ENDPOINT stays —
+# _get_arize_space_id() (chat's own observability path, unchanged) still
+# needs it.
 
-STATUS_DECK_PATH_BY_PROJECT = {
-    "singleSlide": "sample_status_deck.pptx",
-    "Leave Tracker": "leave_tracker_status_deck.pptx",
-}
-DEFAULT_STATUS_DECK_PATH = os.environ.get("ONEPULSE_STATUS_DECK_PATH", "sample_status_deck.pptx")
+POLL_INTERVAL_SECONDS = 3.0  # ADR-021: "polled by the client... roughly every three seconds"
 
 SUGGESTION_CHIPS = ["Why did the schedule slip?", "Summarize the last 3 reports", "Why was one rejected?"]
 
@@ -664,23 +680,6 @@ REAL_STAGE_NAMES = {
 }
 
 
-class _RunCancelled(Exception):
-    """Raised inside on_stage/on_detail (running on the worker thread) to
-    unwind run_pipeline_cycle's own call stack when the main script
-    thread detects it's being cancelled (a project switch, a page
-    navigation). See run_generation()'s module-level note on why this
-    exists — real, deliberate plumbing added specifically to preserve
-    the genuine-termination guarantee verified during Task 31's
-    project-switch investigation, now that the pipeline runs on a
-    separate thread from Streamlit's own cooperative-cancellation
-    checks.
-    """
-
-
-def _sanitize_for_filename(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "project"
-
-
 def _fmt_mmss(seconds: float) -> str:
     s = max(0, int(seconds))
     return f"{s // 60:02d}:{s % 60:02d}"
@@ -708,88 +707,16 @@ def _compute_progress(stages: dict, total: int, now: float) -> float:
     return min(base, 0.995)
 
 
-def _apply_detail_to_stage(stages: dict, shared: dict, current_stage: int, message: str) -> None:
-    """The real curation step (Task 32): every real on_stage/on_detail
-    event pipeline.py already emits is inspected here to compute the
-    ONE-line, real, exact summary shown per step — nothing here is
-    estimated or fabricated; every number is parsed straight out of the
-    same real message the full-fidelity log file also records verbatim.
-    This is the only place that does this parsing — the log file writes
-    every message unmodified, this function only curates the UI's view
-    of the identical real events.
-    """
-    if current_stage == 1:
-        m = re.search(r"real children of (\d+) Committed Feature", message)
-        if m:
-            shared["feature_count"] = int(m.group(1))
-        if re.match(r"^#\d+ ", message):
-            shared["pending_findings_count"] = shared.get("pending_findings_count", 0) + 1
-            # Real finding-status parse (Task 37): pipeline.py emits this
-            # exact real line as `f"#{id} {title} — {status}"` — the
-            # status is real FR-1 output already known this early, so
-            # Synthesis's later "N item(s) flagged" summary needs no new
-            # computation, just this pre-computed real count.
-            status = message.rsplit(" — ", 1)[-1].strip()
-            if status and status != "On Track":
-                shared["flagged_findings_count"] = shared.get("flagged_findings_count", 0) + 1
-        if "No Features tagged 'Committed' found" in message:
-            shared["zero_scope"] = True
-            stages[1]["detail"] = "no committed features found"
-        if not shared.get("zero_scope"):
-            items = shared.get("pending_findings_count", 0)
-            features = shared.get("feature_count")
-            if features is not None:
-                stages[1]["detail"] = f"{items} item(s) across {features} committed feature(s)"
-    elif current_stage == 2:
-        m = re.match(r"^(\d+) untracked initiative", message)
-        if m:
-            shared["untracked_count"] = int(m.group(1))
-        m2 = re.match(r"^(\d+) possible connection", message)
-        if m2:
-            shared["connections_count"] = int(m2.group(1))
-        if "untracked_count" in shared or "connections_count" in shared:
-            stages[2]["detail"] = (
-                f"{shared.get('untracked_count', 0)} untracked initiative(s), "
-                f"{shared.get('connections_count', 0)} possible connection(s)"
-            )
-    elif current_stage == 3:
-        m = re.match(r"^Overall status: (\w+)", message)
-        if m:
-            stages[3]["detail"] = f"overall status: {m.group(1)}"
-    elif current_stage == 5:
-        if message.startswith('Draft: "'):
-            # Real, deliberate overwrite (Task 32 bug fix, detail updated
-            # Task 37): on_stage's own "close the previous stage" step
-            # fires BEFORE this arrives (on_stage(5,...) closes stage 4
-            # with a generic "done" fallback the instant stage 5 starts,
-            # since the real draft text — logged from inside
-            # run_quality_gate — hasn't been seen yet at that moment).
-            # This retroactively replaces that fallback once it is. A
-            # word count isn't meaningful to a reader, so this uses the
-            # real flagged-item count instead — already known from stage
-            # 1's own finding lines (see above), not a new computation.
-            flagged = shared.get("flagged_findings_count", 0)
-            stages[4]["detail"] = f"executive summary drafted, {flagged} item(s) flagged for review"
-        if "Triggering the one permitted revision" in message:
-            shared["revision_fired"] = True
-            stages[5]["live_note"] = "revising for tone (1 of 1 permitted)"
-        elif message.startswith("Revised draft:"):
-            stages[5]["live_note"] = "revised — re-checking…"
-        elif message.startswith("Revision-cap decision"):
-            outcome = message.split(":", 1)[1].strip()
-            stages[5]["live_note"] = None
-            suffix = "after 1 revision" if shared.get("revision_fired") else "on first attempt"
-            stages[5]["detail"] = f"{outcome} {suffix}"
-    elif current_stage == 7:
-        m = re.search(r"report_id=(\d+)", message)
-        if message.startswith("Persisted as report_id="):
-            stages[7]["detail"] = f"report_id={m.group(1)} saved"
-        elif message.startswith("NOT persisted"):
-            stages[7]["detail"] = "not persisted — report already exists for this week"
-
-
 def _render_stage_ui(steps_ph, progress_ph, status_ph, stages: dict, shared: dict, run_start_ts: float, total: int, running: bool, done: bool) -> None:
-    now = time.monotonic()
+    """Presentation only (HTML, color, icons) — `stages` is now read back
+    from the real `cycles` status table via polling (Migration Plan
+    Phase 3), not built live in-process; the curation that produces it
+    lives in `onepulse_common.cycle_progress`, shared with the worker.
+    `run_start_ts` and every stage's own `start_ts`/`end_ts` are real
+    wall-clock (`time.time()`) timestamps now, not `time.monotonic()` —
+    monotonic time can't cross the process boundary this data now does.
+    """
+    now = time.time()
     rows_html = []
     for n in range(1, total + 1):
         s = stages[n]
@@ -863,255 +790,75 @@ def _render_stage_ui(steps_ph, progress_ph, status_ph, stages: dict, shared: dic
             )
 
 
-def log_exception_group(exc: BaseException, logger: logging.Logger, depth: int = 0) -> None:
-    """Flatten anyio/asyncio ExceptionGroups so the real error is visible.
-
-    Real bug found live: `_worker()`'s `except Exception as e:` below
-    catches whatever `run_pipeline_cycle`'s `async with stdio_client(...)`
-    raises — an anyio `TaskGroup` wraps every MCP-session-scoped
-    coroutine, so a real failure inside it (e.g. inside a `wit_work_item`
-    call) surfaces as a bare `ExceptionGroup`/`BaseExceptionGroup`
-    whose own `str()` is just `"unhandled errors in a TaskGroup (1
-    sub-exception)"` — the actual exception type, message, and
-    traceback are one level down in `.exceptions` and were never logged.
-    Confirmed against three real failing runs (`logs/Agentic_AI_
-    Observability_Platform_20260909_*.log`): every one shows exactly
-    this uninformative line and nothing else. This recurses because a
-    TaskGroup can itself raise from inside another TaskGroup's scope
-    (nested `async with` blocks), not just one level deep.
-    """
-    if isinstance(exc, BaseExceptionGroup):
-        for sub in exc.exceptions:
-            log_exception_group(sub, logger, depth + 1)
-    else:
-        logger.error("  " * depth + "%s: %s", type(exc).__name__, exc, exc_info=exc)
+_TERMINAL_CYCLE_STATUSES = {
+    "persisted", "persisted_route_to_human_review",
+    "not_persisted_already_exists", "hard_stop_defect", "failed",
+}
 
 
 def run_generation(selected_project_name: str, selected_program_id: str, console_ph, status_ph, progress_ph) -> None:
-    """The real Generate action (redesigned, Task 32). Reuses
-    `run_pipeline_cycle` unmodified; `on_stage`/`on_detail` remain the
-    single real source of truth for both real outputs this now
-    produces:
+    """The real Generate action — Migration Plan Phase 3. Execution no
+    longer happens here at all: this triggers a real cycle via the API
+    (`POST /api/v1/programs/{programId}/reports`, real `202`, a worker
+    process picks it up) and polls its real progress from the `cycles`
+    status table (`GET /api/v1/cycles/{cycleId}`) roughly every three
+    seconds (ADR-021), rendering whatever the worker has already
+    curated and persisted — `onepulse_common.cycle_progress`'s
+    `advance_stage`/`apply_detail`, unchanged in behavior, just now
+    running in the worker instead of here.
 
-    1. A full-fidelity log file (`logs/<project>_<timestamp>.log`) — every
-       real message, unabridged, via Python's `logging` module. This is
-       the same detail the old console box used to show inline; nothing
-       is dropped, only relocated.
-    2. A curated, ~7-row step view for the UI — one real, computed
-       one-line summary per stage (`_apply_detail_to_stage`), a live-
-       ticking elapsed timer on whichever stage is currently running,
-       and a real, elapsed-time-driven progress bar that starts moving
-       immediately instead of freezing at 0% through all of Investigation
-       (`_compute_progress`).
-
-    Real architectural note, not incidental: `run_pipeline_cycle` now
-    executes on a background thread (needed for the UI to keep
-    re-rendering — i.e., tick — every second regardless of how long the
-    pipeline goes between real on_stage/on_detail events, which Streamlit
-    cannot do while a single script thread sits blocked inside one long
-    synchronous call). This is a real, deliberate departure from the
-    single-threaded design Task 31 verified project-switch cancellation
-    against — moving to a thread would, on its own, silently reintroduce
-    exactly the "backend keeps running invisibly" behavior that
-    investigation spent real effort disproving. Two things preserve the
-    same real guarantee instead of quietly losing it:
-      - `contextvars.copy_context()` captures the active `arize.otel`
-        routing context (and the current OTel span) on the main thread
-        right before the worker starts, and the worker runs inside that
-        captured context (`ctx.run(...)`) — otherwise every span created
-        inside the pipeline would silently stop reaching Arize, since a
-        fresh OS thread does not inherit the calling thread's
-        contextvars on its own.
-      - A `threading.Event` (`cancel_event`) is checked at the top of
-        every real `on_stage`/`on_detail` call; if the *main* thread's
-        polling loop is itself cancelled by Streamlit's own cooperative
-        mechanism (a project switch, exactly as before), its `except`
-        block sets `cancel_event` before re-raising, and the worker
-        thread raises `_RunCancelled` the next time it reaches a real
-        callback — unwinding `run_pipeline_cycle` for real, deliberately,
-        rather than by the single-thread accident Task 31 originally
-        found. The real bound on how fast this fires is unchanged from
-        before: the gap until the *next* real on_stage/on_detail call.
+    Real, deliberate retirement (Migration Plan Phase 3's own explicit
+    instruction): ADR-009's `threading.Event` cancellation plumbing and
+    `contextvars.copy_context()` propagation existed solely to
+    compensate for running a long pipeline inside Streamlit's own rerun
+    model. With execution in a separate worker process, closing this
+    browser tab mid-run does not touch the worker at all — the run
+    completes and persists regardless, which is this phase's own
+    headline guarantee, not something this function has to engineer.
+    If Streamlit's own cooperative cancellation interrupts this
+    function's polling loop (a project switch), it simply stops
+    polling; nothing needs to be signaled anywhere, because nothing
+    here owns the real work anymore.
     """
-    try:
-        ado_pat_b64 = load_ado_pat()
-        arize_space_id = _get_arize_space_id()
-    except RuntimeError as e:
-        st.error(str(e))
-        return
-
-    status_deck_path = STATUS_DECK_PATH_BY_PROJECT.get(selected_project_name, DEFAULT_STATUS_DECK_PATH)
     run_state = st.session_state.ops_runs_by_project[selected_project_name]
-    run_start_ts = time.monotonic()
-    run_state.update(running=True, done=False, start_ts=run_start_ts)
+    run_state.update(running=True, done=False)
 
-    # === Full-fidelity real log file (Task 32) — nothing lost, only
-    # relocated from the UI console box. ===
-    logs_dir = Path("logs")
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / f"{_sanitize_for_filename(selected_project_name)}_{dt.datetime.now():%Y%m%d_%H%M%S}.log"
-    file_logger = logging.getLogger(f"onepulse.run.{id(run_state)}.{time.monotonic_ns()}")
-    file_logger.setLevel(logging.INFO)
-    file_logger.propagate = False
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    file_logger.addHandler(file_handler)
-
-    stages = {n: {"status": "pending", "start_ts": None, "end_ts": None, "detail": None, "live_note": None} for n in range(1, TOTAL_STAGES + 1)}
-    shared: dict = {"current_stage": 0}
-    cancel_event = threading.Event()
-    result_box: dict = {}
-
-    def on_stage(n: int, total: int, message: str) -> None:
-        if cancel_event.is_set():
-            raise _RunCancelled()
-        file_logger.info("[STAGE %d/%d] %s", n, total, message)
-        now = time.monotonic()
-        prev = shared["current_stage"]
-        if prev and stages[prev]["status"] == "running":
-            stages[prev]["end_ts"] = now
-            if stages[prev]["detail"] is None:
-                stages[prev]["detail"] = "done"
-            stages[prev]["status"] = "done"
-        if "SKIPPED" in message:
-            reason = message.split("SKIPPED", 1)[1].strip(" ()-") or "skipped"
-            stages[n].update(status="skipped", start_ts=now, end_ts=now, detail=reason)
-        else:
-            stages[n].update(status="running", start_ts=now)
-            if n == 6:
-                # Real, available immediately (Task 32): the on_stage
-                # message for Rendering already names the real output
-                # path — no need to wait for a later on_detail to know it.
-                m = re.search(r"-> (.+)$", message)
-                if m:
-                    stages[6]["detail"] = f"saved {Path(m.group(1)).name}"
-        shared["current_stage"] = n
-
-    def on_detail(message: str) -> None:
-        if cancel_event.is_set():
-            raise _RunCancelled()
-        file_logger.info("  %s", message)
-        _apply_detail_to_stage(stages, shared, shared["current_stage"], message)
-
-    steps_ph = console_ph  # same st.empty() placeholder, now rendering the curated step view instead of raw console text
-
-    def _finalize_ui(running: bool, done: bool) -> None:
-        _render_stage_ui(steps_ph, progress_ph, status_ph, stages, shared, run_start_ts, TOTAL_STAGES, running, done)
-
-    credential = DefaultAzureCredential()
-    tracer = trace.get_tracer(__name__)
-    # Real ordering bug fixed (found live from a real Arize screenshot
-    # showing scattered top-level siblings instead of one nested tree,
-    # traced to real Application Insights customDimensions data — the
-    # root span's own attributes never included arize.space_id at all).
-    # This used to nest set_routing_context() INSIDE the root span, so
-    # the root span was created before arize.space_id ever existed in
-    # the ambient context; ArizeRoutingSpanProcessor.on_start() had
-    # nothing to read, and on_end() then silently dropped it (its own
-    # "No 'arize.space_id' attribute found" warning — a real, pre-
-    # existing gap since Task 10-13, not a Task 32 threading regression:
-    # confirmed directly by checking `scripts/run_pipeline.py`'s
-    # single-threaded CLI path too, which has the exact same nesting bug
-    # and the exact same missing attribute on its own root span). The
-    # span's real children still correctly carried its real span ID as
-    # their own parent — the OTel data itself was never broken — but
-    # since Arize never received the parent they pointed to, they
-    # rendered as scattered, disconnected top-level siblings. Swapping
-    # the nesting so the routing context is the OUTER manager means it's
-    # already active by the time the root span is created, so it
-    # genuinely gets arize.space_id set on itself and is no longer
-    # skipped.
-    with set_routing_context(space_id=arize_space_id, project_name=ARIZE_PROJECT_NAME):
-        with tracer.start_as_current_span("onepulse_ui_pipeline_run") as root_span:
-            root_span.set_attribute("onepulse.ado_project", selected_project_name)
-            # Capture the active context (Arize routing + current OTel
-            # span) so the worker thread's own event loop sees the same
-            # routing attributes — see the docstring above.
-            ctx = contextvars.copy_context()
-
-            def _worker() -> None:
-                try:
-                    result_box["result"] = run_async(
-                        run_pipeline_cycle(
-                            ado_pat_b64=ado_pat_b64,
-                            project_endpoint=PROJECT_ENDPOINT,
-                            deployment_name=DEPLOYMENT_NAME,
-                            credential=credential,
-                            ado_org_name=ADO_ORG_NAME,
-                            ado_project_name=selected_project_name,
-                            status_deck_path=status_deck_path,
-                            pptx_mcp_server_path=PPTX_MCP_SERVER_PATH,
-                            output_dir=OUTPUT_DIR,
-                            on_stage=on_stage,
-                            on_detail=on_detail,
-                        )
-                    )
-                except _RunCancelled:
-                    result_box["cancelled"] = True
-                except Exception as e:  # noqa: BLE001 - real failure-state design, reported below
-                    result_box["error"] = e
-
-            thread = threading.Thread(target=lambda: ctx.run(_worker), daemon=True)
-            thread.start()
-            try:
-                while thread.is_alive():
-                    _finalize_ui(running=True, done=False)
-                    time.sleep(1)
-            except BaseException:
-                # Streamlit's own cooperative cancellation (a real project
-                # switch) unwinds THIS thread via an exception raised from
-                # inside _finalize_ui's st.* calls. Signal the worker
-                # thread to stop for real before letting it propagate.
-                cancel_event.set()
-                raise
-            thread.join(timeout=5)
-
-            if "result" in result_box:
-                result = result_box["result"]
-                root_span.set_attribute("onepulse.overall_status", result.overall_status)
-                root_span.set_attribute("onepulse.revision_outcome", result.outcome)
-
-    trace.get_tracer_provider().force_flush(timeout_millis=30000)
-
-    if "error" in result_box:
-        # Real, deliberate failure-state design (a real gap in the
-        # reference's own spec — only success paths were documented):
-        # the currently-running step is marked failed, button returns to
-        # idle. Full traceback text is in the log file; the UI shows the
-        # real exception message only.
-        cur = shared["current_stage"] or 1
-        stages[cur].update(status="failed", end_ts=time.monotonic(), detail=str(result_box["error"]))
-        file_logger.error("run failed: %s", result_box["error"])
-        # Real fix: the line above alone only ever logs an anyio
-        # ExceptionGroup's own uninformative str() (e.g. "unhandled
-        # errors in a TaskGroup (1 sub-exception)") — the real
-        # exception is nested inside it and was never reaching the log
-        # file. See log_exception_group's own docstring for how this
-        # was confirmed against real failing runs.
-        log_exception_group(result_box["error"], file_logger)
-        _finalize_ui(running=False, done=False)
-        run_state.update(running=False, done=False, stages=stages, shared=shared)
+    try:
+        triggered = run_async(trigger_report_via_api(selected_program_id))
+    except Exception as e:  # noqa: BLE001 - a real, honest failure to even start
+        st.error(f"Failed to start a run: {e}")
+        run_state.update(running=False, done=False)
         return
 
-    result = result_box["result"]
-    elapsed_total = time.monotonic() - run_start_ts
+    cycle_id = triggered["cycle_id"]
+    run_state["cycle_id"] = cycle_id
 
-    # Finalize whichever stage was still "running" when the pipeline
-    # returned (stage 7 normally — there is no on_stage(8) to close it;
-    # or stage 6, on a real hard-stop-defect early return).
-    cur = shared["current_stage"]
-    if cur and stages[cur]["status"] == "running":
-        stages[cur]["end_ts"] = time.monotonic()
-        if stages[cur]["detail"] is None:
-            stages[cur]["detail"] = "done"
-        stages[cur]["status"] = "done"
-    if result.outcome == "hard_stop_defect":
-        for n in range(cur + 1, TOTAL_STAGES + 1):
-            if stages[n]["status"] == "pending":
-                stages[n].update(status="skipped", start_ts=time.monotonic(), end_ts=time.monotonic(), detail="hard stop — nothing to persist")
+    def _finalize_ui(stages: dict, run_start_ts: float, running: bool, done: bool) -> None:
+        _render_stage_ui(console_ph, progress_ph, status_ph, stages, {}, run_start_ts, TOTAL_STAGES, running, done)
 
-    _finalize_ui(running=False, done=True)
-    run_state.update(running=False, done=True, elapsed=elapsed_total, stages=stages, shared=shared)
+    while True:
+        cycle = run_async(get_cycle_via_api(cycle_id))
+        run_start_ts = dt.datetime.fromisoformat(cycle["created_at"]).timestamp()
+        raw_stages = cycle["stages"]
+        # JSONB round-trips dict keys as strings ("1".."7") — normalize
+        # back to the real int keys _render_stage_ui/new_stage_state use.
+        # An empty {} means the worker hasn't claimed this cycle yet
+        # (still "queued"): render the same all-pending baseline
+        # new_stage_state produces, not a blank/broken view.
+        stages = {int(k): v for k, v in raw_stages.items()} if raw_stages else new_stage_state(TOTAL_STAGES)
+
+        done = cycle["status"] in _TERMINAL_CYCLE_STATUSES
+        _finalize_ui(stages, run_start_ts, running=not done, done=done)
+
+        if done:
+            break
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    elapsed_total = time.time() - run_start_ts
+    run_state.update(
+        running=False, done=True, elapsed=elapsed_total, stages=stages, shared={}, start_ts=run_start_ts,
+        status=cycle["status"], report_id=cycle["report_id"], error_detail=cycle["error_detail"],
+    )
     st.rerun()
 
 
@@ -1252,7 +999,7 @@ with left:
                 # just fed its final, already-settled state.
                 _render_stage_ui(
                     console_ph, progress_ph, status_ph, run_state["stages"], run_state.get("shared", {}),
-                    run_state.get("start_ts", time.monotonic()), TOTAL_STAGES, running=False, done=run_state.get("done", False),
+                    run_state.get("start_ts", time.time()), TOTAL_STAGES, running=False, done=run_state.get("done", False),
                 )
             else:
                 with status_ph.container():

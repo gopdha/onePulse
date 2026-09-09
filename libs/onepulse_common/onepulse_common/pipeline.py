@@ -339,16 +339,28 @@ async def _query_committed_scope(
     hierarchy afterward; callers that just want the flat combined scope
     can still do `feature_ids + child_ids` themselves.
     """
+    # Real gap found live (Migration Plan Phase 3 verification, 2026-09-09):
+    # a real run against Agentic AI Observability Platform saw this exact
+    # WIQL call take 37s with zero on_detail output in between — an
+    # isolated re-run of the identical query moments later completed in
+    # 1.1s with the correct real result, so this wasn't a code or parser
+    # bug, just real, observed ADO API latency variance. Since neither
+    # call here was wrapped in the same heartbeat mechanism `investigate`'s
+    # own agent.run() calls already use, a slow real call here could
+    # silently exceed the status table's real "no gap over 20s" bar
+    # (ADR-021/Migration Plan Phase 3). Wrapped now — reusing the existing
+    # mechanism, not inventing a second one.
     on_detail(f"· real tool call (deterministic scoping): wit_query(Committed Features in '{ado_project_name}')")
-    features_result = await mcp_session.call_tool(
-        "wit_query",
-        {
-            "action": "wiql",
-            "project": ado_project_name,
-            "wiql": _committed_features_wiql(ado_project_name),
-            "top": 1000,
-        },
-    )
+    async with _heartbeat(on_detail, "Investigation scoping query"):
+        features_result = await mcp_session.call_tool(
+            "wit_query",
+            {
+                "action": "wiql",
+                "project": ado_project_name,
+                "wiql": _committed_features_wiql(ado_project_name),
+                "top": 1000,
+            },
+        )
     feature_ids = _extract_work_item_ids(
         "\n".join(block.text for block in features_result.content if hasattr(block, "text"))
     )
@@ -359,15 +371,16 @@ async def _query_committed_scope(
         f"· real tool call (deterministic scoping): wit_query(real children of {len(feature_ids)} "
         "Committed Feature(s) via System.Parent)"
     )
-    children_result = await mcp_session.call_tool(
-        "wit_query",
-        {
-            "action": "wiql",
-            "project": ado_project_name,
-            "wiql": _committed_children_wiql(ado_project_name, feature_ids),
-            "top": 1000,
-        },
-    )
+    async with _heartbeat(on_detail, "Investigation scoping query"):
+        children_result = await mcp_session.call_tool(
+            "wit_query",
+            {
+                "action": "wiql",
+                "project": ado_project_name,
+                "wiql": _committed_children_wiql(ado_project_name, feature_ids),
+                "top": 1000,
+            },
+        )
     child_ids = _extract_work_item_ids(
         "\n".join(block.text for block in children_result.content if hasattr(block, "text"))
     )

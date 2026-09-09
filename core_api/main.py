@@ -9,14 +9,24 @@ and the real Entra App Registration this validates against
 (`onepulse-core-api`), and CLAUDE.md Task 41 for the real setup process,
 including a real consent-propagation delay found live.
 
-Three Phase 1 decisions still hold, unchanged, restated so they aren't
-lost in the split (see the superseded `api/main.py`'s own docstring,
-Task 40, for the full original reasoning): no report-trigger endpoint
-(Phase 3); still no *reviewer* authentication (Phase 8) — what Phase 2
-adds is *service* authentication (proving the caller is really the
+Two of the three original Phase 1 decisions still hold, unchanged,
+restated so they aren't lost in the split (see the superseded
+`api/main.py`'s own docstring, Task 40, for the full original
+reasoning): still no *reviewer* authentication (Phase 8) — what Phase 2
+added is *service* authentication (proving the caller is really the
 BFF) and real identity *resolution* (turning a forwarded object ID into
 a real actor), neither of which is reviewer auth; `onepulse_common` is
-not modified by this file's own routes.
+not modified by this file's own routes. The third — no report-trigger
+endpoint — is real now (Migration Plan Phase 3, ADR-021): `POST
+/api/v1/programs/{programId}/reports` inserts a real `queued` row into
+the `cycles` status table and returns `202` immediately; it does not
+execute the pipeline itself. A separate worker process (`worker/main.py`)
+polls that table and does the real work — see its own module docstring.
+Real deviation from LLD 2.1's literal body shape (`{"requestedBy":
+"<actorId>"}`), stated plainly: identity here follows the same real
+ADR-017 pattern as approve/reject/chat — resolved server-side from the
+BFF-forwarded Entra object ID header, never accepted as a body field —
+so this endpoint takes no meaningful request body at all.
 
 Real, load-bearing design point: this service now has **internal-only**
 meaning even though nothing locally enforces network isolation (that's
@@ -44,12 +54,13 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from opentelemetry import trace
-from opentelemetry.propagate import extract
+from opentelemetry.propagate import extract, inject
 from pydantic import BaseModel, field_validator
 
 from core_api.security import ActorNotFoundError, get_entra_object_id, resolve_actor, verify_service_token
 from onepulse_common.chat_assistant import ask_question
 from onepulse_common.config import PostgresSettings
+from onepulse_common.cycles import create_cycle, get_cycle
 from onepulse_common.db import PostgresClient
 from onepulse_common.embeddings import build_embedding_client
 from onepulse_common.human_governance import (
@@ -245,6 +256,30 @@ class ReportDetailResponse(BaseModel):
     untrackedItems: list[UntrackedItemModel]
 
 
+class TriggerResponse(BaseModel):
+    cycleId: str
+    status: str
+
+
+CycleStatus = Literal[
+    "queued", "running",
+    "persisted", "persisted_route_to_human_review",
+    "not_persisted_already_exists", "hard_stop_defect",
+    "failed",
+]
+
+
+class CycleStatusResponse(BaseModel):
+    cycleId: str
+    status: CycleStatus
+    stages: dict
+    reportId: int | None
+    errorDetail: str | None
+    createdAt: str
+    startedAt: str | None
+    finishedAt: str | None
+
+
 class ChatQueryRequest(BaseModel):
     question: str
     programId: str | None = None
@@ -283,6 +318,70 @@ async def list_programs(request: Request, _token=Depends(verify_service_token)) 
     async with request.app.state.pg_client.pool.acquire() as conn:
         rows = await conn.fetch("SELECT program_id, name FROM programs ORDER BY name")
     return [ProgramItem(programId=str(r["program_id"]), name=r["name"]) for r in rows]
+
+
+@app.post("/api/v1/programs/{program_id}/reports", status_code=202)
+async def trigger_report(
+    request: Request,
+    program_id: str,
+    _token=Depends(verify_service_token),
+    entra_object_id: str = Depends(get_entra_object_id),
+) -> TriggerResponse:
+    """LLD 2.1's real trigger contract, real now (Migration Plan Phase
+    3): inserts a real `queued` row and returns immediately — execution
+    happens in `worker/main.py`, entirely out of this request. Identity
+    resolved the same real ADR-017 way as approve/reject/chat; see the
+    module docstring for why this deviates from the LLD's literal
+    body-supplied `requestedBy` field.
+
+    Real API-to-worker tracing (this phase's own bar): captures the
+    current active span's context (this route's own span, nested under
+    whatever `tracing_middleware` already extracted from the BFF) as a
+    real W3C traceparent via `opentelemetry.propagate.inject`, stored on
+    the cycle row so the worker can nest its own root span under this
+    exact request — the same real mechanism Phase 2 already proved
+    across the BFF-to-core-API hop, now proved a second time.
+    """
+    carrier: dict[str, str] = {}
+    inject(carrier)
+    trace_context = carrier.get("traceparent")
+
+    async with request.app.state.pg_client.pool.acquire() as conn:
+        try:
+            actor = await resolve_actor(conn, entra_object_id)
+        except ActorNotFoundError:
+            raise HTTPException(status_code=401, detail={"error": "actor_not_found"})
+        try:
+            result = await create_cycle(conn, program_id, str(actor["actor_id"]), trace_context)
+        except asyncpg.exceptions.ForeignKeyViolationError:
+            raise HTTPException(status_code=404, detail={"error": "program_not_found"})
+    return TriggerResponse(cycleId=str(result["cycle_id"]), status=result["status"])
+
+
+@app.get("/api/v1/cycles/{cycle_id}")
+async def get_cycle_status(
+    request: Request, cycle_id: str, _token=Depends(verify_service_token)
+) -> CycleStatusResponse:
+    """ADR-021: the real polling read — answers from the database alone,
+    regardless of which process (if any) is currently executing the
+    cycle. No reviewer-identity check here, matching the existing
+    GET /api/v1/reports pattern — a cycle's own status carries no
+    reviewer decision to protect.
+    """
+    async with request.app.state.pg_client.pool.acquire() as conn:
+        result = await get_cycle(conn, cycle_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "cycle_not_found"})
+    return CycleStatusResponse(
+        cycleId=str(result["cycle_id"]),
+        status=result["status"],
+        stages=result["stages"],
+        reportId=result["report_id"],
+        errorDetail=result["error_detail"],
+        createdAt=result["created_at"].isoformat(),
+        startedAt=result["started_at"].isoformat() if result["started_at"] else None,
+        finishedAt=result["finished_at"].isoformat() if result["finished_at"] else None,
+    )
 
 
 @app.get("/api/v1/reviews/pending")

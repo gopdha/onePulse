@@ -49,6 +49,7 @@ EXPECTED_TABLES = [
     "approval_records",
     "actor_scope",
     "usage_ledger",
+    "cycles",
 ]
 
 
@@ -221,6 +222,17 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
             (f"approval_records append-only for {role}",
              await check_privilege_revoked(conn, "approval_records", role, ["UPDATE", "DELETE"]))
         )
+
+    results.append(
+        ("CHECK constraint: cycles.status covers all 4 ADR-021 terminal outcomes + queued/running/failed (0003)",
+         await check_check_constraint_values(
+             conn, "cycles", "status",
+             ["queued", "running", "persisted", "persisted_route_to_human_review",
+              "not_persisted_already_exists", "hard_stop_defect", "failed"],
+         ))
+    )
+    results.append(("column exists: cycles.trace_context", await check_column_exists(conn, "cycles", "trace_context")))
+    results.append(("column exists: cycles.stages", await check_column_exists(conn, "cycles", "stages")))
 
     return results
 

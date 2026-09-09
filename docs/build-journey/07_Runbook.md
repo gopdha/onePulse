@@ -33,29 +33,41 @@ the pipeline. See §6 for the failure signature when it has lapsed.
 
 ### Via the UI (recommended for demos)
 
-**As of Migration Plan Phase 2, three processes must be running together** — `streamlit run
-Home.py` alone now produces failed requests, and starting the BFF without the core API first will
-make every real request through it fail too, since the BFF has no data store of its own to fall
-back on. Reviews (pending/approve/reject), the report list and detail view, and chat all go through
-the BFF, which forwards each request to the core API; Streamlit no longer talks to the core API (or
-Postgres/Search) directly for those:
+**As of Migration Plan Phase 3, four processes must be running together** — `streamlit run
+Home.py` alone now produces failed requests, and clicking "Generate Status Report" with the worker
+not running will queue a real cycle that simply never progresses past `queued` (no error — nothing
+is watching the table yet). Reviews (pending/approve/reject), the report list/detail, chat, and now
+generation itself all go through the BFF, which forwards each request to the core API; Streamlit no
+longer talks to the core API (or Postgres/Search) directly for any of it, and no longer calls
+`run_pipeline_cycle` at all:
 
 ```powershell
 uvicorn core_api.main:app --port 8000   # terminal 1, from the repo root — start this first
 uvicorn bff.main:app --port 8100        # terminal 2 — depends on core_api already running
-streamlit run Home.py                   # terminal 3
+python -m worker.main                   # terminal 3 — polls the real cycles table; order vs. bff doesn't matter
+streamlit run Home.py                   # terminal 4
 ```
 
 Select a project from the dropdown (nothing loads until you do), then click Generate Status Report.
 
-**Generation itself is the one real exception, deliberately not behind either service.** Clicking
-"Generate Status Report" still calls `run_pipeline_cycle` directly, in-process inside Streamlit —
-it does **not** go through the BFF or the core API. This is intentional, not a gap someone forgot to
-wire up: the real LLD-specified trigger endpoint (`POST /api/v1/programs/{programId}/reports`,
-returning `202` with a cycle handle) only becomes real in Migration Plan Phase 3, once execution
-moves to a worker with a real status table behind it — building an in-memory cycle registry now
-would be pure throwaway work. Don't read either service as the whole story for how a report gets
-generated, and don't go looking for a trigger endpoint that isn't there yet on purpose.
+**Generation is real now (Migration Plan Phase 3, ADR-021), and the two-path split Phase 1
+deliberately left open is closed.** Clicking "Generate Status Report" calls the real LLD-specified
+trigger endpoint (`POST /api/v1/programs/{programId}/reports`, a real `202` with a cycle handle) —
+execution happens in `worker/main.py`, a separate local process that polls the real `cycles` status
+table for queued work (`FOR UPDATE SKIP LOCKED`), executes the pipeline, and writes progress into
+that same table *during* execution, not only at stage boundaries — reusing the exact
+on_stage/on_detail heartbeat hook Task 39 already proved keeps every real gap under ~10s. The UI
+polls `GET /api/v1/cycles/{cycleId}` roughly every three seconds (ADR-021) and renders whatever the
+worker has already written. **The headline property this buys**: closing the browser tab entirely,
+mid-run, does not touch the worker — the run completes and persists (or reaches whichever of the
+four real terminal outcomes applies) regardless, because nothing in the browser or in Streamlit's
+own process ever owned the work. No queue exists yet (that's Phase 4/ADR-019) — if the worker
+process itself is killed mid-run, the run is lost; there is no redelivery yet. See CLAUDE.md Task 42
+for the real, live-measured proof of both of these, in both directions.
+
+The full-fidelity log file (`logs/<project>_<timestamp>.log`) is written by the worker now, not
+Streamlit — same real content as before (every tool call, the full draft/revision text, every
+PASS/FAIL check), just relocated a second time.
 
 **Why two services instead of one, as of Phase 2 (ADR-017/ADR-018):** the BFF owns session,
 identity resolution, and response shaping for the frontend — it holds no database connection, no
