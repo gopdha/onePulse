@@ -32,10 +32,27 @@ the pipeline. See §6 for the failure signature when it has lapsed.
 ## 2. Running the Pipeline
 
 ### Via the UI (recommended for demos)
+
+**As of Migration Plan Phase 1, two processes must be running together** — `streamlit run Home.py`
+alone now produces failed requests. Reviews (pending/approve/reject), the report list and detail
+view, and chat all call the real FastAPI service; Streamlit no longer talks to Postgres/Search
+directly for those:
+
 ```powershell
-streamlit run Home.py
+uvicorn api.main:app --port 8000    # in one terminal, from the repo root
+streamlit run Home.py               # in a second terminal
 ```
+
 Select a project from the dropdown (nothing loads until you do), then click Generate Status Report.
+
+**Generation itself is the one real exception, deliberately not behind the API.** Clicking
+"Generate Status Report" still calls `run_pipeline_cycle` directly, in-process inside Streamlit —
+it does **not** go through `uvicorn api.main:app`. This is intentional, not a gap someone forgot to
+wire up: the real LLD-specified trigger endpoint (`POST /api/v1/programs/{programId}/reports`,
+returning `202` with a cycle handle) only becomes real in Migration Plan Phase 3, once execution
+moves to a worker with a real status table behind it — building an in-memory cycle registry now
+would be pure throwaway work. Don't read the API service as the whole story for how a report gets
+generated, and don't go looking for a trigger endpoint that isn't there yet on purpose.
 
 ### Via CLI (for scripted/headless runs)
 ```powershell
@@ -134,3 +151,29 @@ Empty output means it's genuinely never been committed.
 - **Cloud Shell may default to PowerShell**, not Bash — Bash-specific commands will fail with a generic PowerShell parse error if this happens
 - **A newly-created Postgres server on PostgreSQL 18** revokes `CREATE` on schema from `PUBLIC` by default — a one-time admin grant is needed before the first migration
 - **The Entra Administrator role for Postgres is not a full superuser** — it can manage roles but does not automatically bypass RLS
+- **A `reports` row that gets a real `approve_report`/`reject_report` decision becomes permanently
+  undeletable on that first write, and the `REVOKE` blocks recovering from it in either direction.**
+  Both real delete paths fail with the identical `InsufficientPrivilegeError`:
+  `DELETE FROM reports WHERE report_id=X` (Postgres checks the referencing `approval_records`
+  table's own privileges as part of the delete) and `DELETE FROM approval_records WHERE
+  report_id=X` (the `REVOKE UPDATE, DELETE` itself). This is the append-only guarantee working
+  exactly as designed, not a bug to route around — and it has now bitten three separate times
+  during ordinary work (report 306, report 320, report 532), correctly, every time. It will bite
+  again the moment any one-off verification exercises `approve_report`/`reject_report` against a
+  freshly-inserted row — there is no "try it and delete it after" with this guarantee. Two real,
+  safe alternatives instead: verify against a row that's already been reviewed (nothing new gets
+  written), or use the same transactional-rollback pattern `tests/test_human_governance.py` uses
+  (open a transaction, run the real check, roll back — every real constraint and error still fires,
+  nothing is ever actually committed).
+- **The RAG index is stale and contains no data for the project this system now tests against.**
+  Confirmed live by direct query against the real Azure AI Search index: 57 total documents, 100%
+  `program_name = 'singleSlide'`, zero for Agentic AI Observability Platform or Leave Tracker —
+  51 report-level + 6 finding-level chunks, report_ids 1 through 51, matching Task 17's own last
+  real `ingest_reports_to_search.py` run exactly and never re-run since (predates AOP being
+  registered as a program at all). Asking the Chat Assistant anything about AOP today will get an
+  honest "not found in any generated report" — correctly, since the index genuinely has nothing to
+  retrieve, not because retrieval is broken. Don't read that as a chat quality problem. The fix is
+  re-running `ingest_reports_to_search.py`, but not yet, and not naively: that script currently has
+  no filter at all and would also pull in the accumulated `test_human_governance.py` fixture rows
+  wholesale — the reindex is planned for a later migration phase (Migration Plan Phase 11 /
+  ADR-022), alongside adding that filter, not as a standalone fix today.
