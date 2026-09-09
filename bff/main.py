@@ -138,6 +138,30 @@ async def list_programs(request: Request) -> Response:
     return _proxy_response(resp)
 
 
+@app.post("/api/v1/programs/{program_id}/reports")
+async def trigger_report(request: Request, program_id: str) -> Response:
+    """Migration Plan Phase 3: proxies the real trigger endpoint. No
+    request body forwarded — identity travels via the same real header
+    _core_headers() already sets on every route (see core_api/main.py's
+    own docstring for why this deviates from the LLD's literal
+    body-supplied requestedBy field). The real `202` status the core API
+    returns is preserved as-is by _proxy_response, not silently
+    rewritten to `200`.
+    """
+    headers = await _core_headers(request)
+    resp = await request.app.state.http_client.post(
+        f"/api/v1/programs/{program_id}/reports", headers=headers
+    )
+    return _proxy_response(resp)
+
+
+@app.get("/api/v1/cycles/{cycle_id}")
+async def get_cycle_status(request: Request, cycle_id: str) -> Response:
+    headers = await _core_headers(request)
+    resp = await request.app.state.http_client.get(f"/api/v1/cycles/{cycle_id}", headers=headers)
+    return _proxy_response(resp)
+
+
 @app.get("/api/v1/reviews/pending")
 async def get_pending_reviews(request: Request, programId: str) -> Response:
     headers = await _core_headers(request)

@@ -1,9 +1,10 @@
 """Thin HTTP client for the real BFF (`bff/main.py`), used by `Home.py`
-for reviews (pending/approve/reject), report list/detail, and chat
-query. Generation still calls `run_pipeline_cycle` directly; the
-trigger endpoint isn't real until Phase 3, when a worker and a status
-table exist behind it — that split is intentional, not something this
-module works around.
+for reviews (pending/approve/reject), report list/detail, chat query,
+and — real now, Migration Plan Phase 3 — generation. `Home.py` no longer
+calls `run_pipeline_cycle` directly at all: `trigger_report_via_api`
+starts a real cycle (a separate worker process executes it) and
+`get_cycle_via_api` polls its real progress from the `cycles` status
+table, closing the two-path split Phase 1 deliberately left open.
 
 Migration Plan Phase 2 (ADR-017): this now talks to the BFF, not the
 core API directly — Streamlit itself never resolved a "real" identity
@@ -124,6 +125,43 @@ async def get_report_detail_via_api(report_id: int) -> dict:
             }
             for u in data["untrackedItems"]
         ],
+    }
+
+
+async def trigger_report_via_api(program_id: str) -> dict:
+    """Real POST /api/v1/programs/{programId}/reports, via the BFF —
+    Migration Plan Phase 3. Returns {"cycle_id": ..., "status":
+    "queued"} immediately; the real pipeline runs in a separate worker
+    process, not in this request. Home.py polls get_cycle_via_api for
+    progress instead of blocking on this call.
+    """
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+        resp = await client.post(f"/api/v1/programs/{program_id}/reports")
+        resp.raise_for_status()
+        data = resp.json()
+    return {"cycle_id": data["cycleId"], "status": data["status"]}
+
+
+async def get_cycle_via_api(cycle_id: str) -> dict:
+    """Real GET /api/v1/cycles/{cycleId}, via the BFF — the real ADR-021
+    polling read. `stages` keys arrive as JSON strings ("1".."7"); kept
+    as strings here too (Home.py's own rendering already normalizes),
+    since re-keying to int here would just be undone by the JSON
+    round-trip the next poll anyway.
+    """
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+        resp = await client.get(f"/api/v1/cycles/{cycle_id}")
+        resp.raise_for_status()
+        data = resp.json()
+    return {
+        "cycle_id": data["cycleId"],
+        "status": data["status"],
+        "stages": data["stages"],
+        "report_id": data["reportId"],
+        "error_detail": data["errorDetail"],
+        "created_at": data["createdAt"],
+        "started_at": data["startedAt"],
+        "finished_at": data["finishedAt"],
     }
 
 

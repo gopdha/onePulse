@@ -120,3 +120,27 @@ async def test_real_rejected_notes_required_check_constraint_is_detected(conn) -
         )
         is True
     )
+
+
+async def test_real_cycles_table_is_detected(conn) -> None:
+    # Migration 0003 (Phase 3 status table) — proves the check queries
+    # information_schema for real, same discipline as every table above.
+    assert await check_table_exists(conn, "cycles") is True
+
+
+async def test_real_cycles_status_check_constraint_covers_all_terminal_outcomes(conn) -> None:
+    assert (
+        await check_check_constraint_values(
+            conn, "cycles", "status",
+            ["queued", "running", "persisted", "persisted_route_to_human_review",
+             "not_persisted_already_exists", "hard_stop_defect", "failed"],
+        )
+        is True
+    )
+
+
+async def test_forced_failure_cycles_status_check_rejects_a_value_never_in_the_constraint(conn) -> None:
+    assert (
+        await check_check_constraint_values(conn, "cycles", "status", ["purple_haze"])
+        is False
+    )

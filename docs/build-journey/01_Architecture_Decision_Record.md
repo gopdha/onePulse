@@ -110,6 +110,8 @@ Each entry follows: **Context → Decision → Reasoning → Consequences**. The
 
 **Consequences**: The termination guarantee's *character* changed, and this is documented precisely rather than glossed over: switching projects always **eventually** stops the backend (never silently completes and persists a surprise report), but the actual stop time is now bounded by whatever work is in flight — measured at ~4s and ~16.5s in two real test scenarios, not instant. This is a genuine, permanent trade-off of the threaded architecture, not a bug.
 
+**Superseded (Migration Plan Phase 3, Task 42, 2026-09-09):** this entire decision no longer applies. Once pipeline execution moved to a real, separate worker process — not a background thread inside Streamlit — the problem this ADR exists to solve (smooth UI ticking vs. a real termination guarantee, both constrained to one process) stopped being real: the worker is not a thread Streamlit spawns and cannot cancel or race with, so there is nothing left to bound. The `threading.Event`/`contextvars.copy_context()` plumbing this ADR chose was removed outright, not left inert. The bounded-by-in-flight-work guarantee this ADR measured (~4s/~16.5s) is superseded by an unconditional one: closing the client entirely does not affect the worker at all, proven live in Task 42. Kept here for real historical reference, same treatment as every other superseded decision in this log — not deleted just because the architecture moved on.
+
 ---
 
 ## ADR-010: Streamlit for the UI, not Azure Static Web Apps
