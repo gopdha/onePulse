@@ -112,6 +112,20 @@ async def check_check_constraint_values(
     return all(f"'{v}'" in combined for v in expected_values)
 
 
+async def check_constraint_exists(conn: asyncpg.Connection, table_name: str, constraint_name: str) -> bool:
+    """True iff a constraint with this exact name exists on this table —
+    for constraints like a Monday-only CHECK or a cross-column CHECK that
+    aren't a simple value-list (check_check_constraint_values's shape),
+    so are looked up by name against pg_constraint directly instead.
+    """
+    result = await conn.fetchval(
+        "SELECT 1 FROM pg_constraint WHERE conrelid = $1::regclass AND conname = $2",
+        table_name,
+        constraint_name,
+    )
+    return result is not None
+
+
 async def check_rls_enabled(conn: asyncpg.Connection, table_name: str) -> bool:
     result = await conn.fetchval(
         "SELECT relrowsecurity FROM pg_class WHERE relname = $1 AND relnamespace = 'public'::regnamespace",
@@ -188,6 +202,15 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
          await check_check_constraint_values(
              conn, "actors", "role", ["portfolio_lead", "program_lead", "platform_admin"]
          ))
+    )
+
+    results.append(
+        ("CHECK constraint: reports.week_of is Monday-only (0002, NOT VALID)",
+         await check_constraint_exists(conn, "reports", "reports_week_of_is_monday"))
+    )
+    results.append(
+        ("CHECK constraint: approval_records rejected decisions require notes (0002)",
+         await check_constraint_exists(conn, "approval_records", "approval_records_rejected_notes_required"))
     )
 
     results.append(("RLS enabled: reports", await check_rls_enabled(conn, "reports")))

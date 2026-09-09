@@ -20,6 +20,7 @@ from onepulse_common.db import PostgresClient
 from verify_migration import (
     check_check_constraint_values,
     check_column_exists,
+    check_constraint_exists,
     check_generated_column,
     check_policy_exists,
     check_privilege_revoked,
@@ -96,4 +97,26 @@ async def test_forced_failure_revoke_check_detects_a_real_grant(conn) -> None:
     assert (
         await check_privilege_revoked(conn, "findings", "app_role_local_dev", ["INSERT"])
         is False
+    )
+
+
+async def test_real_week_of_monday_check_constraint_is_detected(conn) -> None:
+    # Migration 0002's real constraint — proves the check queries
+    # pg_constraint for real rather than always returning True.
+    assert await check_constraint_exists(conn, "reports", "reports_week_of_is_monday") is True
+
+
+async def test_forced_failure_missing_named_constraint_is_detected(conn) -> None:
+    assert (
+        await check_constraint_exists(conn, "reports", "this_constraint_does_not_exist_1a2b3c")
+        is False
+    )
+
+
+async def test_real_rejected_notes_required_check_constraint_is_detected(conn) -> None:
+    assert (
+        await check_constraint_exists(
+            conn, "approval_records", "approval_records_rejected_notes_required"
+        )
+        is True
     )

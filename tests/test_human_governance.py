@@ -1,28 +1,57 @@
 """Phase 7 Human Governance API — real tests against the real
 onepulse-pg-dev instance. No mocks: every test here writes a real row
-and reads it back with a separate, direct query, and the REVOKE test
-attempts a real UPDATE/DELETE over the real connection this project
-uses everywhere else, to prove the database itself refuses it.
+and reads it back with a separate query on the same connection, and the
+REVOKE test attempts a real UPDATE/DELETE over the real connection this
+project uses everywhere else, to prove the database itself refuses it.
 
 Prerequisite: `python scripts/seed_dev_data.py --target dev` must have
 been run at least once, so the singleSlide program and the stand-in
 reviewer actor (see seed_dev_data.py) already exist.
 
-Each report-writing test inserts its own fresh report row with a random
-week_of (avoiding the UNIQUE(program_id, week_of) constraint across
-repeated runs) rather than cleaning up afterwards. Cleanup is not
-possible in the general case: approval_records is append-only by design
-(REVOKE UPDATE, DELETE — Phase 2), and reports rows that have an
-approval_records row referencing them cannot be deleted without
-deleting that row first. Accumulating a handful of clearly-marked test
-rows in the dev database is the accepted cost of testing this for real
-rather than mocking it away.
+Real fix (2026-09-10): every test used to insert a real, committed
+`reports` row with a deliberately random (non-Monday) `week_of`, purely
+to dodge `UNIQUE(program_id, week_of)` across repeated runs — the header
+here used to describe this as "accumulating a handful of clearly-marked
+test rows... the accepted cost of testing this for real." That framing
+undersold the real consequence: by 2026-09-10 it was 439 of 459 rows in
+the live `reports` table (95%+), still growing with every test run,
+`list_recent_reports` returning 20/20 fixture rows for singleSlide ahead
+of any real pipeline output, and `ingest_reports_to_search.py` (no
+filter at all) ready to index every one of them into the real RAG
+corpus. Not a handful, and not anticipated when the cost was accepted.
+
+Fixed by wrapping each test in one real transaction, rolled back in the
+fixture's own teardown — the intent (test against the real database, not
+a mock) is fully preserved: every real constraint, the real `REVOKE`,
+and every real error still fire, on the real schema, over the real
+connection this project authenticates with everywhere else. Nothing a
+test writes is ever actually committed, so nothing is left behind for
+list_recent_reports, ingest_reports_to_search, or a future
+`UNIQUE`/CHECK collision to trip over. `approve_report`/`reject_report`'s
+own internal `conn.transaction()` calls nest correctly as real
+SAVEPOINTs under the fixture's outer transaction (asyncpg's standard
+behavior for a transaction started while already inside one) — a
+savepoint commit (release) or rollback never escapes to a real COMMIT,
+which only the (never-called) outer commit could do.
+
+One test (`test_approval_records_update_is_rejected_by_the_database`)
+runs two statements that are *expected* to fail with a real database
+error. Each is wrapped in its own `async with conn.transaction():` (a
+real SAVEPOINT) so the expected, caught failure only rolls back to that
+savepoint — not the whole outer test transaction, which would otherwise
+be left aborted for every statement after it in the same test.
+
+`_random_week_of()` no longer needs to be random: with nothing ever
+committed, there is no cross-run collision to dodge, and migration 0002
+added a real `reports.week_of` Monday-only CHECK (found necessary by the
+same investigation that found this pollution) that a random date would
+violate 6 days out of 7. Replaced with one fixed, real Monday.
 """
 
 from __future__ import annotations
 
+import itertools
 import os
-import random
 from datetime import date, timedelta
 
 import asyncpg
@@ -43,13 +72,28 @@ pytestmark = pytest.mark.asyncio
 
 TEST_MARKER = "test_human_governance.py fixture row"
 
+# Real, distinct Mondays, satisfying migration 0002's
+# reports_week_of_is_monday CHECK. A single fixed date isn't enough — a
+# test needing two real reports for the same program (e.g.
+# test_list_pending_reviews_excludes_reviewed_reports) would collide on
+# UNIQUE(program_id, week_of) — so this hands out a fresh, monotonically
+# increasing real Monday on every call instead. Deterministic, not
+# random: nothing ever persists (see module docstring), so there is no
+# cross-run collision to dodge, only a real within-test one to avoid.
+_week_of_counter = itertools.count()
 
-def _random_week_of() -> date:
-    return date(2000, 1, 1) + timedelta(days=random.randint(0, 2_900_000))
+
+def _next_test_week_of() -> date:
+    return date(2000, 1, 3) + timedelta(weeks=next(_week_of_counter))
 
 
 @pytest_asyncio.fixture
 async def conn():
+    """One real connection, wrapped in one real transaction that is
+    always rolled back on teardown — see module docstring for why, and
+    for how approve_report/reject_report's own internal transactions
+    nest correctly underneath it as real SAVEPOINTs.
+    """
     settings = PostgresSettings(
         host="onepulse-pg-dev.postgres.database.azure.com",
         database="onepulse",
@@ -57,7 +101,12 @@ async def conn():
     )
     client = await PostgresClient.connect(settings, min_size=1, max_size=1)
     async with client.pool.acquire() as c:
-        yield c
+        tx = c.transaction()
+        await tx.start()
+        try:
+            yield c
+        finally:
+            await tx.rollback()
     await client.close()
 
 
@@ -85,7 +134,7 @@ async def _insert_test_report(conn, program_id: str) -> int:
         RETURNING report_id
         """,
         program_id,
-        _random_week_of(),
+        _next_test_week_of(),
         TEST_MARKER,
     )
 
@@ -145,6 +194,34 @@ async def test_reject_report_requires_notes(conn, program_id, actor_id) -> None:
     assert reviewed is False
 
 
+async def test_reject_report_with_empty_notes_is_also_refused_by_the_database(
+    conn, program_id, actor_id
+) -> None:
+    """Migration 0002's real CHECK constraint
+    (approval_records_rejected_notes_required) — proves empty-notes
+    rejection is refused at the database level too, independent of
+    reject_report's own application-level NotesRequiredError check
+    above. Goes around that function deliberately, via a direct INSERT,
+    so this cannot pass merely because the Python-level guard happened
+    to run first.
+    """
+    report_id = await _insert_test_report(conn, program_id)
+
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO approval_records (report_id, decision, actor_id, notes) "
+                "VALUES ($1, 'rejected', $2, '')",
+                report_id,
+                actor_id,
+            )
+
+    count = await conn.fetchval(
+        "SELECT count(*) FROM approval_records WHERE report_id = $1", report_id
+    )
+    assert count == 0
+
+
 async def test_approve_report_requires_actor_id(conn, program_id) -> None:
     report_id = await _insert_test_report(conn, program_id)
 
@@ -187,17 +264,27 @@ async def test_approval_records_update_is_rejected_by_the_database(conn, program
     against whichever role ONEPULSE_PG_ROLE resolves to (app_role_local_dev
     by default), which is the real, honest substitution for `app_role`
     in a local dev context — not a weaker stand-in.
+
+    Each expected-failure statement below is wrapped in its own
+    `async with conn.transaction():` (a real SAVEPOINT, since the `conn`
+    fixture already has an outer transaction open) — otherwise the first
+    caught failure would leave the whole outer test transaction aborted,
+    and every statement after it (including the second expected failure
+    and the final confirming SELECT) would fail with
+    `InFailedSQLTransactionError` instead of actually exercising anything.
     """
     report_id = await _insert_test_report(conn, program_id)
     await approve_report(conn, report_id, actor_id)
 
     with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
-        await conn.execute(
-            "UPDATE approval_records SET notes = 'tampered' WHERE report_id = $1", report_id
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE approval_records SET notes = 'tampered' WHERE report_id = $1", report_id
+            )
 
     with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
-        await conn.execute("DELETE FROM approval_records WHERE report_id = $1", report_id)
+        async with conn.transaction():
+            await conn.execute("DELETE FROM approval_records WHERE report_id = $1", report_id)
 
     # Confirm the row is genuinely untouched, not just that an exception
     # was raised for some unrelated reason.
