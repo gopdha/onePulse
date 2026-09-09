@@ -1,51 +1,31 @@
-"""OnePulse API — Migration Plan Phase 1 (LLD Section 2's endpoint
-contract, never built until now; ADR-015's real, direct justification).
+"""OnePulse core API — Migration Plan Phase 2 (ADR-017): owns the
+domain, every data connection, and dispatch. Everything that was in
+`api/main.py` (Phase 1) lives here now, plus the real boundary Phase 2
+adds: every route requires a real, validated service token (see
+`security.py`), and identity is resolved server-side from a real
+`actors` lookup — never accepted as an internal `actor_id` from the
+caller. See `security.py`'s own module docstring for the full reasoning
+and the real Entra App Registration this validates against
+(`onepulse-core-api`), and CLAUDE.md Task 41 for the real setup process,
+including a real consent-propagation delay found live.
 
-Real scope, three decisions made explicitly rather than left as buried
-assumptions — see CLAUDE.md Task 40 for the full reasoning behind each,
-and treat all three as adjustable defaults, not fixed constraints:
+Three Phase 1 decisions still hold, unchanged, restated so they aren't
+lost in the split (see the superseded `api/main.py`'s own docstring,
+Task 40, for the full original reasoning): no report-trigger endpoint
+(Phase 3); still no *reviewer* authentication (Phase 8) — what Phase 2
+adds is *service* authentication (proving the caller is really the
+BFF) and real identity *resolution* (turning a forwarded object ID into
+a real actor), neither of which is reviewer auth; `onepulse_common` is
+not modified by this file's own routes.
 
-1. NO report-trigger endpoint in this phase. LLD 2.1's `POST
-   /api/v1/programs/{programId}/reports` returns `202` with a cycle
-   handle — that only becomes real in Phase 3, once execution moves to a
-   worker with a real status table behind it (ADR-021). An in-memory
-   cycle registry built now would be pure throwaway work. Streamlit
-   keeps calling `run_pipeline_cycle` directly for generation until then.
-2. NO authentication in this phase. `actorId` is a trusted request
-   field, exactly as it is today in `scripts/review_cli.py` and
-   `Home.py`. Real reviewer identity is Phase 8, and gates public
-   ingress (Migration Plan, ADR-018) — inventing an interim auth scheme
-   here would just be something Phase 8 has to unpick.
-3. `onepulse_common` is NOT modified. Every route below wraps an
-   already-proven function; none of their own signatures or behavior
-   changed to get here. Pydantic models mirror constraints the database
-   already enforces (the real four-level `findings.status_label`
-   taxonomy; non-empty rejection notes, matching the real
-   `approval_records_rejected_notes_required` CHECK added this same
-   task) — so a violation fails at this edge *as well as* at the
-   database, never *instead of* it; both layers are proven directly, not
-   assumed from each other (see the bar-for-done evidence in Task 40).
+Real, load-bearing design point: this service now has **internal-only**
+meaning even though nothing locally enforces network isolation (that's
+Phase 7, Container Apps ingress). `verify_service_token` is what
+actually stands in for that boundary today — a request without a real,
+valid token for this service's own audience is rejected regardless of
+which port it arrives on.
 
-One connection pattern, deliberately kept honest rather than smoothed
-over: `human_governance.py`'s functions all take a `conn` they don't
-open themselves — this app opens one real, long-lived pool at startup
-(the lifespan below) and acquires from it per request, which is the
-correct pattern for a long-lived service (unlike Streamlit's
-open-a-connection-per-rerun `with_connection` helper, which exists
-specifically because Streamlit has no persistent process to hold a pool
-in). `onepulse_common.pipeline.list_recent_reports`, by contrast, opens
-and closes its own dedicated one-shot connection internally on every
-call — a real, pre-existing inconsistency in `onepulse_common` this
-phase's own constraint (do not modify it) means living with, not fixing
-here.
-
-Not wired in this phase, deliberately: the dual Application
-Insights/Arize observability every CLI agentic entry point carries.
-Not asked for, and Phase 2's BFF/core-API split changes the process
-boundary anyway — wiring it now risks doing it twice.
-
-Run: uvicorn api.main:app --reload --port 8000 (from the repo root, same
-CWD convention as every other script in this project).
+Run: uvicorn core_api.main:app --port 8000 (from the repo root).
 """
 
 from __future__ import annotations
@@ -55,29 +35,34 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 import asyncpg
-from azure.identity import DefaultAzureCredential
 from agent_framework.foundry import FoundryChatClient
+from arize.otel import set_routing_context
+from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from opentelemetry import trace
+from opentelemetry.propagate import extract
 from pydantic import BaseModel, field_validator
 
+from core_api.security import ActorNotFoundError, get_entra_object_id, resolve_actor, verify_service_token
 from onepulse_common.chat_assistant import ask_question
 from onepulse_common.config import PostgresSettings
 from onepulse_common.db import PostgresClient
 from onepulse_common.embeddings import build_embedding_client
 from onepulse_common.human_governance import (
-    ActorIdRequiredError,
     NotesRequiredError,
     approve_report,
     get_report_detail,
     list_pending_reviews,
     reject_report,
 )
+from onepulse_common.observability import ARIZE_PROJECT_NAME, enable_observability
 from onepulse_common.pipeline import list_recent_reports
 from onepulse_common.search_index import build_search_client
+from trace_debug import enable_debug_span_log
 
 load_dotenv()
 
@@ -92,23 +77,30 @@ PROJECT_ENDPOINT = os.environ.get(
 )
 DEPLOYMENT_NAME = os.environ.get("ONEPULSE_FOUNDRY_DEPLOYMENT_NAME", "onePulse-gpt-5-mini")
 
+_tracer = trace.get_tracer(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Every real client this service needs, constructed once and reused
-    across requests — not once per call, matching a long-lived service
-    rather than Streamlit's per-rerun reconstruction.
-    """
     pg_client = await PostgresClient.connect(PG_SETTINGS, min_size=1, max_size=5)
     credential = DefaultAzureCredential()
     search_client = build_search_client(credential)
     embedding_client = build_embedding_client(credential)
     chat_client = FoundryChatClient(project_endpoint=PROJECT_ENDPOINT, model=DEPLOYMENT_NAME, credential=credential)
 
+    # Real dual-export observability (Application Insights + Arize),
+    # the identical function every other real entry point in this
+    # project uses — one TracerProvider per process, called once here
+    # (this service's own lifespan runs once per process, same
+    # guarantee run_pipeline.py's single-CLI-invocation shape gives).
+    arize_space_id = enable_observability(credential, PROJECT_ENDPOINT)
+    enable_debug_span_log("core_api")
+
     app.state.pg_client = pg_client
     app.state.search_client = search_client
     app.state.embedding_client = embedding_client
     app.state.chat_client = chat_client
+    app.state.arize_space_id = arize_space_id
 
     try:
         yield
@@ -116,43 +108,53 @@ async def lifespan(app: FastAPI):
         await pg_client.close()
         await search_client.close()
         await embedding_client.close()
+        trace.get_tracer_provider().force_flush(timeout_millis=30000)
 
 
-app = FastAPI(title="OnePulse API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="OnePulse Core API", version="0.2.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def tracing_middleware(request: Request, call_next):
+    """The real cross-process half of Phase 2's own bar: extracts the
+    W3C `traceparent` the BFF sent (via `opentelemetry.propagate.
+    extract`, the standard mechanism, not hand-rolled header parsing)
+    and uses it as the parent context for this service's own root span
+    — this is what makes the core API's spans nest under the BFF's in
+    the real trace tree, rather than appearing as a second, disconnected
+    trace. `set_routing_context` is the OUTER manager (same real fix
+    Task 30 already found and proved once: `ArizeRoutingSpanProcessor.
+    on_start()` reads this contextvar at span-*creation* time, not
+    on_end() — so it must already be active before `start_as_current_
+    span` runs, not merely before the span finishes).
+    """
+    parent_ctx = extract(dict(request.headers))
+    with set_routing_context(space_id=app.state.arize_space_id, project_name=ARIZE_PROJECT_NAME):
+        with _tracer.start_as_current_span(
+            f"core_api {request.method} {request.url.path}", context=parent_ctx
+        ) as span:
+            span.set_attribute("http.method", request.method)
+            span.set_attribute("http.target", request.url.path)
+            response = await call_next(request)
+            span.set_attribute("http.status_code", response.status_code)
+    return response
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    """LLD 2.2's real, specified error shape for a rejection with empty
-    notes is `400 { "error": "notes_required" }`, not FastAPI's default
-    `422` validation-error body. RejectRequest's own field_validator
-    (below) raises exactly this on empty/whitespace-only notes — this
-    handler recognizes that specific case by which field failed and
-    reshapes the response to match the real contract; `actorId`'s own
-    validator gets the same treatment for consistency. Any other
-    validation failure keeps FastAPI's normal 422 behavior, using
-    `jsonable_encoder` rather than passing `exc.errors()` to
-    `JSONResponse` directly — a real bug found live: Pydantic's own
-    error dicts carry the raw exception object under `ctx`, which
-    `json.dumps` cannot serialize on its own (confirmed live: a bare
-    empty actorId crashed this handler with `TypeError: Object of type
-    ValueError is not JSON serializable` before this fix).
+    """Unchanged real behavior from Phase 1 — see the superseded
+    `api/main.py`'s own docstring (Task 40) for the full reasoning,
+    including the real `jsonable_encoder` bug found live there.
     """
     for err in exc.errors():
         loc = err.get("loc", ())
         if loc and loc[-1] == "notes":
             return JSONResponse(status_code=400, content={"error": "notes_required"})
-        if loc and loc[-1] == "actorId":
-            return JSONResponse(status_code=400, content={"error": "actor_id_required"})
     return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
 
 # ---------------------------------------------------------------------
-# Pydantic models — request bodies validate at the edge; response models
-# mirror the real column-level constraints the database already
-# enforces (Literal types for the real CHECK-constrained taxonomies),
-# not because Pydantic is a substitute for those CHECKs, but so a
-# genuine mismatch is caught here too, not only much further downstream.
+# Pydantic models
 # ---------------------------------------------------------------------
 
 RagStatus = Literal["Red", "Amber", "Green", "Unknown"]
@@ -161,34 +163,14 @@ StatusLabel = Literal["On Track", "At Risk", "Blocked", "Needs Human Review"]
 Decision = Literal["approved", "rejected"]
 
 
-class ApproveRequest(BaseModel):
-    actorId: str
-
-    @field_validator("actorId")
-    @classmethod
-    def actor_id_must_not_be_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("actor_id_required")
-        return v
-
-
 class RejectRequest(BaseModel):
-    actorId: str
     notes: str
-
-    @field_validator("actorId")
-    @classmethod
-    def actor_id_must_not_be_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("actor_id_required")
-        return v
 
     @field_validator("notes")
     @classmethod
     def notes_must_not_be_empty(cls, v: str) -> str:
-        # Mirrors the real approval_records_rejected_notes_required CHECK
-        # (migration 0002: decision != 'rejected' OR length(trim(notes)) > 0)
-        # — same "empty after trim" definition, at the edge as well.
+        # Mirrors the real approval_records_rejected_notes_required
+        # CHECK (migration 0002) — same "empty after trim" definition.
         if not v or not v.strip():
             raise ValueError("notes_required")
         return v
@@ -264,16 +246,8 @@ class ReportDetailResponse(BaseModel):
 
 
 class ChatQueryRequest(BaseModel):
-    actorId: str
     question: str
     programId: str | None = None
-
-    @field_validator("actorId")
-    @classmethod
-    def actor_id_must_not_be_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("actor_id_required")
-        return v
 
     @field_validator("question")
     @classmethod
@@ -297,72 +271,78 @@ class ChatQueryResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------
-# Routes
+# Routes — every one requires a real, validated service token
+# (verify_service_token), applied per-route via `Depends` rather than
+# buried in middleware, so each route's real auth requirement is
+# visible in its own signature.
 # ---------------------------------------------------------------------
 
 
 @app.get("/api/v1/programs")
-async def list_programs(request: Request) -> list[ProgramItem]:
-    """Not in LLD 2's literal contract — added because every other route
-    below needs a real programId, and nothing else in this API exposes
-    how to find one. Wraps the same real `programs` table Home.py's own
-    project selector already reads.
-    """
+async def list_programs(request: Request, _token=Depends(verify_service_token)) -> list[ProgramItem]:
     async with request.app.state.pg_client.pool.acquire() as conn:
         rows = await conn.fetch("SELECT program_id, name FROM programs ORDER BY name")
     return [ProgramItem(programId=str(r["program_id"]), name=r["name"]) for r in rows]
 
 
 @app.get("/api/v1/reviews/pending")
-async def get_pending_reviews(request: Request, programId: str) -> PendingReviewsResponse:
-    """LLD 2.2: GET /api/v1/reviews/pending?programId={programId}."""
+async def get_pending_reviews(
+    request: Request, programId: str, _token=Depends(verify_service_token)
+) -> PendingReviewsResponse:
     async with request.app.state.pg_client.pool.acquire() as conn:
         result = await list_pending_reviews(conn, programId)
     return PendingReviewsResponse(**result)
 
 
 @app.post("/api/v1/reviews/{report_id}/approve")
-async def approve(request: Request, report_id: int, body: ApproveRequest) -> ReviewDecisionResponse:
-    """LLD 2.2: POST /api/v1/reviews/{reportId}/approve."""
+async def approve(
+    request: Request,
+    report_id: int,
+    _token=Depends(verify_service_token),
+    entra_object_id: str = Depends(get_entra_object_id),
+) -> ReviewDecisionResponse:
+    """Real ADR-017 resolution: the caller (BFF) supplies only an Entra
+    object ID; the real internal actor_id used for the approval is
+    always looked up here, never accepted from the request.
+    """
     async with request.app.state.pg_client.pool.acquire() as conn:
         try:
-            result = await approve_report(conn, report_id, body.actorId)
-        except ActorIdRequiredError:
-            raise HTTPException(status_code=400, detail={"error": "actor_id_required"})
+            actor = await resolve_actor(conn, entra_object_id)
+        except ActorNotFoundError:
+            raise HTTPException(status_code=401, detail={"error": "actor_not_found"})
+        try:
+            result = await approve_report(conn, report_id, str(actor["actor_id"]))
         except asyncpg.exceptions.ForeignKeyViolationError:
             raise HTTPException(status_code=404, detail={"error": "report_not_found"})
     return ReviewDecisionResponse(**result)
 
 
 @app.post("/api/v1/reviews/{report_id}/reject")
-async def reject(request: Request, report_id: int, body: RejectRequest) -> ReviewDecisionResponse:
-    """LLD 2.2: POST /api/v1/reviews/{reportId}/reject. 400 notes_required
-    on empty notes — RejectRequest's own field_validator already catches
-    this before the handler runs (see the RequestValidationError handler
-    above for the response-shape mapping); the NotesRequiredError catch
-    here is real defense in depth, not the primary path, for the same
-    reason `reject_report` keeps its own internal check regardless of
-    what calls it.
-    """
+async def reject(
+    request: Request,
+    report_id: int,
+    body: RejectRequest,
+    _token=Depends(verify_service_token),
+    entra_object_id: str = Depends(get_entra_object_id),
+) -> ReviewDecisionResponse:
     async with request.app.state.pg_client.pool.acquire() as conn:
         try:
-            result = await reject_report(conn, report_id, body.actorId, body.notes)
+            actor = await resolve_actor(conn, entra_object_id)
+        except ActorNotFoundError:
+            raise HTTPException(status_code=401, detail={"error": "actor_not_found"})
+        try:
+            result = await reject_report(conn, report_id, str(actor["actor_id"]), body.notes)
         except NotesRequiredError:
             raise HTTPException(status_code=400, detail={"error": "notes_required"})
-        except ActorIdRequiredError:
-            raise HTTPException(status_code=400, detail={"error": "actor_id_required"})
         except asyncpg.exceptions.ForeignKeyViolationError:
             raise HTTPException(status_code=404, detail={"error": "report_not_found"})
     return ReviewDecisionResponse(**result)
 
 
 @app.get("/api/v1/reports")
-async def get_reports(programId: str | None = None, limit: int = 20) -> list[ReportSummary]:
-    """Not in LLD 2's literal contract — the real report history view
-    Home.py's "Previous Status Reports" panel already needs. Wraps
-    `list_recent_reports` unchanged; that function manages its own
-    connection internally (see module docstring).
-    """
+async def get_reports(
+    programId: str | None = None, limit: int = 20, _token=Depends(verify_service_token)
+) -> list[ReportSummary]:
     rows = await list_recent_reports(limit=limit, program_id=programId)
     return [
         ReportSummary(
@@ -382,13 +362,9 @@ async def get_reports(programId: str | None = None, limit: int = 20) -> list[Rep
 
 
 @app.get("/api/v1/reports/{report_id}")
-async def get_report(request: Request, report_id: int) -> ReportDetailResponse:
-    """Not in LLD 2's literal contract — FR-13's "preview a fully
-    rendered report" requirement, already served by
-    `get_report_detail`. 404 when the report genuinely doesn't exist,
-    matching REST convention — `get_report_detail` itself returns
-    `report: None` rather than raising, so that translation happens here.
-    """
+async def get_report(
+    request: Request, report_id: int, _token=Depends(verify_service_token)
+) -> ReportDetailResponse:
     async with request.app.state.pg_client.pool.acquire() as conn:
         result = await get_report_detail(conn, report_id)
     if result["report"] is None:
@@ -429,22 +405,29 @@ async def get_report(request: Request, report_id: int) -> ReportDetailResponse:
 
 
 @app.post("/api/v1/chat/query")
-async def chat_query(request: Request, body: ChatQueryRequest) -> ChatQueryResponse:
-    """LLD 2.3: POST /api/v1/chat/query. `programId` is accepted directly
-    as a filter, the same real, explicitly-flagged shortcut
-    `ask_question` itself already documents (real server-side
-    `actor_scope` resolution is Phase 8 work, not built anywhere yet) —
-    not invented at this edge, just passed through unchanged.
+async def chat_query(
+    request: Request,
+    body: ChatQueryRequest,
+    _token=Depends(verify_service_token),
+    entra_object_id: str = Depends(get_entra_object_id),
+) -> ChatQueryResponse:
+    """`entra_object_id` is resolved for real (proving the identity is
+    real and known) but not yet used to scope retrieval — the same
+    real, already-documented shortcut `ask_question` itself states
+    (`actor_scope` resolution is Phase 8 work). Resolving it here now,
+    even unused for scoping yet, means Phase 8 only has to change what
+    this does with the result, not add the resolution step itself.
     """
+    async with request.app.state.pg_client.pool.acquire() as conn:
+        try:
+            await resolve_actor(conn, entra_object_id)
+        except ActorNotFoundError:
+            raise HTTPException(status_code=401, detail={"error": "actor_not_found"})
+
     state = request.app.state
     result = await ask_question(
         state.chat_client, state.search_client, state.embedding_client, body.question, body.programId
     )
-    # ask_question's real CHAT_SCHEMA returns snake_case citation keys
-    # (report_id, program_name, week_of, source_item_ref, finding_title)
-    # — mapped explicitly here, same as every other route, rather than
-    # assuming Pydantic's **result would line up with the camelCase
-    # response contract.
     return ChatQueryResponse(
         answer=result["answer"],
         citations=[

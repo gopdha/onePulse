@@ -33,26 +33,42 @@ the pipeline. See §6 for the failure signature when it has lapsed.
 
 ### Via the UI (recommended for demos)
 
-**As of Migration Plan Phase 1, two processes must be running together** — `streamlit run Home.py`
-alone now produces failed requests. Reviews (pending/approve/reject), the report list and detail
-view, and chat all call the real FastAPI service; Streamlit no longer talks to Postgres/Search
-directly for those:
+**As of Migration Plan Phase 2, three processes must be running together** — `streamlit run
+Home.py` alone now produces failed requests, and starting the BFF without the core API first will
+make every real request through it fail too, since the BFF has no data store of its own to fall
+back on. Reviews (pending/approve/reject), the report list and detail view, and chat all go through
+the BFF, which forwards each request to the core API; Streamlit no longer talks to the core API (or
+Postgres/Search) directly for those:
 
 ```powershell
-uvicorn api.main:app --port 8000    # in one terminal, from the repo root
-streamlit run Home.py               # in a second terminal
+uvicorn core_api.main:app --port 8000   # terminal 1, from the repo root — start this first
+uvicorn bff.main:app --port 8100        # terminal 2 — depends on core_api already running
+streamlit run Home.py                   # terminal 3
 ```
 
 Select a project from the dropdown (nothing loads until you do), then click Generate Status Report.
 
-**Generation itself is the one real exception, deliberately not behind the API.** Clicking
+**Generation itself is the one real exception, deliberately not behind either service.** Clicking
 "Generate Status Report" still calls `run_pipeline_cycle` directly, in-process inside Streamlit —
-it does **not** go through `uvicorn api.main:app`. This is intentional, not a gap someone forgot to
+it does **not** go through the BFF or the core API. This is intentional, not a gap someone forgot to
 wire up: the real LLD-specified trigger endpoint (`POST /api/v1/programs/{programId}/reports`,
 returning `202` with a cycle handle) only becomes real in Migration Plan Phase 3, once execution
 moves to a worker with a real status table behind it — building an in-memory cycle registry now
-would be pure throwaway work. Don't read the API service as the whole story for how a report gets
+would be pure throwaway work. Don't read either service as the whole story for how a report gets
 generated, and don't go looking for a trigger endpoint that isn't there yet on purpose.
+
+**Why two services instead of one, as of Phase 2 (ADR-017/ADR-018):** the BFF owns session,
+identity resolution, and response shaping for the frontend — it holds no database connection, no
+Azure AI Search client, and no Foundry client of any kind, enforced structurally, not just by
+convention (`tests/test_bff_no_data_access.py` proves it via static import-graph analysis plus a
+live, adversarial subprocess check of `sys.modules`). The core API owns the domain and every real
+data connection. The BFF authenticates to the core API with a real Entra service-to-service token
+(not a shared secret), and forwards the caller's Entra object ID via the
+`X-Onepulse-Entra-Object-Id` header — the core API is the only place that ever resolves an object
+ID into an internal `actor_id`; nothing external is ever trusted to supply one directly. There is
+still no real reviewer authentication (that's Phase 8) — the BFF currently forwards a fixed stub
+object ID (`ONEPULSE_STUB_ENTRA_OBJECT_ID`), but the real shape (a header carrying an identity the
+core API resolves itself) is already in place for Phase 8 to slot a real token into.
 
 ### Via CLI (for scripted/headless runs)
 ```powershell
@@ -160,11 +176,25 @@ Empty output means it's genuinely never been committed.
   exactly as designed, not a bug to route around — and it has now bitten three separate times
   during ordinary work (report 306, report 320, report 532), correctly, every time. It will bite
   again the moment any one-off verification exercises `approve_report`/`reject_report` against a
-  freshly-inserted row — there is no "try it and delete it after" with this guarantee. Two real,
-  safe alternatives instead: verify against a row that's already been reviewed (nothing new gets
-  written), or use the same transactional-rollback pattern `tests/test_human_governance.py` uses
-  (open a transaction, run the real check, roll back — every real constraint and error still fires,
-  nothing is ever actually committed).
+  freshly-inserted row — there is no "try it and delete it after" with this guarantee. **Correction,
+  found the hard way during Migration Plan Phase 2 (report 454):** "verify against a row that's
+  already been reviewed" is *not* actually safe — `approve_report`/`reject_report` never check the
+  row's current `reviewed` state before writing. Re-approving an already-reviewed report succeeds
+  and inserts a second, real `approval_records` row for the same report, just as undeletable as the
+  first. The only real safe alternative is the transactional-rollback pattern
+  `tests/test_human_governance.py` uses (open a transaction, run the real check, roll back — every
+  real constraint and error still fires, nothing is ever actually committed), or picking a row that
+  has genuinely never been decided on and accepting the resulting permanent row as the real cost of
+  testing against real infrastructure.
+- **Old pre-Task-40 test-fixture `reports` rows can have a `week_of` far outside any sane calendar
+  range** (some from years like 4396 or 9853 — leftovers from the old `_random_week_of()` test
+  helper, before `tests/test_human_governance.py` was rewritten around transactional rollback).
+  Migration `0002`'s `reports_week_of_is_monday` CHECK is `NOT VALID`, so these old rows were never
+  retroactively validated and sat there quietly — but any real `UPDATE` against one (which is
+  exactly what `approve_report`/`reject_report` do) re-checks the constraint on the new row image
+  and fails with a genuine `CheckViolationError`, not a bug in the code doing the updating. Confirmed
+  live during Phase 2 BFF verification (report 489). If a review action 500s with this error, check
+  the row's actual `week_of` before assuming the service layer broke.
 - **The RAG index is stale and contains no data for the project this system now tests against.**
   Confirmed live by direct query against the real Azure AI Search index: 57 total documents, 100%
   `program_name = 'singleSlide'`, zero for Agentic AI Observability Platform or Leave Tracker —

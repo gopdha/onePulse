@@ -1,9 +1,24 @@
-"""Thin HTTP client for the real FastAPI service (`api/main.py`), used
-by `Home.py` for reviews (pending/approve/reject), report list/detail,
-and chat query — Migration Plan Phase 1. Generation still calls
-`run_pipeline_cycle` directly; the trigger endpoint isn't real until
-Phase 3, when a worker and a status table exist behind it — that split
-is intentional, not something this module works around.
+"""Thin HTTP client for the real BFF (`bff/main.py`), used by `Home.py`
+for reviews (pending/approve/reject), report list/detail, and chat
+query. Generation still calls `run_pipeline_cycle` directly; the
+trigger endpoint isn't real until Phase 3, when a worker and a status
+table exist behind it — that split is intentional, not something this
+module works around.
+
+Migration Plan Phase 2 (ADR-017): this now talks to the BFF, not the
+core API directly — Streamlit itself never resolved a "real" identity
+anyway (the old `actorId` it sent was always `default_actor_id`, a
+plain, unauthenticated lookup of the first row in `actors`), so real
+identity resolution moving server-side, into the BFF, changes nothing
+about what Streamlit could actually prove about who was asking. The
+`actor_id` parameters below are kept, unused, purely so `Home.py`'s own
+existing call sites (`render_report_row`, `_ask()`, the `default_actor_
+id` plumbing) don't need to change for this phase — the BFF determines
+the real (today, stubbed) identity itself and forwards it to the core
+API; nothing this module sends is used for that anymore. Real cleanup
+of this now-vestigial parameter is natural, low-risk work for whenever
+Phase 8's real identity work next touches this UI layer, not forced
+here to keep this phase's own diff to Home.py at zero.
 
 Every function here mirrors the exact return shape (snake_case keys,
 real `date`/`datetime` objects where `Home.py`'s existing code already
@@ -11,14 +26,12 @@ calls `.isoformat()`/`.strftime()` on them) and exception-raising
 behavior (`ActorIdRequiredError`, `NotesRequiredError` — the same real
 classes `onepulse_common.human_governance` defines, re-raised here, not
 duplicated) that `Home.py` already depended on when it called
-`onepulse_common` directly. The intent is that only the call sites in
-`Home.py` change — nothing downstream of them (rendering, exception
-handling) needs to, which is what keeps this a real rewiring rather than
-a second, parallel implementation of the same UI logic.
+`onepulse_common` directly.
 
-Run the API service first: `uvicorn api.main:app --port 8000` (from the
-repo root). `ONEPULSE_API_BASE_URL` overrides the default
-`http://127.0.0.1:8000` if it's running elsewhere.
+Run the BFF (and the core API it depends on) first: `uvicorn core_api.
+main:app --port 8000`, then `uvicorn bff.main:app --port 8100` (from
+the repo root — see the Runbook). `ONEPULSE_BFF_BASE_URL` overrides the
+default `http://127.0.0.1:8100` if it's running elsewhere.
 """
 
 from __future__ import annotations
@@ -30,7 +43,7 @@ import httpx
 
 from onepulse_common.human_governance import ActorIdRequiredError, NotesRequiredError
 
-API_BASE_URL = os.environ.get("ONEPULSE_API_BASE_URL", "http://127.0.0.1:8000")
+API_BASE_URL = os.environ.get("ONEPULSE_BFF_BASE_URL", "http://127.0.0.1:8100")
 
 
 def _parse_date(value: str) -> dt.date:
@@ -115,50 +128,50 @@ async def get_report_detail_via_api(report_id: int) -> dict:
 
 
 async def approve_report_via_api(report_id: int, actor_id: str | None) -> dict:
-    """Real POST /api/v1/reviews/{reportId}/approve. Raises the same
-    real `ActorIdRequiredError` `approve_report` itself raises on a
-    missing actor — mapped from the API's `400 {"error":
-    "actor_id_required"}`, not a new, separate error path.
+    """Real POST /api/v1/reviews/{reportId}/approve, via the BFF.
+    `actor_id` is accepted but not sent — see module docstring: the BFF
+    resolves the real (today, stubbed) identity itself now and forwards
+    it to the core API; nothing sent from here is used for that. If the
+    BFF's own stubbed identity doesn't resolve to a real `actors` row,
+    the core API returns `401 {"error": "actor_not_found"}`, surfaced
+    here as `ActorIdRequiredError` so `Home.py`'s existing exception
+    handling (unchanged since Phase 1) still catches it correctly.
     """
     async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
-        resp = await client.post(f"/api/v1/reviews/{report_id}/approve", json={"actorId": actor_id})
-    if resp.status_code == 400 and resp.json().get("error") == "actor_id_required":
-        raise ActorIdRequiredError("actor_id is required")
+        resp = await client.post(f"/api/v1/reviews/{report_id}/approve")
+    if resp.status_code == 401 and resp.json().get("error") == "actor_not_found":
+        raise ActorIdRequiredError("the BFF's identity did not resolve to a real actor")
     resp.raise_for_status()
     return resp.json()
 
 
 async def reject_report_via_api(report_id: int, actor_id: str | None, notes: str) -> dict:
-    """Real POST /api/v1/reviews/{reportId}/reject. Raises the same real
-    `NotesRequiredError`/`ActorIdRequiredError` `reject_report` itself
-    raises — mapped from the API's `400 {"error": "notes_required"}` /
-    `400 {"error": "actor_id_required"}`.
+    """Real POST /api/v1/reviews/{reportId}/reject, via the BFF. See
+    `approve_report_via_api` for why `actor_id` is accepted but not
+    sent.
     """
     async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
-        resp = await client.post(
-            f"/api/v1/reviews/{report_id}/reject", json={"actorId": actor_id, "notes": notes}
-        )
-    if resp.status_code == 400:
-        error = resp.json().get("error")
-        if error == "notes_required":
-            raise NotesRequiredError("notes_required")
-        if error == "actor_id_required":
-            raise ActorIdRequiredError("actor_id is required")
+        resp = await client.post(f"/api/v1/reviews/{report_id}/reject", json={"notes": notes})
+    if resp.status_code == 400 and resp.json().get("error") == "notes_required":
+        raise NotesRequiredError("notes_required")
+    if resp.status_code == 401 and resp.json().get("error") == "actor_not_found":
+        raise ActorIdRequiredError("the BFF's identity did not resolve to a real actor")
     resp.raise_for_status()
     return resp.json()
 
 
 async def ask_question_via_api(question: str, program_id: str | None, actor_id: str | None) -> dict:
-    """Real POST /api/v1/chat/query. Same real citation shape
-    `onepulse_common.chat_assistant.ask_question` already returned
+    """Real POST /api/v1/chat/query, via the BFF. Same real citation
+    shape `onepulse_common.chat_assistant.ask_question` already returned
     (`report_id`, `program_name`, `week_of` as a plain string — the
     original response never turned that one into a `date` object
-    either, so this doesn't start now).
+    either, so this doesn't start now). See `approve_report_via_api` for
+    why `actor_id` is accepted but not sent.
     """
     async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=120.0) as client:
         resp = await client.post(
             "/api/v1/chat/query",
-            json={"actorId": actor_id, "question": question, "programId": program_id},
+            json={"question": question, "programId": program_id},
         )
         resp.raise_for_status()
         data = resp.json()
