@@ -486,22 +486,30 @@ other code change. A caller whose own machine isn't in `bff`'s IP allow-list, or
 granted the `access_as_user` scope, is correctly refused — see the Easy Auth gotcha above for what
 that setup actually requires.
 
-**How to warm it before a demo.** Real, measured cold-start numbers (Migration Plan Phase 7's own
-explicit ask — "you have been assuming the Python-plus-Node image is slow... measure it"), not
-assumed: a real, precisely-timed first request through the full `bff` → `core_api` chain from a
-genuine zero-replica state (both Python-only images, chained — `bff`'s own cold start plus the
-outbound call triggering `core_api`'s) took **55.7 seconds** end to end (`curl -w
-'%{time_total}'`, not a guess). `investigation` (the one Python-**and**-Node image) — measured via a
-fresh-revision creation-to-ready window rather than a second live KEDA-trigger test, given the time
-already spent on this phase — showed its own container process starting **17 seconds** after
-replica creation and confirmed actively polling its real queue within **50 seconds** of it; comparable
-to, not dramatically worse than, the two-Python-services-chained figure, despite carrying the Node
-runtime and `npm ci`'d dependency tree. **If a real demo cannot tolerate a ~1-minute wait on the
-first click:** trigger one real, throwaway request against `bff` a few minutes beforehand (the
-existing Runbook advice from earlier phases — "raise `minReplicas` to 1 temporarily before a demo,
-return it to 0 after," ADR-016 — still applies and is the correct mechanism; scale-to-zero cost
-discipline is what makes leaving it at 1 indefinitely the wrong default, not that warming is
-optional).
+**Warm it before every demo. This is a required step, not a nicety — skipping it means a real
+stakeholder watches a blank screen for the better part of a minute before anything visibly starts.**
+Real, measured cold-start numbers (Migration Plan Phase 7's own explicit ask — "you have been
+assuming the Python-plus-Node image is slow... measure it"), not assumed, and the number is what
+makes this required rather than optional: a real, precisely-timed first request through the full
+`bff` → `core_api` chain from a genuine zero-replica state (both Python-only images, chained —
+`bff`'s own cold start plus the outbound call triggering `core_api`'s) took **55.7 seconds** end to
+end (`curl -w '%{time_total}'`, not a guess) — comfortably long enough that an unwarmed first click
+in front of an audience reads as broken, not slow. **Correct this project's own prior assumption,
+not just repeat it: the Python-**and**-Node `investigation` image is not "the slow one."** Measured
+via a fresh-revision creation-to-ready window rather than a second live KEDA-trigger test, given the
+time already spent on this phase — its own container process started **17 seconds** after replica
+creation and was confirmed actively polling its real queue within **50 seconds** of it: comparable
+to, not dramatically worse than, the two-Python-services-chained figure above, despite carrying the
+Node runtime and its `npm ci`'d dependency tree. This project has repeated "the Node image is the
+slow one" as a standing assumption since Phase 4/5 (see the "real, expected asymmetry" note in §2 —
+that note is about image *size*, ~1.83GB vs ~1.33GB, and remains correct; it does not extend to
+*startup time*, which this measurement does not support treating as worse for the Node image
+specifically). **The required step, every time, before anyone but the developer is watching:**
+trigger one real, throwaway request against `bff` a few minutes beforehand — the existing advice
+from earlier phases, "raise `minReplicas` to 1 temporarily before a demo, return it to 0 after"
+(ADR-016), is the correct mechanism and stays required precisely because scale-to-zero cost
+discipline is what makes leaving `minReplicas` at 1 indefinitely the wrong *default*, not because
+warming itself is discretionary.
 
 **Proving no interactive credential is present, the literal Phase 7 bar:** `az containerapp exec`
 into any of the four apps and run `az account show` — it fails with `Please run 'az login' to setup
