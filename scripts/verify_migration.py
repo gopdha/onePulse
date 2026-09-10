@@ -65,6 +65,28 @@ async def check_table_exists(conn: asyncpg.Connection, table_name: str) -> bool:
     return result is not None
 
 
+async def check_table_exists_in_schema(conn: asyncpg.Connection, schema_name: str, table_name: str) -> bool:
+    """Same real check as check_table_exists, generalized past the
+    hardcoded `public` schema — needed for Phase 4's own `investigation`
+    schema (Migration Plan Phase 4/ADR-020), a separate function rather
+    than changing check_table_exists's signature so every existing call
+    site (and its own regression tests) is unaffected. Uses
+    pg_catalog.pg_class/pg_namespace directly rather than
+    information_schema.tables, for the identical real reason
+    check_schema_exists does — the connecting role may legitimately have
+    zero access to this schema (the exact boundary this phase proves),
+    and existence should be answerable independent of that.
+    """
+    result = await conn.fetchval(
+        "SELECT 1 FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r'",
+        schema_name,
+        table_name,
+    )
+    return result is not None
+
+
 async def check_column_exists(conn: asyncpg.Connection, table_name: str, column_name: str) -> bool:
     result = await conn.fetchval(
         "SELECT 1 FROM information_schema.columns "
@@ -142,6 +164,38 @@ async def check_policy_exists(conn: asyncpg.Connection, table_name: str, policy_
         policy_name,
     )
     return result is not None
+
+
+async def check_schema_exists(conn: asyncpg.Connection, schema_name: str) -> bool:
+    """Real, live-discovered subtlety (Phase 4): information_schema.schemata
+    is itself subject to the connecting role's own USAGE visibility —
+    once app_role_local_dev genuinely has zero access to `investigation`
+    (the real boundary this phase builds), that schema stops appearing
+    in information_schema.schemata for this connection at all, which
+    would make this check wrongly report "missing" rather than "exists,
+    but correctly inaccessible". pg_catalog.pg_namespace is a real
+    system catalog every role can read regardless of schema-level grants
+    (it has to be — the ACL info itself lives there), so it answers the
+    real existence question independent of the very permission boundary
+    this migration exists to prove.
+    """
+    result = await conn.fetchval(
+        "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1", schema_name
+    )
+    return result is not None
+
+
+async def check_no_schema_privilege(conn: asyncpg.Connection, schema_name: str, role_name: str) -> bool:
+    """True iff role_name has NO USAGE privilege on schema_name — the
+    real, structural proof one service's role cannot even see into the
+    other's schema (Migration Plan Phase 4/ADR-020). Uses has_schema_privilege
+    directly rather than information_schema, since a schema with zero
+    grants at all produces no rows in the grant-listing views to query
+    (there's no "explicit absence" row) — has_schema_privilege answers
+    the real yes/no question directly against Postgres's own ACL check.
+    """
+    result = await conn.fetchval("SELECT has_schema_privilege($1, $2, 'USAGE')", role_name, schema_name)
+    return result is False
 
 
 async def check_privilege_revoked(
@@ -233,6 +287,20 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
     )
     results.append(("column exists: cycles.trace_context", await check_column_exists(conn, "cycles", "trace_context")))
     results.append(("column exists: cycles.stages", await check_column_exists(conn, "cycles", "stages")))
+
+    results.append(("schema exists: investigation (0004)", await check_schema_exists(conn, "investigation")))
+    results.append(
+        ("table exists: investigation.investigation_runs",
+         await check_table_exists_in_schema(conn, "investigation", "investigation_runs"))
+    )
+    results.append(
+        ("Reporting role (app_role_local_dev) has NO access to investigation schema",
+         await check_no_schema_privilege(conn, "investigation", "app_role_local_dev"))
+    )
+    results.append(
+        ("Investigation role (investigation_role_local_dev) has NO access to public schema",
+         await check_no_schema_privilege(conn, "public", "investigation_role_local_dev"))
+    )
 
     return results
 

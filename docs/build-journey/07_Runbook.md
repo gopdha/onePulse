@@ -33,41 +33,62 @@ the pipeline. See §6 for the failure signature when it has lapsed.
 
 ### Via the UI (recommended for demos)
 
-**As of Migration Plan Phase 3, four processes must be running together** — `streamlit run
-Home.py` alone now produces failed requests, and clicking "Generate Status Report" with the worker
-not running will queue a real cycle that simply never progresses past `queued` (no error — nothing
-is watching the table yet). Reviews (pending/approve/reject), the report list/detail, chat, and now
-generation itself all go through the BFF, which forwards each request to the core API; Streamlit no
-longer talks to the core API (or Postgres/Search) directly for any of it, and no longer calls
-`run_pipeline_cycle` at all:
+**As of Migration Plan Phase 4, FIVE processes must be running together** — Investigation is now
+its own service, coordinated with Reporting through two real Azure Storage Queues rather than an
+in-process function call. `worker/` was renamed `reporting/` (it's still the same claim-a-cycle,
+run-stages-2-7 process Phase 3 built); a new `investigation/main.py` service owns stage 1 entirely.
+Reviews, the report list/detail, and chat still go through the BFF → core API, unchanged from Phase
+2/3; the BFF/core API themselves never talk to Investigation directly — only Reporting does.
 
 ```powershell
-uvicorn core_api.main:app --port 8000   # terminal 1, from the repo root — start this first
-uvicorn bff.main:app --port 8100        # terminal 2 — depends on core_api already running
-python -m worker.main                   # terminal 3 — polls the real cycles table; order vs. bff doesn't matter
-streamlit run Home.py                   # terminal 4
+uvicorn core_api.main:app --port 8000        # terminal 1, from the repo root — start this first
+uvicorn bff.main:app --port 8100             # terminal 2 — depends on core_api already running
+uvicorn investigation.main:app --port 8200   # terminal 3 — the Investigation service; start before reporting
+python -m reporting.main                     # terminal 4 — polls cycles AND dispatches to Investigation over the queue
+streamlit run Home.py                        # terminal 5
 ```
+
+Order matters more than in Phase 3: Reporting's first real action on claiming a cycle is sending an
+`investigation-requests` message, so Investigation should already be listening before Reporting
+claims real work (a message sent to a not-yet-running consumer just waits in the queue — nothing
+breaks, but it's a needless delay while you're paying attention to it live).
 
 Select a project from the dropdown (nothing loads until you do), then click Generate Status Report.
 
-**Generation is real now (Migration Plan Phase 3, ADR-021), and the two-path split Phase 1
-deliberately left open is closed.** Clicking "Generate Status Report" calls the real LLD-specified
-trigger endpoint (`POST /api/v1/programs/{programId}/reports`, a real `202` with a cycle handle) —
-execution happens in `worker/main.py`, a separate local process that polls the real `cycles` status
-table for queued work (`FOR UPDATE SKIP LOCKED`), executes the pipeline, and writes progress into
-that same table *during* execution, not only at stage boundaries — reusing the exact
-on_stage/on_detail heartbeat hook Task 39 already proved keeps every real gap under ~10s. The UI
-polls `GET /api/v1/cycles/{cycleId}` roughly every three seconds (ADR-021) and renders whatever the
-worker has already written. **The headline property this buys**: closing the browser tab entirely,
-mid-run, does not touch the worker — the run completes and persists (or reaches whichever of the
-four real terminal outcomes applies) regardless, because nothing in the browser or in Streamlit's
-own process ever owned the work. No queue exists yet (that's Phase 4/ADR-019) — if the worker
-process itself is killed mid-run, the run is lost; there is no redelivery yet. See CLAUDE.md Task 42
-for the real, live-measured proof of both of these, in both directions.
+**What actually happens now, Phase 4 (ADR-019/020):** Reporting claims a queued cycle exactly as in
+Phase 3 (`FOR UPDATE SKIP LOCKED`, unchanged), but instead of calling `investigate()` in-process, it
+sends a real `investigation-requests` message (`cycle_id`, `program_name`, `requested_by_actor_id`,
+a fresh injected W3C `traceparent`) and polls `findings-ready` for the matching `cycle_id`. The
+Investigation service — the only process with a Node runtime and ADO PAT access — picks the message
+up, runs the real investigation, upserts its results into its own `investigation.investigation_runs`
+row (keyed on `cycle_id`, so a redelivery overwrites rather than accumulates), and sends a thin
+`findings-ready` notification back. Reporting then fetches the real findings over a plain HTTP
+`GET /internal/investigations/{cycleId}` call to the Investigation service — **never** by querying
+the `investigation` schema directly; there is no grant that would even let it (see §6). Progress
+writes to `cycles.stages` continue exactly as in Phase 3, including a heartbeat while Reporting
+waits on the queue round trip, so the UI never sits silent for more than ~10s even though the
+granular per-tool-call detail that used to stream live now lives only in Investigation's own log
+(`INVESTIGATION_BASE_URL`, `ONEPULSE_INVESTIGATION_PG_ROLE` — see `.env.example`).
 
-The full-fidelity log file (`logs/<project>_<timestamp>.log`) is written by the worker now, not
-Streamlit — same real content as before (every tool call, the full draft/revision text, every
-PASS/FAIL check), just relocated a second time.
+**The headline property Phase 4 adds, proven live (CLAUDE.md Task 43): a hard-killed Investigation
+process is now recoverable, not just a hard-killed worker.** Phase 3's own baseline (Task 42): a
+worker killed mid-run leaves its cycle stuck at `running` forever, invisible even to a freshly
+started worker, since nothing was watching for it. Real, repeated Phase 4 test: kill the
+Investigation process tree mid-run (its `investigation-requests` message is already invisible,
+leased for `VISIBILITY_TIMEOUT_SECONDS=90`) — the message stays invisible for the remainder of that
+lease (confirmed via a direct queue peek showing zero visible messages, though
+`approximate_message_count` still counts it), then becomes visible again once the lease expires
+with no renewal (a dead consumer, by definition, can't renew), gets picked up by a **freshly
+started** Investigation process, and the run completes end to end. Closing the browser tab (Phase 3's
+own guarantee) and killing Investigation (Phase 4's new one) are now both survivable; only killing
+Reporting itself still loses the in-flight run (Reporting's own claim has no queue redelivery behind
+it — same as Phase 3, deliberately unchanged, since Reporting's own dispatch-to-Investigation step is
+idempotent and safe to just re-trigger).
+
+The full-fidelity log file (`logs/<project>_<timestamp>.log`) is still written by Reporting, same
+real content as before for stages 2-7; Investigation's own per-tool-call detail is not in that file
+— it's in Investigation's own process output (or, when actually needed for live incident diagnosis,
+`ONEPULSE_DEBUG_SPAN_LOG` on both services shows the real span chain, see §4).
 
 **Why two services instead of one, as of Phase 2 (ADR-017/ADR-018):** the BFF owns session,
 identity resolution, and response shaping for the frontend — it holds no database connection, no
@@ -127,6 +148,18 @@ FROM reports r JOIN programs p ON p.program_id = r.program_id
 ORDER BY r.created_at DESC LIMIT 15;
 ```
 
+### The `investigation` schema (Migration Plan Phase 4, ADR-020)
+`investigation.investigation_runs` is a **separate schema with a separate role**
+(`investigation_role_local_dev` locally) — the same Entra login above connects to it fine as the
+admin, but `app_role`/`app_role_local_dev` (what Reporting/core API/BFF connect as) genuinely cannot
+query it at all: `SELECT * FROM investigation.investigation_runs` from that role fails with
+`InsufficientPrivilegeError: permission denied for schema investigation`, by real Postgres GRANT, not
+by convention. Reporting never queries this schema; it fetches Investigation's results over HTTP
+instead (see §2). To apply a migration against this schema, use `scripts/migrate_investigation.py`,
+not `scripts/migrate.py` — connecting as the Investigation role itself so it owns its own schema from
+first `CREATE SCHEMA`, avoiding the ownership-transfer trap `0001_initial_schema.sql`'s own header
+comment documents in detail.
+
 ---
 
 ## 4. Verifying Observability
@@ -143,6 +176,21 @@ One `operation_Id` grouping all spans from a single run confirms correct trace p
 
 ### Arize
 Traces tab → click into a specific trace → confirm real `AGENT`/`LLM`/`TOOL` span kinds and real nested hierarchy. Note: the outer Traces list can occasionally show a misleading name/status on the root row even when the detail view underneath is fully correct — always click in before concluding something is wrong.
+
+### Proving a trace crossed a process boundary directly, without an Arize Developer Access key
+Set `ONEPULSE_DEBUG_SPAN_LOG=<path to a .jsonl file>` before starting any service (`core_api`,
+`bff`, `reporting`, `investigation` all wire it in their own `main()`/lifespan) — it adds a real,
+additional `SimpleSpanProcessor` to the process's already-configured `TracerProvider`, appending one
+JSON line per span at real `on_end()` time (`{service, name, trace_id, span_id, parent_span_id,
+start_time, end_time}`) — the exact same span objects every other configured exporter (Application
+Insights, Arize) also receives. Point two or more services at the **same** file to interleave their
+real spans and directly confirm a parent-child chain across an HTTP or queue hop by eye: grep for
+each service's named root span (e.g. `"reporting run_cycle"`, `"investigation POST
+investigation-requests"`) and check that one's `span_id` equals the other's `parent_span_id`, under
+an identical `trace_id`. No-op with zero overhead when the env var isn't set. This is how the
+Reporting→Investigation queue-hop trace was proven for real in Migration Plan Phase 4 (CLAUDE.md
+Task 43) — a named span only appears in the file once it *ends*, so a long-running root span (the
+whole cycle) won't show up until the whole run finishes.
 
 ---
 
@@ -168,6 +216,45 @@ Empty output means it's genuinely never been committed.
 
 ## 6. Common Real Gotchas
 
+- **A Postgres Flexible Server client-IP allowlist rule drifts silently — a real network reconnect
+  mid-session (a new public IP) causes every NEW connection to hang and time out
+  (`OSError: [WinError 121] The semaphore timeout period has expired`) while already-open pool
+  connections keep working fine, and every OTHER Azure endpoint (Foundry, Entra login, Storage
+  Queues) stays reachable.** This reads exactly like a code bug in whichever service is starting
+  fresh, not a firewall problem, because the symptom is service-specific and asymmetric. Isolate it
+  by testing raw TCP connectivity directly (`socket.create_connection((host, 5432), timeout=10)`) —
+  if that alone times out while HTTPS to other Azure hosts is instant, check
+  `az postgres flexible-server firewall-rule list --resource-group onepulse-gr --server-name
+  onepulse-pg-dev -o table` against your current IP (`curl https://api.ipify.org`) before chasing
+  anything in the code. Fix: `az postgres flexible-server firewall-rule create --resource-group
+  onepulse-gr --server-name onepulse-pg-dev --name <rule-name> --start-ip-address <ip>
+  --end-ip-address <ip>` (note: `--name` is the *rule* name; `--server-name` is separate — an easy
+  swap to get backwards, since the CLI's own error for the wrong combination is unhelpful). Hit live
+  during Migration Plan Phase 4 verification.
+- **Stale processes from an earlier session (or an earlier terminal in the same one) silently race
+  freshly-started ones for the exact same real work — `FOR UPDATE SKIP LOCKED` and queue consumption
+  both correctness-guarantee against duplicate PROCESSING, not against a confusing race for WHICH
+  process wins.** A pre-rename `worker.main` process left running from before `worker/` became
+  `reporting/` claimed a real cycle before the newly-started `reporting.main` could, using its own
+  stale in-process code (which itself resolved a `node_modules` path that no longer existed after
+  the Investigation-service move) — producing an error that looked like a real code bug in the new
+  service, not what it actually was. Before trusting any test result, confirm which processes are
+  really running and on which ports/PIDs: `Get-CimInstance Win32_Process -Filter "Name='python.exe'"
+  | Select-Object ProcessId, CommandLine`. Note this also legitimately shows TWO processes per
+  `uvicorn`/`python -m` launch on Windows — a thin `.venv\Scripts\python.exe` redirector plus the
+  real interpreter underneath it (not a bug, not a duplicate service; only the latter binds ports or
+  does real work) — don't mistake that pairing itself for the stale-process problem.
+- **`az boards work-item update --fields "System.Tags=X"` only ever ADDS to the existing tags — it
+  cannot remove one, regardless of what value you pass** (confirmed live: setting `Tags=` to empty,
+  or to the desired final value alone, left the old tags untouched; only a genuinely new tag value
+  gets unioned in). There is no working mechanism in this environment to fully replace/remove a tag
+  via script: `az rest`/`az devops invoke` against `dev.azure.com` both fail for this org specifically
+  — the same real MSA/AAD tenant-duality issue already documented in §1/Governance & Security
+  Reference §4 (a generic AAD token gets a sign-in-page redirect, not an API response, the identical
+  failure shape the PAT gotcha above describes for an expired token) — and the project's own
+  `ONEPULSE_ADO_PAT` is deliberately read-only (`401` on any write). Don't attempt to mutate real ADO
+  tags via script for a one-off test without first confirming a working write path exists; a
+  temporary, unremovable extra tag is real, permanent debris on shared data, not a clean rollback.
 - **If you hit any ADO failure, check whether the PAT has expired before assuming something new
   broke.** The token has a 7-day expiry and is not auto-renewed. An expired ADO PAT usually does
   *not* return a clean `401` — Azure DevOps commonly returns `203 Non-Authoritative Information`

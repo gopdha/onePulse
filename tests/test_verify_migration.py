@@ -22,10 +22,13 @@ from verify_migration import (
     check_column_exists,
     check_constraint_exists,
     check_generated_column,
+    check_no_schema_privilege,
     check_policy_exists,
     check_privilege_revoked,
     check_rls_enabled,
+    check_schema_exists,
     check_table_exists,
+    check_table_exists_in_schema,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -144,3 +147,37 @@ async def test_forced_failure_cycles_status_check_rejects_a_value_never_in_the_c
         await check_check_constraint_values(conn, "cycles", "status", ["purple_haze"])
         is False
     )
+
+
+async def test_real_investigation_schema_is_detected(conn) -> None:
+    # Migration Plan Phase 4 — proves this reads pg_catalog.pg_namespace
+    # for real, not information_schema.schemata (which the connecting
+    # role's own real, structural lack of access to `investigation`
+    # would otherwise make wrongly report "missing" — see
+    # check_schema_exists's own docstring).
+    assert await check_schema_exists(conn, "investigation") is True
+
+
+async def test_forced_failure_missing_schema_is_detected(conn) -> None:
+    assert await check_schema_exists(conn, "this_schema_does_not_exist_1a2b3c") is False
+
+
+async def test_real_investigation_runs_table_is_detected_in_its_own_schema(conn) -> None:
+    assert await check_table_exists_in_schema(conn, "investigation", "investigation_runs") is True
+
+
+async def test_forced_failure_table_in_wrong_schema_is_not_detected(conn) -> None:
+    # investigation_runs genuinely does not live in `public` — proves
+    # this check is schema-scoped, not just table-name matching.
+    assert await check_table_exists_in_schema(conn, "public", "investigation_runs") is False
+
+
+async def test_real_reporting_role_has_no_investigation_schema_privilege(conn) -> None:
+    assert await check_no_schema_privilege(conn, "investigation", "app_role_local_dev") is True
+
+
+async def test_forced_failure_schema_privilege_check_detects_a_real_grant(conn) -> None:
+    # app_role_local_dev genuinely does have USAGE on `public` (its own
+    # real schema) — proves this check can detect a real grant, not just
+    # report True unconditionally.
+    assert await check_no_schema_privilege(conn, "public", "app_role_local_dev") is False

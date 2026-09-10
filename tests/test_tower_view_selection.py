@@ -36,7 +36,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from onepulse_common.pipeline import _query_tower_hierarchy
+from investigation.investigate import _query_tower_hierarchy
 from onepulse_common.tower_rollup import build_tower_rollups
 
 pytestmark = pytest.mark.asyncio
