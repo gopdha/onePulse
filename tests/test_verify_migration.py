@@ -23,6 +23,7 @@ from verify_migration import (
     check_column_exists_in_schema,
     check_constraint_exists,
     check_constraint_exists_in_schema,
+    check_force_rls_enabled,
     check_generated_column,
     check_has_table_privileges,
     check_no_schema_privilege,
@@ -94,6 +95,20 @@ async def test_forced_failure_rls_not_enabled_on_unprotected_table_detected(conn
 
 async def test_forced_failure_missing_policy_detected(conn) -> None:
     assert await check_policy_exists(conn, "reports", "this_policy_does_not_exist") is False
+
+
+async def test_real_force_rls_is_enabled_on_reports(conn) -> None:
+    # ADR-023 follow-up: FORCE was enabled specifically because app_role
+    # now owns `reports` and would otherwise be exempt from its own
+    # tenant_isolation policy — the same owner-exemption bug one level
+    # up. Real, current state, not assumed from the migration file alone.
+    assert await check_force_rls_enabled(conn, "reports") is True
+
+
+async def test_forced_failure_force_rls_not_enabled_on_unprotected_table_detected(conn) -> None:
+    # tenants has no RLS/FORCE at all — proves this isn't hardcoded to
+    # always return True for any table name.
+    assert await check_force_rls_enabled(conn, "tenants") is False
 
 
 async def test_forced_failure_revoke_check_detects_a_real_grant(conn) -> None:

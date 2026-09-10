@@ -1,0 +1,27 @@
+-- Real, direct consequence of ADR-023's own ownership fix, not a
+-- separate issue: transferring `reports`' ownership to `app_role`
+-- (Task 44 follow-up) put the real production/deployed role in the
+-- exact position `app_role_local_dev` used to occupy — the table's
+-- OWNER, and therefore exempt from its own `tenant_isolation` RLS
+-- policy by Postgres's default. Left unfixed, the ownership fix would
+-- have reinstalled the identical bug one level up: the role RLS exists
+-- to constrain would itself be exempt from it, on the very table where
+-- owner exemption was just discovered and named as the root cause of
+-- RLS having never been evaluated.
+--
+-- IMPORTANT, stated precisely so it is never read as more than it is:
+-- this statement makes RLS un-bypassable by ownership once it
+-- enforces something. It does NOT make RLS enforce anything today.
+-- `tenant_isolation`'s own policy body (0005) remains permissive
+-- whenever `app.current_tenant_id` is unset — and nothing anywhere in
+-- this codebase sets it yet. Real per-request tenant resolution is
+-- deliberately deferred to Phase 8's `get_current_actor()` work (see
+-- 12_Migration_Plan.md's Phase 8 Definition of Done) — validating a
+-- tenant-setter against this project's single real tenant row today
+-- would be code whose correctness cannot be verified, the same
+-- pattern this whole finding is about, just smaller.
+--
+-- Idempotent: FORCE ROW LEVEL SECURITY is a plain boolean table
+-- property, safe to set unconditionally on every run.
+
+ALTER TABLE public.reports FORCE ROW LEVEL SECURITY;

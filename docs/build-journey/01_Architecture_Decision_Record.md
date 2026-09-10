@@ -611,6 +611,22 @@ from how ownership transfer "should" behave — all fixed in the same pass**:
   referenced primary-key column of each of the five real tables this schema's FKs reference (`tenants`,
   `portfolios`, `programs`, `actors`, `findings`) — confirmed sufficient by direct test, avoiding a
   blanket table-level `UPDATE` that would let these roles modify columns no FK check ever touches.
+- **A fourth consequence of this same ownership transfer, not a separate issue: `app_role` — now the
+  real owner of `reports` — would itself have been exempt from `tenant_isolation`, the identical bug
+  one level up, on the very table where owner exemption was just discovered as the root cause of RLS
+  having never been evaluated.** `FORCE ROW LEVEL SECURITY` was never set on `reports`
+  (`relforcerowsecurity = false`), so ownership exemption applied unconditionally to whichever role
+  owned the table — first `app_role_local_dev`, now `app_role`, with nothing about the transfer itself
+  changing that. Fixed (`0006_force_row_level_security_on_reports.sql`): `ALTER TABLE reports FORCE ROW
+  LEVEL SECURITY`, confirmed live via direct query (`relforcerowsecurity = true`). **Stated precisely,
+  so it is not read as more than it is: this makes RLS un-bypassable by ownership once it enforces
+  something. It does not make RLS enforce anything today.** `tenant_isolation`'s own policy body
+  (0005) is still permissive whenever `app.current_tenant_id` is unset, and nothing in this codebase
+  sets it yet — real per-request tenant resolution is deliberately deferred to Phase 8's own
+  `get_current_actor()` work (see `12_Migration_Plan.md`'s Phase 8 Definition of Done), not wired in
+  now. Validating a tenant-setter against this project's one real tenant row today would be code whose
+  correctness cannot be verified — the same pattern this whole finding is about, just a smaller
+  instance of it — so it was deliberately not built as part of this fix.
 - **`migrate.py --target dev` cannot be run interactively under its own new default.** Confirmed live:
   `InvalidAuthorizationSpecificationError: Service principals cannot generate AAD_AUTH_TOKENTYPE_APP_USER
   tokens for role "app_role"` — a real Azure AD token-type restriction, not a bug, and exactly the

@@ -231,6 +231,27 @@ async def check_rls_enabled(conn: asyncpg.Connection, table_name: str) -> bool:
     return result is True
 
 
+async def check_force_rls_enabled(conn: asyncpg.Connection, table_name: str) -> bool:
+    """True iff FORCE ROW LEVEL SECURITY is set — distinct from, and
+    checked separately from, check_rls_enabled. Real, load-bearing
+    reason (ADR-023 follow-up, 2026-09-10): `reports` had
+    relrowsecurity=True the entire time RLS was never actually
+    evaluated (Task 44's own finding) — RLS being "enabled" proves
+    nothing about whether the table's current OWNER is exempt from it,
+    which is exactly what FORCE controls. `app_role` now owns `reports`
+    (ADR-023's own ownership transfer); without FORCE, the real
+    production role would be exempt from the very policy meant to
+    constrain it — the identical bug one level up. This check exists so
+    that fact is asserted directly, not re-derived by reading
+    pg_class by hand the next time someone needs to know.
+    """
+    result = await conn.fetchval(
+        "SELECT relforcerowsecurity FROM pg_class WHERE relname = $1 AND relnamespace = 'public'::regnamespace",
+        table_name,
+    )
+    return result is True
+
+
 async def check_policy_exists(conn: asyncpg.Connection, table_name: str, policy_name: str) -> bool:
     result = await conn.fetchval(
         "SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = $1 AND policyname = $2",
@@ -426,6 +447,10 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
 
     results.append(("RLS enabled: reports", await check_rls_enabled(conn, "reports")))
     results.append(("RLS policy exists: reports.tenant_isolation", await check_policy_exists(conn, "reports", "tenant_isolation")))
+    results.append(
+        ("FORCE ROW LEVEL SECURITY: reports (app_role, its owner, is not exempt from tenant_isolation)",
+         await check_force_rls_enabled(conn, "reports"))
+    )
 
     for role in ("app_role", "app_role_local_dev"):
         results.append(

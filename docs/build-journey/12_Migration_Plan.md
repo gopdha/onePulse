@@ -180,10 +180,34 @@ unerasable.
 - If triggering is ever opened to visitors, FR-11's rate limit (2/day) and NFR-6's usage-ledger check
   must exist first. Neither is built.
 
+> **RLS enforcement is a stated dependency of this phase, not something to rediscover here** (see
+> ADR-023, Trade-off #9, Governance & Security Reference §3). The policy exists, is syntactically
+> correct, and — as of the pre-Phase-6 ownership fix — can no longer be bypassed by table ownership
+> (`FORCE ROW LEVEL SECURITY`). It enforces nothing today, because nothing sets
+> `app.current_tenant_id` on any real request. This phase is where that input first exists (a real,
+> verified identity), so this phase is where the setter belongs:
+> - `get_current_actor()`'s own resolution should also resolve the caller's real tenant —
+>   `actor_scope` → (`portfolio_id`/`program_id`) → `portfolios.tenant_id`, the identical join
+>   `tenant_isolation`'s own policy subquery already performs.
+> - `SET LOCAL app.current_tenant_id = <resolved tenant>` inside the transaction, in both `core_api`
+>   and `reporting` — the only two of the four services that ever touch `reports` (`bff` has no data
+>   store access by design; `investigation` has no access to the `public` schema by design).
+> - Scoped, not open-ended: three call sites already wrap in an explicit transaction and just need
+>   the `SET LOCAL` added (`approve_report`, `reject_report`, `persist_report`); three more are
+>   currently bare reads and need an explicit transaction wrap added first (`get_report_detail`,
+>   `list_pending_reviews`, `list_recent_reports`).
+> - **Enforcement must be proven against a second real tenant row, not the one that exists today.**
+>   A pass with a single tenant proves nothing — it cannot distinguish "isolation works" from "there
+>   was never anything to isolate from." This is exactly the class of finding this whole correction
+>   is about; do not let Phase 8 repeat it by testing a guarantee that still only has one case to run
+>   against.
+
 **Definition of Done**: an attempt to approve while supplying a different `actor_id` than the
 authenticated identity is rejected — shown as a real request and a real error. A visitor-role account
-cannot trigger a run, and cannot retrieve a SAS for a report outside its scope. **Opening ingress to
-the public is part of this phase's DoD, not an earlier one.**
+cannot trigger a run, and cannot retrieve a SAS for a report outside its scope. `reports`' RLS policy
+is proven to actually filter — a second real tenant's reports genuinely invisible to a caller scoped
+to the first, shown by a real query under each context, not inferred from the policy text. **Opening
+ingress to the public is part of this phase's DoD, not an earlier one.**
 
 ---
 
