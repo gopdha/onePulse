@@ -24,7 +24,7 @@ real evidence, not assertion. Governed by ADR-015 through ADR-022.
 | Close out the in-flight Claude Code work: `week_of` uniqueness check, tag-stripping hardening, MCP version pin, completion logging, spotlighting audit | Do not migrate on top of a possible data-integrity regression or an unpinned dependency that already caused one outage. |
 | Confirm a clean end-to-end run on AOP at the reduced scope | The regression baseline everything after is measured against. **`singleSlide` and `Leave Tracker` are retired as test targets** — they never had proper test data. AOP is now tagged down to 1 Committed Feature with 11 children for a fast cycle; the 6-feature / 115-item scope is restored by re-tagging in ADO. |
 | Add unit coverage for ADR-012's report-format selection | Retiring `singleSlide` removes the only exercise of the flat-findings fallback path — and of the `WorkItemType == "Epic"` check added after a stray legacy parent link triggered the wrong format. Unit tests over the selection logic replace that regression guard more cheaply than keeping a project alive. |
-| Seed a second `programs` row before Phase 8 | With one program, a scope filter that silently does nothing is indistinguishable from one that works. A second program with a couple of seeded reports is enough to make a leak visible, and is what makes Phase 8's Definition of Done meaningful. No second ADO project is needed. |
+| Seed a genuine second tenant before Phase 8 — not just a second `programs` row | With one program, a scope filter that silently does nothing is indistinguishable from one that works, and with one tenant, RLS proves nothing either way. Phase 8's own strengthened Definition of Done requires real second-tenant data to prove `tenant_isolation` actually filters — a bare second `tenants` row with nothing under it isn't enough to exercise that. Seed a real second `tenants` row, its own `portfolios` row, at least one `programs` row under that portfolio with a couple of seeded reports, and a real `actors`/`actor_scope` row scoped to it — the same shape Phase 8's RLS proof needs, prepared here so it isn't discovered short when Phase 8 starts. No second ADO project is needed. |
 | Resolve the test-fixture pollution in `reports` | 425 of 445 rows are fixtures from `test_human_governance.py`, still accumulating. `list_recent_reports` returns fixtures ahead of real output, and `ingest_reports_to_search.py` has no filter, so a reindex would push fixtures into the RAG corpus. Phase 1 builds the query layer that carries this forward; Phase 4 would pollute the core schema specifically. |
 | Append ADR-015 through ADR-022; amend ADR-010; update Trade-offs Log entries 5, 6, 12 | Record the decisions before building against them. |
 | Commit `docs/build-journey/` to the repository, or add a Task-number mapping table | The 13-document set is not in version control, and `CLAUDE.md` carries a parallel record under different numbering. ADR references currently do not resolve on the machine doing the work. |
@@ -215,7 +215,22 @@ unerasable.
   external sharing — a real run takes ~6 minutes with a long quiet stretch, while the Tower View,
   approval flow, and cited chat answers are all instant.
 - If triggering is ever opened to visitors, FR-11's rate limit (2/day) and NFR-6's usage-ledger check
-  must exist first. Neither is built.
+  must exist first. Neither is built. **Now buildable without a separate retrofit — Phase 4
+  (ADR-019) already threads `requested_by_actor_id` through `claim_next_queued_cycle`'s own
+  `RETURNING` clause and the `investigation-requests` queue envelope, specifically so this exact
+  requirement wouldn't need one later. FR-11's own limit is per Portfolio Lead — enforcing it means
+  counting real trigger requests against that field, grouped by actor and day, not inventing a new
+  identity channel.**
+- **What happens when someone authenticates successfully but has no `actors` row.** Not an edge
+  case — this is the *common* path for anyone the URL is shared with before they're provisioned, the
+  first thing a new reader of this URL will actually hit. `get_current_actor()` must return a real,
+  clean "no access" response for this case (a real `403`, not a stack trace, not a silent fallback to
+  some default scope) — the same discipline this project already applies to every other identity
+  failure mode (`ActorNotFoundError`, Phase 2).
+- **How people actually get provisioned.** A stated answer is required here, not an unexamined gap —
+  it doesn't need to be self-service. Inserting an `actors` row by hand, mapping a real
+  `entra_object_id` to a role and an `actor_scope` entry, is an acceptable answer for Now-scope, as
+  long as it's written down as the answer rather than left implicit in "someone will figure it out."
 
 > **RLS enforcement is a stated dependency of this phase, not something to rediscover here** (see
 > ADR-023, Trade-off #9, Governance & Security Reference §3). The policy exists, is syntactically
@@ -233,17 +248,29 @@ unerasable.
 >   the `SET LOCAL` added (`approve_report`, `reject_report`, `persist_report`); three more are
 >   currently bare reads and need an explicit transaction wrap added first (`get_report_detail`,
 >   `list_pending_reviews`, `list_recent_reports`).
-> - **Enforcement must be proven against a second real tenant row, not the one that exists today.**
->   A pass with a single tenant proves nothing — it cannot distinguish "isolation works" from "there
->   was never anything to isolate from." This is exactly the class of finding this whole correction
->   is about; do not let Phase 8 repeat it by testing a guarantee that still only has one case to run
->   against.
+> - **Enforcement must be proven against a second real tenant, with genuine multi-tenant data behind
+>   it — not one convenient extra row.** A pass with a single tenant proves nothing — it cannot
+>   distinguish "isolation works" from "there was never anything to isolate from." With multi-user now
+>   a stated requirement, the bar is correspondingly stronger than "one more row that happens to
+>   work": `portfolios`, `programs`, and `actor_scope` need to hold real second-tenant data — a real
+>   second portfolio and at least one real program under it, a real actor scoped to it — not a bare
+>   second `tenants` row with nothing genuinely hanging off it. This is exactly the class of finding
+>   this whole correction is about; do not let Phase 8 repeat it by testing a guarantee against data
+>   too thin to actually exercise it.
 
 **Definition of Done**: an attempt to approve while supplying a different `actor_id` than the
 authenticated identity is rejected — shown as a real request and a real error. A visitor-role account
-cannot trigger a run, and cannot retrieve a SAS for a report outside its scope. `reports`' RLS policy
-is proven to actually filter — a second real tenant's reports genuinely invisible to a caller scoped
-to the first, shown by a real query under each context, not inferred from the policy text. **Opening
+cannot trigger a run, and cannot retrieve a SAS for a report outside its scope. **A real authenticated
+request from an identity with no matching `actors` row is shown returning a clean, real "no access"
+response, not a crash or a silent default scope — the common case, proven, not assumed.** **The
+provisioning path is written down and exercised at least once for real** (a real `entra_object_id`
+inserted and mapped to a role/`actor_scope`, then that identity's own first authenticated request
+shown succeeding). `reports`' RLS policy is proven to actually filter against real, populated
+second-tenant data — a second real tenant's real portfolios/programs/reports genuinely invisible to a
+caller scoped to the first, shown by a real query under each context, not inferred from the policy
+text and not proven against a bare extra row. **A real trigger correctly refused after FR-11's 2/day
+limit for the same actor is reached, shown as a real request and a real error — using the
+`requested_by_actor_id` already carried end to end since Phase 4, not a new mechanism.** **Opening
 ingress to the public is part of this phase's DoD, not an earlier one.**
 
 ---

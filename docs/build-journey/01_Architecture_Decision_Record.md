@@ -226,10 +226,30 @@ Claude.
 
 **Context**: ADR-010 chose a local-first Streamlit application over the Physical Architecture's
 Azure Static Web Apps design, explicitly because Streamlit's pure-Python model let the UI reuse
-`onepulse_common`'s proven functions directly, with no REST API layer required. That reasoning held
-while the system was single-user and local. Three things changed it: the intent to deploy so the
-system can be reached from anywhere, the intent to share a URL with external people, and the
-accumulated cost of running a multi-minute pipeline inside a rerun-based framework.
+`onepulse_common`'s proven functions directly, with no REST API layer required. That reasoning was
+correct for what the system actually was at the time — a single-user local tool with no requirement
+to authenticate anyone. **The requirement has since been stated as a multi-user production system:
+real, distinct users, each authenticated, each authorized to see only their own scope of programs
+and reports.**
+
+That is the change that actually reverses ADR-010, and it is structural, not a framework preference.
+Streamlit has no request-level identity model. It runs as one long-lived Python process per browser
+session, driven by a rerun loop triggered by widget interaction — there is no middleware layer and no
+per-request object for a caller's identity to attach to. There is nowhere for a function like
+`get_current_actor()` to live, because there is no request to resolve it against, only a session
+implicitly owned by whoever happens to be connected to that process. A single-user local tool never
+had to answer "who is asking, right now, on this specific call," because the answer was always the
+one person running it. A multi-user system must answer that question on every request, and
+Streamlit's architecture has no place to put the answer.
+
+Everything else that argues for leaving Streamlit — the intent to deploy so the system is reachable
+outside a local machine, the intent to share a URL rather than a `git clone`, and the accumulated
+cost of running a multi-minute pipeline inside a rerun-based framework — is real, but secondary to
+that, and each is independently survivable on its own: a deployed single-user Streamlit instance is
+possible, and the rerun-model's own cost was already worked around once without leaving Streamlit
+(ADR-009 and Tasks 32/42's threading and worker extraction). The identity gap is not survivable the
+same way — there is no bolt-on fix inside Streamlit's own model, because that model has no slot to
+bolt one onto. Closing it means moving to a framework whose request lifecycle has that slot built in.
 
 **Decision**: Replace the Streamlit UI with a React single-page application talking to a FastAPI
 backend. Plain React built with Vite, not Next.js.
@@ -238,18 +258,28 @@ backend. Plain React built with Vite, not Next.js.
 pipeline is Python, Managed Identity has no browser equivalent, browsers cannot speak Postgres, and
 scope resolution must happen server-side or the guarantee is fake (LLD §10.2 already specifies that
 the asker's authorized scope is resolved server-side and never client-supplied). A server-side API
-layer is therefore mandatory, not optional. FastAPI specifically because the codebase is async
-throughout — `mcp.ClientSession`, Agent Framework calls, anyio task groups — and a sync framework
-would reintroduce the class of complexity ADR-009 already documents the cost of. Next.js was
-rejected because its principal features (server components, API routes, SSR) exist to let the
-frontend be its own backend, which conflicts with having a Python backend; and because SSR would
-require a second always-on Node server for an internal tool with no SEO or first-paint requirement.
+layer is therefore mandatory, not optional. FastAPI specifically because it gives that layer the
+exact thing Streamlit has no equivalent of: a real per-request lifecycle, with dependency injection
+(`Depends(...)`) as the standard place to resolve a caller's identity once per request — the literal,
+concrete site `get_current_actor()` occupies from Phase 8 on. It is also the natural choice because
+the codebase is async throughout — `mcp.ClientSession`, Agent Framework calls, anyio task groups —
+and a sync framework would reintroduce the class of complexity ADR-009 already documents the cost of.
+Next.js was rejected because its principal features (server components, API routes, SSR) exist to
+let the frontend be its own backend, which conflicts with having a Python backend; and because SSR
+would require a second always-on Node server for an internal tool with no SEO or first-paint
+requirement.
 
 **Consequences**: This reverses ADR-010's central benefit. The REST layer that decision existed to
 avoid must now be built, and it is the bulk of the work — the React portion is comparatively small.
-Bought in exchange: real multi-user authentication, a durable execution boundary, and a UI that is
-not fighting a rerun model. The endpoint contract is not new design work — LLD §10.2 specified these
-endpoints during the design phase and they were never implemented.
+Bought in exchange: a request-level identity model with somewhere for `get_current_actor()` to
+actually run, a durable execution boundary, and a UI that is not fighting a rerun model. The endpoint
+contract is not new design work — LLD §10.2 specified these endpoints during the design phase and
+they were never implemented.
+
+**ADR-010 itself is not being second-guessed here.** Its choice was the right one under the
+constraints that actually held at the time — no authenticated users, no per-user authorization,
+nothing for a REST layer to protect that direct function calls couldn't already do more simply. This
+ADR records that the constraint changed, not that the earlier judgment was wrong.
 
 **Amendment to ADR-010**: ADR-010 records Azure Static Web Apps as deferred Next-scope work. That is
 now incorrect in both directions. ASWA was never viable for Streamlit at all — it hosts static assets
@@ -276,8 +306,12 @@ authentication, internal-only ingress for non-public services, and scale-to-zero
 matters concretely: usage is bursty (demos and development sessions), and the Consumption plan's
 per-subscription free grant of 180,000 vCPU-seconds and 360,000 GiB-seconds covers roughly 50 hours
 per month at 1 vCPU / 2 GiB — well beyond real usage. App Service was rejected because it cannot
-scale to zero, so a plan bills around the clock. AKS was rejected as disproportionate for a system
-with one real user.
+scale to zero, so a plan bills around the clock. AKS was rejected because nothing in this system's
+real requirements needs Kubernetes' own primitives — no custom controllers, no StatefulSet-shaped
+workloads, no multi-cluster or service-mesh requirement the project's four backend services don't
+already get from Container Apps' simpler model. That is a statement about what Kubernetes offers
+that this system has no use for, not about how many people use the system — the same rejection holds
+regardless of user count, since Container Apps scales the same way AKS would for this workload shape.
 
 **Consequences**: Compute cost is expected to be zero within the free grant, with Azure Container
 Registry (~US$5/month) and Log Analytics ingestion as the real added spend. The trade-off is cold
@@ -325,6 +359,22 @@ mistake Governance & Security Reference §5 documents at the UI layer, one level
 **Consequences**: Every schema or field change touches two services. Debugging spans two log streams.
 With both services scaled to zero, a first request pays two chained cold starts. Accepted knowingly,
 in exchange for the learning outcome, which is the actual objective here.
+
+**Retroactive note (2026-09-10, ADR-015's own multi-user pass)**: The requirement now stated in
+ADR-015 — a multi-user production system with authenticated users and per-user authorization — gives
+this same boundary a real functional justification it did not have when this decision was made:
+separating session and identity handling from the domain is exactly the shape a real per-user
+authorization model needs, and the boundary definition above (BFF owns session/identity/response
+shaping, never a data store; the core API owns the domain and every data connection) already matches
+it without modification. **This is recorded as new information arriving after the fact, not as a
+correction to the decision's own history.** The split was made before that requirement existed, for
+the reasons stated above — learning Azure hands-on and leaving room for later services — and the
+requirement caught up with it afterward. The original Reasoning is left exactly as written above, not
+softened or reframed: it was true when written (no functional requirement demanded this split at
+decision time), and the honest value of this ADR is that it says so plainly rather than dressing up a
+learning exercise as necessity it didn't yet have. What's added here is simply that the exercise
+turned out, later, to have built the right shape for a real reason — which is worth knowing, but is
+not the same claim as "the requirement drove the decision."
 
 ---
 
