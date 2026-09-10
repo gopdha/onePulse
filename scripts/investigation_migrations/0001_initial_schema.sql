@@ -92,6 +92,37 @@ CREATE TABLE IF NOT EXISTS investigation.investigation_runs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Real, explicit, self-asserting ownership — not left implicit in "this
+-- file is only ever run by migrate_investigation.py, connecting as the
+-- Investigation role" (true today, but Phase 7 provisions from scratch
+-- and that invariant is a fact about operational discipline, not
+-- something this SQL file itself enforces). Prefers the real deployed
+-- `investigation_role` once it exists (Phase 6+), falling back to
+-- `investigation_role_local_dev` today. For the intended path (this
+-- role already owns what it just created, or is re-running the same
+-- idempotent migration), asserting ownership of yourself is a real
+-- Postgres no-op — safe to run every time. If ownership has ever drifted
+-- to a different role (the exact live bug this statement exists to
+-- prevent recurring — see the header comment above), this correctly
+-- FAILS LOUDLY with a permission error instead of silently leaving bad
+-- ownership in place: `ALTER ... OWNER TO` requires the connecting role
+-- to already be the current owner (or a superuser), which
+-- investigation_role(_local_dev) is not if some other role created the
+-- object first. That failure is the desired outcome — it surfaces the
+-- exact class of drift a positive-grant check would otherwise be the
+-- only way to catch, the very next time this migration runs, rather
+-- than waiting for someone to think to check.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'investigation_role') THEN
+        EXECUTE 'ALTER SCHEMA investigation OWNER TO investigation_role';
+        EXECUTE 'ALTER TABLE investigation.investigation_runs OWNER TO investigation_role';
+    ELSIF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'investigation_role_local_dev') THEN
+        EXECUTE 'ALTER SCHEMA investigation OWNER TO investigation_role_local_dev';
+        EXECUTE 'ALTER TABLE investigation.investigation_runs OWNER TO investigation_role_local_dev';
+    END IF;
+END $$;
+
 -- Real, honest accommodation, not a workaround: investigation_role (the
 -- real deployed-workload role) does not exist yet as of Phase 4 —
 -- nothing is deployed (Migration Plan Phases 5-7). Only
