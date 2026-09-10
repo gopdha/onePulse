@@ -137,9 +137,34 @@ concurrency behaviour under 115 items is not exercised by 11.
 - ADO PAT to Key Vault, granted **only** to the Investigation service's identity
 - Blob Storage and Queue data-plane roles
 
-**Definition of Done**: a full run with zero interactive credentials available. Prove by grep for
-static credentials (the check used in the original Phase 1), and by confirming each role's live
-grants match the Schema Reference — the first time these roles carry real load.
+> **Amended 2026-09-10 (CLAUDE.md Task 45, ADR-024) — the original Definition of Done below was
+> written before a real, structural fact was known: genuine Managed Identity auth (the IMDS-based
+> mechanism) is unreachable from a local container, confirmed by direct test (a `curl` to
+> `169.254.169.254` from inside a container fails to connect, not a permissions error). "A full run
+> with zero interactive credentials available" cannot be proven from these local containers — not a
+> shortfall in this phase's execution, a structural property of where these containers run. See
+> ADR-024 for the full decision and why a Service Principal secret was rejected as a substitute.**
+>
+> **What this phase actually proved, real and complete:** every identity, RBAC grant, Postgres role
+> mapping, and Key Vault secret this phase's own bullet list calls for — created and live-verified
+> by direct query, not configured and assumed. The ADO PAT reachable only by Investigation's
+> identity, demonstrated via direct RBAC query and a live container environment dump. A real,
+> full-scope end-to-end AOP run through the complete chain (BFF's own new service-to-service app-role
+> check, core_api, Postgres, Foundry, Key Vault) with the shared local credential standing in for
+> the identity call this environment cannot make. `verify_migration.py` and the full suite green.
+>
+> **What remains genuinely unproven, deferred to Phase 7 explicitly, not silently:** that any of
+> these real identities can actually authenticate a container via true Managed Identity end to end,
+> with the shared `azure_cli_state` volume absent or demonstrably unused. This is Phase 7's own
+> Definition of Done now, stated there directly — not something to rediscover when Phase 7 starts.
+
+**Definition of Done, revised**: every identity/RBAC/Postgres-role/Key-Vault item above created and
+live-verified (not merely configured); the ADO PAT's access boundary demonstrated by direct query,
+not asserted; a real, full-scope AOP run completing through the whole chain with these grants
+engaged; a grep for static credentials (the check used in the original Phase 1); each role's live
+grants confirmed against the Schema Reference — the first time these roles carry real load.
+**Not** part of this phase's Definition of Done, by explicit decision: a literal zero-interactive-
+credential run — deferred to Phase 7 (see above and ADR-024).
 
 ---
 
@@ -157,10 +182,22 @@ grants match the Schema Reference — the first time these roles carry real load
 - Built-in Entra authentication enabled from the first deployment
 - Postgres network access from the Container Apps environment
 
+> **Carries forward a real, stated dependency from Phase 6 (ADR-024) — not something to rediscover
+> here.** Phase 6 provisioned every real identity, RBAC grant, and Postgres role mapping this
+> phase's containers now need, and proved all of it live except the one thing no local container
+> could prove: that Managed Identity auth actually works, end to end, when a container is real
+> Azure compute. This phase is where that becomes checkable for the first time — make it a real,
+> explicit part of this phase's own Definition of Done, not an assumption carried in from Phase 6.
+
 **Definition of Done**: local Streamlit, pointed at the deployed BFF, completes a real run, a real
 approval, and a real report download via SAS. Measure the real cold-start time on the Python + Node
 image rather than assuming published figures. Confirm the core API and both workers are genuinely
-unreachable from outside the environment.
+unreachable from outside the environment. **A real run completing with the `azure_cli_state` volume
+absent or demonstrably unused by these containers — proving Managed Identity auth actually works
+end to end, not merely that it was configured in Phase 6** (Postgres via `app_role`/
+`investigation_role`, Foundry, Search, Key Vault, Queues — the same real grants Phase 6 already put
+in place, now exercised for the first time by the identity they were actually granted to, not a
+shared human credential standing in for it).
 
 ---
 

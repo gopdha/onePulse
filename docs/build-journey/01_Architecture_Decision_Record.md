@@ -645,3 +645,78 @@ from how ownership transfer "should" behave — all fixed in the same pass**:
 every runtime role). Cleaner in the abstract, but more infrastructure to stand up for a problem the
 existing two-role design already has a correct answer for once its migration-runner default is fixed
 — not pursued without a concrete reason the existing roles can't serve this purpose.
+
+---
+
+## ADR-024: Phase 6 provisions real identities without proving Managed Identity works; a Service Principal secret is rejected as the substitute
+
+**Context**: Migration Plan Phase 6's original Definition of Done asked for "a full run with zero
+interactive credentials available." Before implementing, a direct test was run rather than assumed:
+from inside a real local container, a request to Azure's Instance Metadata Service
+(`169.254.169.254`, the real endpoint `ManagedIdentityCredential` calls to obtain a Managed-Identity
+token) failed to connect entirely — not an auth failure, a routing failure. IMDS is reachable only
+from genuine Azure compute; it verifies the caller against the specific Azure resource an identity
+is attached to, and there is no way to present a local process as that resource from outside Azure's
+own compute fabric. "Containers stay local" (this phase's own stated constraint) and "prove Managed
+Identity auth end to end" are therefore mutually exclusive for the actual runtime mechanism, not a
+gap that more Entra permissions, more RBAC assignments, or more careful configuration could close.
+
+**Decision**: Split Phase 6's bar into what is real and provable locally, and what genuinely is not.
+Provision every real identity, RBAC grant, Postgres role mapping, and Key Vault secret this phase
+calls for, and verify all of it live — by direct query, by a real end-to-end pipeline run, never by
+configuration alone. Do **not** attempt to prove Managed Identity authentication itself works end to
+end from a local container. That proof is real, necessary, and explicitly assigned to Phase 7 (see
+its own amended Definition of Done), the first point these containers are genuine Azure compute with
+IMDS actually reachable.
+
+**Reasoning**: Three real options were considered before deciding, not one accepted by default.
+
+1. *Split the bar (chosen).* Honest about what a local container can and cannot prove; wastes no
+   effort chasing a proof that cannot exist in this environment; the real infrastructure work (the
+   overwhelming majority of the phase) proceeds unblocked.
+2. *A Service Principal with a client secret or certificate, standing in for Managed Identity
+   locally — rejected.* This would genuinely satisfy "zero interactive credentials, no `az login`"
+   — but it is a second static credential in a project whose Governance & Security Reference §1
+   opens with zero static secrets and tracks exactly one named, deliberately time-boxed exception
+   (the ADO PAT). That exception exists because a real constraint forced it: four independent,
+   failed Managed-Identity authentication attempts against a genuinely misconfigured ADO org (see
+   Governance & Security Reference §4, Challenges & Real-World Findings #2). A Service Principal
+   secret here would exist for a categorically different reason — to satisfy a bar that turned out
+   to be unachievable as originally worded, not because a real technical constraint left no other
+   option. Introducing a second static credential to make a phase whose entire purpose is
+   *eliminating* credentials look complete would be self-defeating, not a proportionate trade.
+3. *Real local OIDC federation (Workload Identity Federation with a locally-issued, verifiable
+   token) — rejected, not because it wouldn't work, but because it isn't worth building now.* This
+   would genuinely avoid both a static secret and `az login`. It requires standing up a real,
+   trusted local OIDC issuer this project has no existing pattern for — novel infrastructure to
+   close a gap Phase 7 closes for free, for a single phase's local verification. Revisit only if a
+   concrete, recurring need for local MI testing emerges beyond this one phase.
+
+**A related decision, restated explicitly here so it reads as deliberate rather than an
+inconsistency against this same phase's own "give each service its own identity" principle**:
+`core_api` and `reporting` share one Managed Identity (`id-onepulse-app-dev`), not two. This was
+never in tension with "each service its own identity" — that principle is about not giving
+Investigation's real blast radius (the ADO PAT, the `investigation` schema) back by sharing an
+identity with services that have neither. `core_api` and `reporting` were never split at the
+schema/role level in the first place (ADR-020: both are `public`-schema, `app_role` consumers by
+design) — giving them two *separate* Managed Identities mapped to the *same* Postgres role would add
+a real operational cost (two identities to rotate, audit, and reason about) for zero real isolation
+benefit, since `pgaadauth_create_principal_with_oid` maps one role name to exactly one object ID
+regardless — two identities sharing `app_role` would mean one of them silently cannot authenticate
+as it at all. Investigation and BFF each get their own identity because each has a real, distinct
+resource only it should reach (the ADO PAT; core API's own service-to-service app role,
+respectively) — `core_api`/`reporting` have no equivalent distinct resource to separate.
+
+**Consequences**:
+
+- Migration Plan Phase 6's and Phase 7's own Definition of Done sections are both amended to state
+  this split directly — a reader arriving at either section later, without this conversation's
+  context, should not be able to come away believing Phase 6 proved Managed Identity works.
+- Phase 7 inherits a real, explicit, load-bearing verification item it would otherwise have had to
+  rediscover: prove a real run completes with the `azure_cli_state` volume absent or demonstrably
+  unused, exercising the exact identities and grants Phase 6 already put in place.
+- `docker-compose.yml` carries real, correct `AZURE_CLIENT_ID` values per service now — inert
+  locally (nothing can present them to an unreachable IMDS), real configuration for Phase 7.
+
+**Not chosen**: see Reasoning above — a Service Principal secret and local OIDC federation, both
+considered and both rejected for stated, specific reasons, not merely unconsidered.
