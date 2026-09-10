@@ -47,16 +47,37 @@ dependencies = [
     # auth only (allowSharedKeyAccess=false on the storage account) —
     # no account key, ever.
     "azure-storage-queue>=12.17.0",
-    # Local-first UI home (Home.py + pages/) — presentation layer only,
-    # calls onepulse_common.pipeline / human_governance / chat_assistant
-    # directly rather than reimplementing any of their logic.
-    "streamlit>=1.63.0",
+    # Migration Plan Phase 1/2 (core_api, bff) — real, load-bearing gap
+    # found only at Phase 5 (containerization): these were pip-installed
+    # ad hoc into the local .venv across Tasks 40-41 and never actually
+    # added here, so a fresh `pip install` (exactly what a container
+    # image build does) would have silently failed to bring them in.
+    # Every one of the four real services imports onepulse_common
+    # transitively, so this one shared manifest is the correct, single
+    # place for them — not four separate per-service requirements files.
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.4",
+    "httpx>=0.28.1",
+    "PyJWT>=2.13.0",
+    "pydantic>=2.13.4",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+]
+# Real, load-bearing separation found at Phase 5 (containerization):
+# streamlit was previously a hard dependency of this shared package, so
+# every one of the four backend service images (none of which import
+# streamlit at all — only Home.py does) paid its real, substantial size
+# cost (streamlit itself plus pandas/numpy/pyarrow/altair/pydeck)
+# unconditionally. Host-side local development installs this extra
+# (`pip install -e libs/onepulse_common[ui]`, or it's already present in
+# an existing venv from before this split — nothing to redo there);
+# every Dockerfile in this project deliberately does not request it.
+ui = [
+    "streamlit>=1.63.0",
 ]
 
 [build-system]
