@@ -11,21 +11,38 @@ cd <repo root>
 .venv\Scripts\Activate.ps1
 ```
 
-Confirm you're `az login`'d under the correct account and tenant before doing anything real —
-Postgres and Foundry authentication both rely on `DefaultAzureCredential` falling back to this
-session.
+The four backend services run as real containers via `docker compose` (Migration Plan Phase 5) —
+see §2. This section covers the real Azure identity/credential state underneath them, current as of
+Migration Plan Phase 6 (CLAUDE.md Task 45).
 
-**Azure DevOps is the exception.** ADO does *not* authenticate via `DefaultAzureCredential`. It
-uses a scoped Personal Access Token (Work Items, read-only, 7-day expiry), read from
-`ONEPULSE_ADO_PAT` in `.env`. This is a deliberate, time-boxed exception to the project's
-zero-static-secrets discipline, adopted after four real Managed-Identity authentication attempts
-against the `gopdha` ADO org failed with four different errors, tracing to a genuine MSA/AAD
-tenant-duality issue in how that org is configured. See Governance & Security Reference §4 and
-Challenges & Real-World Findings #2. The underlying Entra-ID fix remains open technical debt; the
-PAT is not the intended long-term pattern.
+**Real per-service Managed Identities now exist and carry real RBAC/Postgres grants**
+(`id-onepulse-app-dev` — shared by `core_api`/`reporting`, mapped to the Postgres `app_role`;
+`id-onepulse-investigation-dev` — Investigation's own, mapped to `investigation_role`, plus Key
+Vault `Secrets User`; `id-onepulse-bff-dev` — BFF's own, holding core_api's `Service.Access` app
+role). **None of this is reachable from these LOCAL containers, confirmed by direct test, not
+assumed:** a `curl` from inside a local container to Azure's Instance Metadata Service
+(`169.254.169.254`, the endpoint `ManagedIdentityCredential` actually calls) fails to connect —
+IMDS is only reachable from genuine Azure compute. Real Managed Identity auth becomes possible only
+once these images run as real Container Apps (Phase 7).
 
-Because the token expires every 7 days, an `az login` session alone is **not** sufficient to run
-the pipeline. See §6 for the failure signature when it has lapsed.
+Until then, `DefaultAzureCredential`'s `AzureCliCredential` fallback is what actually authenticates
+every container — a real, once-per-environment interactive `az login --use-device-code`, its
+resulting Linux-native token cache shared across all four containers via the `azure_cli_state` named
+volume (see `docker-compose.yml`'s own header comment, and CLAUDE.md Task 44 for the real DPAPI
+finding that led to this design). Confirm that volume holds a real, unexpired session before doing
+anything real — Postgres, Foundry, Azure AI Search, Storage Queues, and Key Vault all rely on it.
+
+**Azure DevOps is the one real exception to identity-based auth entirely, but is no longer a plain
+env var.** ADO uses a scoped Personal Access Token (Work Items, read-only, 7-day expiry) — as of
+Phase 6 it lives in Key Vault (`onepulse-kv-dev`, secret `ado-pat`), fetched at request time by the
+Investigation service only, via its own `fetch_ado_pat_from_keyvault()`. This is still a deliberate,
+time-boxed exception to the project's zero-static-secrets discipline (see Governance & Security
+Reference §4 and Challenges & Real-World Findings #2 for why a PAT exists at all), but the PAT
+itself no longer sits in any container's plain environment — confirmed live: `docker compose exec
+investigation env` shows only `ONEPULSE_ADO_PAT_KEY_VAULT_URL`, never the PAT; `core_api`/`bff`/
+`reporting` reference neither the PAT nor the vault URL at all. Because the underlying PAT still
+expires every 7 days, a working `azure_cli_state` session alone is **not** sufficient to run the
+pipeline — see §6 for the failure signature when it has lapsed.
 
 ---
 
@@ -368,3 +385,16 @@ Empty output means it's genuinely never been committed.
   no filter at all and would also pull in the accumulated `test_human_governance.py` fixture rows
   wholesale — the reindex is planned for a later migration phase (Migration Plan Phase 11 /
   ADR-022), alongside adding that filter, not as a standalone fix today.
+- **A new Entra RBAC/app-role assignment does not retroactively affect an already-issued, not-yet-
+  expired access token.** Found live during Migration Plan Phase 6 (Task 45): adding core_api's
+  `Service.Access` app role and assigning it did not fix BFF's real service-to-service call, which
+  kept 403ing with `missing_app_role` — BFF's container had a real, still-valid cached access token
+  (up to ~32 minutes of remaining life) acquired *before* the role assignment, and Azure AD does not
+  invalidate a bearer token when the backing role assignment changes; the token remains valid with
+  its original claims until natural expiry. `docker compose restart` does not help — the cache lives
+  in the shared `azure_cli_state` volume, not the container's process memory. The real fix: clear
+  only the `AccessToken` entries from `/root/.azure/msal_token_cache.json` inside the affected
+  container (preserving `RefreshToken`/`Account` so no new interactive login is needed) — the next
+  `get-access-token` call silently reacquires, picking up the new role. If a freshly-changed role
+  assignment doesn't seem to be taking effect, check the cached token's real `expiresOn` before
+  assuming the assignment itself is wrong.

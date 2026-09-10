@@ -58,6 +58,16 @@ TENANT_ID = os.environ.get("ONEPULSE_ENTRA_TENANT_ID", "")
 CORE_API_APP_ID = os.environ.get("ONEPULSE_CORE_API_APP_ID", "")
 CORE_API_IDENTIFIER_URI = os.environ.get("ONEPULSE_CORE_API_IDENTIFIER_URI", "")
 
+# Migration Plan Phase 6: a real Application permission (app role),
+# `Service.Access`, added to this App Registration and assigned only to
+# id-onepulse-bff-dev's service principal. Before this, `verify_service_
+# token` validated signature/audience/issuer but not WHO within this
+# tenant was calling — any principal able to acquire a token for this
+# API's audience would pass. Checking `roles` closes that: a valid
+# token that lacks this specific app role is a real, distinct 403, not
+# silently accepted.
+REQUIRED_APP_ROLE = os.environ.get("ONEPULSE_CORE_API_REQUIRED_APP_ROLE", "Service.Access")
+
 # Real, live Microsoft-hosted JWKS endpoint for this tenant — the same
 # real signing keys that issued the token, fetched (and cached by
 # PyJWKClient) rather than trusted blind. Works for both v1 and v2
@@ -120,6 +130,9 @@ async def verify_service_token(authorization: str = Header(...)) -> dict:
         raise HTTPException(status_code=401, detail={"error": "invalid_issuer"})
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail={"error": "invalid_token", "detail": str(exc)})
+
+    if REQUIRED_APP_ROLE not in claims.get("roles", []):
+        raise HTTPException(status_code=403, detail={"error": "missing_app_role", "required": REQUIRED_APP_ROLE})
 
     return claims
 

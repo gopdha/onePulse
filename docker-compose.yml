@@ -18,20 +18,38 @@
 # replaces it with a real React frontend rather than ever containerizing
 # it).
 #
-# az login credentials: real Managed Identity is Phase 6 work. Until
-# then, DefaultAzureCredential's AzureCliCredential fallback needs a real
-# `az` CLI binary (present in every image here) plus real, already-
-# authenticated CLI state. A bind-mount of the host's own ~/.azure does
-# NOT work across a Windows-host/Linux-container boundary — az CLI
-# encrypts its token cache with the host OS's native secret storage
-# (DPAPI on Windows), which a Linux container cannot decrypt (confirmed
-# live, CLAUDE.md Task 44: a bind-mounted Windows .azure directory
-# produces a real "User ... does not exist in MSAL token cache" error,
-# not a permissions problem). The real, working fix is the named volume
-# below: a one-time `az login --use-device-code` run once, inside a
-# container using this same volume, produces a genuinely Linux-native
-# token cache every container sharing the volume can then use — see the
-# Runbook for the exact one-time command.
+# az login credentials: real Managed Identity is Migration Plan Phase 6
+# work — and Phase 6 (CLAUDE.md Task 45) found, by direct test, that it
+# structurally cannot be exercised from these LOCAL containers: Azure's
+# Instance Metadata Service (the endpoint ManagedIdentityCredential
+# actually calls) is only reachable from genuine Azure compute — a curl
+# from inside a local container to 169.254.169.254 fails to connect at
+# all, not a permissions error. Real Managed Identity becomes reachable
+# only once these images run as real Azure Container Apps (Phase 7).
+#
+# Until then, DefaultAzureCredential's AzureCliCredential fallback needs
+# a real `az` CLI binary (present in every image here) plus real,
+# already-authenticated CLI state. A bind-mount of the host's own
+# ~/.azure does NOT work across a Windows-host/Linux-container boundary
+# — az CLI encrypts its token cache with the host OS's native secret
+# storage (DPAPI on Windows), which a Linux container cannot decrypt
+# (confirmed live, CLAUDE.md Task 44: a bind-mounted Windows .azure
+# directory produces a real "User ... does not exist in MSAL token
+# cache" error, not a permissions problem). The real, working fix is the
+# named volume below: a one-time `az login --use-device-code` run once,
+# inside a container using this same volume, produces a genuinely
+# Linux-native token cache every container sharing the volume can then
+# use — see the Runbook for the exact one-time command.
+#
+# Real, already-provisioned per-service Managed Identities (Task 45),
+# recorded here as real, correct, forward-looking configuration for
+# Phase 7 — inert today, since nothing local can authenticate as any of
+# them (see above). Postgres/Foundry/Search/Key Vault/Queue role
+# mappings and RBAC grants are already live against these real object
+# IDs; only the runtime auth path (IMDS) is what's missing locally:
+#   core_api, reporting -> id-onepulse-app-dev  (Postgres app_role)
+#   investigation       -> id-onepulse-investigation-dev (Postgres investigation_role; Key Vault Secrets User)
+#   bff                  -> id-onepulse-bff-dev (core_api's own Service.Access app role)
 volumes:
   azure_cli_state:
 
@@ -48,6 +66,11 @@ services:
       - ./docker_logs:/var/log/onepulse
     environment:
       ONEPULSE_PG_ROLE: app_role_local_dev
+      # Real, forward-looking Phase 7 config — inert locally (no IMDS to
+      # present it to). Selects WHICH of this environment's several
+      # user-assigned identities a Container App should request a token
+      # for, once ManagedIdentityCredential can actually run.
+      AZURE_CLIENT_ID: 1c0ae505-d1a2-4c87-9c3c-01266ee4e4fe  # id-onepulse-app-dev
       ONEPULSE_FOUNDRY_PROJECT_ENDPOINT: ${ONEPULSE_FOUNDRY_PROJECT_ENDPOINT}
       ONEPULSE_FOUNDRY_DEPLOYMENT_NAME: ${ONEPULSE_FOUNDRY_DEPLOYMENT_NAME}
       ONEPULSE_ENTRA_TENANT_ID: ${ONEPULSE_ENTRA_TENANT_ID}
@@ -74,6 +97,7 @@ services:
       # (8000) is irrelevant here; bff reaches it by compose service name
       # on the shared bridge network, never localhost.
       ONEPULSE_CORE_API_BASE_URL: http://core_api:8000
+      AZURE_CLIENT_ID: da595efc-8dba-4d53-9ef8-57d8f416f261  # id-onepulse-bff-dev
       ONEPULSE_CORE_API_IDENTIFIER_URI: ${ONEPULSE_CORE_API_IDENTIFIER_URI}
       ONEPULSE_STUB_ENTRA_OBJECT_ID: ${ONEPULSE_STUB_ENTRA_OBJECT_ID}
       ONEPULSE_APPINSIGHTS_CONNECTION_STRING: ${ONEPULSE_APPINSIGHTS_CONNECTION_STRING}
@@ -93,12 +117,21 @@ services:
       - ./docker_logs:/var/log/onepulse
     environment:
       ONEPULSE_INVESTIGATION_PG_ROLE: investigation_role_local_dev
+      AZURE_CLIENT_ID: 8354da3b-e56e-4f0a-8f67-5bf18162af38  # id-onepulse-investigation-dev
       ONEPULSE_FOUNDRY_PROJECT_ENDPOINT: ${ONEPULSE_FOUNDRY_PROJECT_ENDPOINT}
       ONEPULSE_FOUNDRY_DEPLOYMENT_NAME: ${ONEPULSE_FOUNDRY_DEPLOYMENT_NAME}
       ONEPULSE_ADO_ORG: ${ONEPULSE_ADO_ORG}
-      # The one and only place this project ever wires this variable into
-      # a container environment — see this file's own header comment.
-      ONEPULSE_ADO_PAT: ${ONEPULSE_ADO_PAT}
+      # Migration Plan Phase 6 (Task 45): the ADO PAT no longer sits in
+      # this container's plain environment at all — a real, meaningful
+      # improvement over Phase 5 (a plain env var is visible via
+      # `docker inspect`/`/proc/<pid>/environ`; a value fetched at
+      # runtime via the Key Vault SDK is not). The service fetches it
+      # itself, at request time, via fetch_ado_pat_from_keyvault() —
+      # only the vault's URL is real, non-secret configuration here.
+      # This is still the one and only place this project ever wires an
+      # ADO-PAT-adjacent value into a container environment at all — see
+      # this file's own header comment.
+      ONEPULSE_ADO_PAT_KEY_VAULT_URL: ${ONEPULSE_ADO_PAT_KEY_VAULT_URL:-https://onepulse-kv-dev.vault.azure.net/}
       ONEPULSE_ARIZE_SPACE_ID: ${ONEPULSE_ARIZE_SPACE_ID}
       ONEPULSE_ARIZE_API_KEY: ${ONEPULSE_ARIZE_API_KEY}
       ONEPULSE_DEBUG_SPAN_LOG: ${ONEPULSE_DEBUG_SPAN_LOG:-/var/log/onepulse/spans.jsonl}
@@ -115,6 +148,7 @@ services:
       - ./docker_logs:/var/log/onepulse
     environment:
       ONEPULSE_PG_ROLE: app_role_local_dev
+      AZURE_CLIENT_ID: 1c0ae505-d1a2-4c87-9c3c-01266ee4e4fe  # id-onepulse-app-dev, shared with core_api
       ONEPULSE_FOUNDRY_PROJECT_ENDPOINT: ${ONEPULSE_FOUNDRY_PROJECT_ENDPOINT}
       ONEPULSE_FOUNDRY_DEPLOYMENT_NAME: ${ONEPULSE_FOUNDRY_DEPLOYMENT_NAME}
       # Real container-network address, same reasoning as bff's

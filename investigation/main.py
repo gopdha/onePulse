@@ -89,7 +89,7 @@ from fastapi import FastAPI, HTTPException
 from opentelemetry import trace
 from opentelemetry.propagate import extract, inject
 
-from investigation.investigate import investigate, load_ado_pat
+from investigation.investigate import fetch_ado_pat_from_keyvault, investigate, load_ado_pat
 from investigation.store import get_investigation_run, upsert_investigation_run
 from onepulse_common.config import PostgresSettings
 from onepulse_common.db import PostgresClient
@@ -167,6 +167,7 @@ async def _handle_message(
     message: QueueMessage,
     pg_client: PostgresClient,
     credential: DefaultAzureCredential,
+    async_credential: AsyncDefaultAzureCredential,
     arize_space_id: str,
 ) -> None:
     if await is_poison(message):
@@ -192,7 +193,8 @@ async def _handle_message(
                 span.set_attribute("onepulse.cycle_id", cycle_id)
                 span.set_attribute("onepulse.ado_project", program_name)
                 try:
-                    ado_pat_b64 = load_ado_pat()
+                    raw_pat = await fetch_ado_pat_from_keyvault(async_credential)
+                    ado_pat_b64 = load_ado_pat(raw_pat)
                     chat_client = FoundryChatClient(
                         project_endpoint=PROJECT_ENDPOINT, model=DEPLOYMENT_NAME, credential=credential
                     )
@@ -272,6 +274,7 @@ async def _consume_loop(app: FastAPI) -> None:
                     message,
                     app.state.pg_client,
                     app.state.credential,
+                    credential,
                     app.state.arize_space_id,
                 )
             if not received_any:
