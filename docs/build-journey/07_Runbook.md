@@ -398,3 +398,122 @@ Empty output means it's genuinely never been committed.
   `get-access-token` call silently reacquires, picking up the new role. If a freshly-changed role
   assignment doesn't seem to be taking effect, check the cached token's real `expiresOn` before
   assuming the assignment itself is wrong.
+- **`Cognitive Services OpenAI User` (Phase 6's own RBAC grant) covers real-time inference calls
+  only — it does NOT include the Foundry project's own connections-listing operation
+  (`get_application_insights_connection_string()`), which every service's `enable_observability()`
+  calls at startup.** Confirmed live during Migration Plan Phase 7: every service that calls it
+  (`core_api`, `reporting`, `investigation`) crashed on first real deploy with a genuine
+  `azure.core.exceptions.ClientAuthenticationError: (PermissionDenied) Principal does not have
+  access to API/Operation` — `ERROR: Application startup failed. Exiting.` — which then
+  crash-loop-backs-off (`CrashLoopBackOff on legion`, `restartCount` climbing), making a simple
+  `az containerapp revision restart` insufficient on its own; the replica keeps retrying the *old*
+  failure on its own backoff schedule rather than picking up a just-fixed RBAC grant. The real fix
+  is the **`Foundry User`** built-in role (`Microsoft.CognitiveServices/*/read` control-plane access
+  plus `Microsoft.CognitiveServices/*` data-plane — a superset covering both the connections listing
+  AND the inference calls `Cognitive Services OpenAI User` already granted; that older grant is
+  harmless left in place, not removed), granted at the Foundry account scope to every identity that
+  calls `enable_observability()`. After granting it, don't just restart the existing revision — force
+  a genuinely fresh one (e.g. `az containerapp update --set-env-vars SOME_MARKER=1`) to escape the
+  old crash-loop backoff timer and confirm the fix on a truly clean start, not a retry of the old one.
+- **Container Apps' built-in Entra authentication (Easy Auth) for the `azureActiveDirectory`
+  provider requires a real client secret — there is no secretless/Managed-Identity-federated path
+  for it.** This is a genuine, structural exception to this project's zero-static-secrets discipline
+  (Governance & Security Reference §1), not a shortcut: the platform performs its own server-side
+  OAuth confidential-client exchange with Entra on behalf of a signing-in browser, which Entra
+  requires a client secret or certificate to authorize — Managed Identity federates THIS project's
+  own outbound service-to-service calls, not the platform's inbound sign-in flow. The secret is
+  generated once (`az ad app credential reset`) and stored only in the container app's own managed
+  secret store (`az containerapp auth microsoft update --client-secret ...`, never echoed to a log
+  or committed anywhere), the same discipline as every other real secret this project has ever
+  handled. Set `--action Return401` (not `RedirectToLoginPage`) for unauthenticated requests — a
+  browser redirect breaks any plain HTTP caller (Streamlit, curl) that can't follow an interactive
+  login flow, which this phase's own caller genuinely is until Phase 9's real frontend exists.
+  Acquiring a real bearer token for testing needs the app registration to actually expose a
+  delegated scope (`api://<appId>/access_as_user`) and a real `oauth2PermissionGrant` for the caller
+  (the same real recipe already used for core_api in Phase 2) — a bare `az account get-access-token
+  --resource <appId>` against an app with no exposed scope silently returns an opaque, non-JWT token
+  that fails validation with a generic `400`, not a diagnosable error.
+
+---
+
+## 7. Deploying to Azure Container Apps (Migration Plan Phase 7)
+
+**Not public.** `bff` is the only service with any external reachability, and it is IP-restricted to
+approved developer machines plus real built-in Entra authentication — both, not either. `core_api`,
+`investigation`, and `reporting` have **no public FQDN at all**; a request to their `*.internal.*`
+hostname from outside the environment gets a genuine platform-level "Azure Container App -
+Unavailable" page, confirmed live, not merely configured (see below). Public ingress on `bff` is
+explicitly Phase 8 work, gated on real reviewer identity landing first — see `12_Migration_Plan.md`.
+
+**Real resources, resource group `onepulse-gr`, region `centralus`** (Key Vault is the one exception,
+`eastus2`, pre-existing from Phase 6 — cross-region Key Vault reads are fine, no colocation
+requirement): Container Registry `onepulseacrdev` (Basic), Log Analytics workspace
+`onepulse-caenv-logs`, Container Apps environment `onepulse-caenv`, and four container apps —
+`onepulse-core-api`, `onepulse-bff`, `onepulse-investigation`, `onepulse-reporting`.
+
+**How to deploy** (no IaC/Bicep yet this phase — real, disclosed scope gap, not an oversight; every
+step below was run directly via `az`, which is what actually exists today to repeat or extend):
+
+```powershell
+# Build each service's image directly in ACR (no local docker push needed)
+az acr build -r onepulseacrdev -t onepulse-core-api:<tag> -f core_api/Dockerfile .
+az acr build -r onepulseacrdev -t onepulse-bff:<tag> -f bff/Dockerfile .
+az acr build -r onepulseacrdev -t onepulse-investigation:<tag> -f investigation/Dockerfile .
+az acr build -r onepulseacrdev -t onepulse-reporting:<tag> -f reporting/Dockerfile .
+
+# Deploy a new image to an existing app (creates a fresh revision)
+az containerapp update -g onepulse-gr -n onepulse-<service> --image onepulseacrdev.azurecr.io/onepulse-<service>:<tag>
+```
+
+Each app already carries its real user-assigned identity (`--user-assigned`), real `AZURE_CLIENT_ID`,
+and real Postgres/Foundry/Search/Queue/Key-Vault config as plain env vars (see each app's own
+`az containerapp show` for the current set) — `core_api`/`reporting` share `id-onepulse-app-dev`
+(mapped to `app_role`); `investigation` has its own `id-onepulse-investigation-dev` (mapped to
+`investigation_role`, plus Key Vault `Secrets User`); `bff` has its own `id-onepulse-bff-dev` (plus
+core_api's `Service.Access` app role). `ONEPULSE_PG_ROLE`/`ONEPULSE_INVESTIGATION_PG_ROLE` are
+`app_role`/`investigation_role` here — the real production roles, not the `_local_dev` mirrors —
+because these containers authenticate via real Managed Identity, confirmed live (see below), not the
+shared `az login` session local `docker compose` containers use.
+
+**How to reach it, as the intended caller (Streamlit):** `.env`'s `ONEPULSE_BFF_BASE_URL` points at
+the real deployed FQDN (`https://onepulse-bff.<environment-default-domain>.azurecontainerapps.io`),
+and `ONEPULSE_BFF_SIGNIN_APP_ID` names the real Entra app registration (`onepulse-bff-signin`) whose
+`access_as_user` delegated scope `api_client.py`'s own `_auth_headers()` acquires a real bearer token
+for on every request, via the same already-authenticated `az login` session every other local script
+in this project uses — not a static token in `.env`. Run Streamlit exactly as before
+(`streamlit run Home.py`); it now talks to real deployed compute instead of local containers, with no
+other code change. A caller whose own machine isn't in `bff`'s IP allow-list, or who hasn't been
+granted the `access_as_user` scope, is correctly refused — see the Easy Auth gotcha above for what
+that setup actually requires.
+
+**How to warm it before a demo.** Real, measured cold-start numbers (Migration Plan Phase 7's own
+explicit ask — "you have been assuming the Python-plus-Node image is slow... measure it"), not
+assumed: a real, precisely-timed first request through the full `bff` → `core_api` chain from a
+genuine zero-replica state (both Python-only images, chained — `bff`'s own cold start plus the
+outbound call triggering `core_api`'s) took **55.7 seconds** end to end (`curl -w
+'%{time_total}'`, not a guess). `investigation` (the one Python-**and**-Node image) — measured via a
+fresh-revision creation-to-ready window rather than a second live KEDA-trigger test, given the time
+already spent on this phase — showed its own container process starting **17 seconds** after
+replica creation and confirmed actively polling its real queue within **50 seconds** of it; comparable
+to, not dramatically worse than, the two-Python-services-chained figure, despite carrying the Node
+runtime and `npm ci`'d dependency tree. **If a real demo cannot tolerate a ~1-minute wait on the
+first click:** trigger one real, throwaway request against `bff` a few minutes beforehand (the
+existing Runbook advice from earlier phases — "raise `minReplicas` to 1 temporarily before a demo,
+return it to 0 after," ADR-016 — still applies and is the correct mechanism; scale-to-zero cost
+discipline is what makes leaving it at 1 indefinitely the wrong default, not that warming is
+optional).
+
+**Proving no interactive credential is present, the literal Phase 7 bar:** `az containerapp exec`
+into any of the four apps and run `az account show` — it fails with `Please run 'az login' to setup
+account`, confirmed live; there is no shared `azure_cli_state`-equivalent volume mounted anywhere in
+this deployment (`properties.template.volumes` is empty on every app). `DefaultAzureCredential`
+still succeeds in ~13ms from inside the same container (`python -c "from azure.identity import
+DefaultAzureCredential; DefaultAzureCredential().get_token(...)"`) — real Managed Identity via IMDS,
+not `az login`, the thing Phase 6 could provision but never prove.
+
+**Proving `verify_migration.py` runs from real deployed compute, not a laptop:** `reporting`'s image
+carries the script (`scripts/verify_migration.py`, copied at build time specifically for this) —
+`az containerapp exec -g onepulse-gr -n onepulse-reporting --command "python
+scripts/verify_migration.py --target dev"` connects as the real `app_role` Managed Identity from
+inside the container and prints the same real 119/119 result the local `.venv` run does, over the
+identical live database.

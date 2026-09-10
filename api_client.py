@@ -41,10 +41,37 @@ import datetime as dt
 import os
 
 import httpx
+from azure.identity.aio import DefaultAzureCredential
 
 from onepulse_common.human_governance import ActorIdRequiredError, NotesRequiredError
 
 API_BASE_URL = os.environ.get("ONEPULSE_BFF_BASE_URL", "http://127.0.0.1:8100")
+
+# Migration Plan Phase 7: the deployed bff has real, live built-in Entra
+# authentication (Easy Auth) in front of it -- a plain, unauthenticated
+# request now gets a genuine 401 from the platform itself before it ever
+# reaches bff/main.py. This module's own caller (this developer's
+# already-authenticated `az login` session, the same real credential
+# every other local script in this project already uses) acquires a
+# real bearer token for the bff-signin app registration's own
+# `access_as_user` delegated scope and presents it on every request --
+# not a static token pasted into .env, the identical live-credential
+# pattern this project has used throughout. Against a plain local
+# core_api/bff pair (no Easy Auth in front, Phase 1-6's own local dev
+# shape), ONEPULSE_BFF_SIGNIN_APP_ID is simply unset and this becomes a
+# real no-op (empty headers), so this file works unchanged either way.
+_BFF_SIGNIN_APP_ID = os.environ.get("ONEPULSE_BFF_SIGNIN_APP_ID")
+_credential: DefaultAzureCredential | None = None
+
+
+async def _auth_headers() -> dict[str, str]:
+    global _credential
+    if not _BFF_SIGNIN_APP_ID:
+        return {}
+    if _credential is None:
+        _credential = DefaultAzureCredential()
+    token = await _credential.get_token(f"api://{_BFF_SIGNIN_APP_ID}/access_as_user")
+    return {"Authorization": f"Bearer {token.token}"}
 
 
 def _parse_date(value: str) -> dt.date:
@@ -74,7 +101,7 @@ async def list_recent_reports_via_api(limit: int, program_id: str) -> list[dict]
     """Real GET /api/v1/reports?programId=...&limit=... — same shape
     `onepulse_common.pipeline.list_recent_reports` already returned.
     """
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0, headers=await _auth_headers()) as client:
         resp = await client.get("/api/v1/reports", params={"programId": program_id, "limit": limit})
         resp.raise_for_status()
     return [_report_summary_from_api(r) for r in resp.json()]
@@ -86,7 +113,7 @@ async def get_report_detail_via_api(report_id: int) -> dict:
     `{"report": None, ...}` shape rather than raising — `show_report_
     dialog` already checks `report is None` and handles it.
     """
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0, headers=await _auth_headers()) as client:
         resp = await client.get(f"/api/v1/reports/{report_id}")
         if resp.status_code == 404:
             return {"report": None, "findings": [], "untracked_items": []}
@@ -135,7 +162,7 @@ async def trigger_report_via_api(program_id: str) -> dict:
     process, not in this request. Home.py polls get_cycle_via_api for
     progress instead of blocking on this call.
     """
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0, headers=await _auth_headers()) as client:
         resp = await client.post(f"/api/v1/programs/{program_id}/reports")
         resp.raise_for_status()
         data = resp.json()
@@ -149,7 +176,7 @@ async def get_cycle_via_api(cycle_id: str) -> dict:
     since re-keying to int here would just be undone by the JSON
     round-trip the next poll anyway.
     """
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0, headers=await _auth_headers()) as client:
         resp = await client.get(f"/api/v1/cycles/{cycle_id}")
         resp.raise_for_status()
         data = resp.json()
@@ -175,7 +202,7 @@ async def approve_report_via_api(report_id: int, actor_id: str | None) -> dict:
     here as `ActorIdRequiredError` so `Home.py`'s existing exception
     handling (unchanged since Phase 1) still catches it correctly.
     """
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0, headers=await _auth_headers()) as client:
         resp = await client.post(f"/api/v1/reviews/{report_id}/approve")
     if resp.status_code == 401 and resp.json().get("error") == "actor_not_found":
         raise ActorIdRequiredError("the BFF's identity did not resolve to a real actor")
@@ -188,7 +215,7 @@ async def reject_report_via_api(report_id: int, actor_id: str | None, notes: str
     `approve_report_via_api` for why `actor_id` is accepted but not
     sent.
     """
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0, headers=await _auth_headers()) as client:
         resp = await client.post(f"/api/v1/reviews/{report_id}/reject", json={"notes": notes})
     if resp.status_code == 400 and resp.json().get("error") == "notes_required":
         raise NotesRequiredError("notes_required")
@@ -206,7 +233,7 @@ async def ask_question_via_api(question: str, program_id: str | None, actor_id: 
     either, so this doesn't start now). See `approve_report_via_api` for
     why `actor_id` is accepted but not sent.
     """
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=120.0) as client:
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=120.0, headers=await _auth_headers()) as client:
         resp = await client.post(
             "/api/v1/chat/query",
             json={"question": question, "programId": program_id},
