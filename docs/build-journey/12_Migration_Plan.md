@@ -114,6 +114,18 @@ the others — installed at image build time via `npm ci`, never resolved at spa
 the reduced scope for the loop, then re-tag AOP to the full 6-feature scope and run once more:
 concurrency behaviour under 115 items is not exercised by 11.
 
+> **The reduced-scope leg may not be available when this phase starts — confirm before relying on
+> it, don't rediscover it here.** Phase 4 (CLAUDE.md Task 43) tried to re-tag AOP down and found no
+> safe, working way to remove a `Committed` tag in this environment: `az boards work-item update
+> --fields "System.Tags=X"` only ever ADDS to existing tags, never replaces or removes; `az rest`/
+> `az devops invoke` against `dev.azure.com` both fail for this org via the same real MSA/AAD
+> tenant-duality issue on record since Task 4 (a sign-in-page redirect instead of an API response);
+> and the project's own `ONEPULSE_ADO_PAT` is deliberately read-only. Phase 4's own verification ran
+> the full 115-item scope four times instead and treated that as the harder, load-bearing case. If
+> this phase needs the small-then-full pattern specifically (not just "a real run," but a genuine
+> low-concurrency-then-high-concurrency comparison), resolve a real tag-mutation path first — or pick
+> a different, genuinely small real project to register instead of trying to shrink AOP in place.
+
 ---
 
 ## Phase 6 — Managed Identity, replacing `az login`

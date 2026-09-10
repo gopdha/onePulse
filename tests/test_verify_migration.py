@@ -20,8 +20,11 @@ from onepulse_common.db import PostgresClient
 from verify_migration import (
     check_check_constraint_values,
     check_column_exists,
+    check_column_exists_in_schema,
     check_constraint_exists,
+    check_constraint_exists_in_schema,
     check_generated_column,
+    check_has_table_privileges,
     check_no_schema_privilege,
     check_policy_exists,
     check_privilege_revoked,
@@ -181,3 +184,70 @@ async def test_forced_failure_schema_privilege_check_detects_a_real_grant(conn) 
     # real schema) — proves this check can detect a real grant, not just
     # report True unconditionally.
     assert await check_no_schema_privilege(conn, "public", "app_role_local_dev") is False
+
+
+async def test_real_investigation_runs_columns_are_detected(conn) -> None:
+    # Merge-review finding: the original Phase 4 checks only proved the
+    # TABLE exists, never its actual column shape — every other real
+    # table in this schema gets column-level checks; this one hadn't.
+    # Run over the SAME app_role_local_dev connection every other check
+    # here uses, which has zero USAGE on `investigation` — proves this
+    # reads pg_catalog.pg_attribute directly, not information_schema.
+    # columns (which would be empty for this connection, same real
+    # visibility trap check_schema_exists's own docstring documents).
+    for column in ("cycle_id", "program_name", "status", "findings", "tower_hierarchy"):
+        assert await check_column_exists_in_schema(conn, "investigation", "investigation_runs", column) is True
+
+
+async def test_forced_failure_missing_column_in_schema_is_detected(conn) -> None:
+    assert await check_column_exists_in_schema(
+        conn, "investigation", "investigation_runs", "this_column_does_not_exist_1a2b3c"
+    ) is False
+
+
+async def test_forced_failure_column_in_wrong_schema_is_not_detected(conn) -> None:
+    # cycle_id genuinely does not live on any public.* table.
+    assert await check_column_exists_in_schema(conn, "public", "reports", "cycle_id") is False
+
+
+async def test_real_investigation_runs_status_check_constraint_is_detected(conn) -> None:
+    # Real, live-discovered gap fixed at merge review: check_constraint_
+    # exists's own `$1::regclass` cast fails with a real
+    # InsufficientPrivilegeError for this connection against a schema it
+    # has no USAGE on (identifier resolution itself needs schema
+    # visibility, unlike a plain pg_catalog WHERE-clause scan) — this is
+    # the schema-safe replacement, proven against the real constraint.
+    assert await check_constraint_exists_in_schema(
+        conn, "investigation", "investigation_runs", "investigation_runs_status_check"
+    ) is True
+
+
+async def test_forced_failure_missing_constraint_in_schema_is_detected(conn) -> None:
+    assert await check_constraint_exists_in_schema(
+        conn, "investigation", "investigation_runs", "this_constraint_does_not_exist_1a2b3c"
+    ) is False
+
+
+async def test_real_investigation_role_can_use_its_own_schema(conn) -> None:
+    # The first positive-grant check anywhere in this file — every other
+    # check here is structural existence or a negative/REVOKE proof.
+    # Proves investigation_role_local_dev genuinely holds real
+    # SELECT/INSERT/UPDATE on its own table, over the SAME
+    # app_role_local_dev connection every other test here uses (which
+    # cannot see the investigation schema at all) — proving the OID-
+    # based resolution this check uses is unaffected by the connecting
+    # role's own lack of access to the schema being asked about.
+    assert await check_has_table_privileges(
+        conn, "investigation", "investigation_runs", "investigation_role_local_dev",
+        ["SELECT", "INSERT", "UPDATE"],
+    ) is True
+
+
+async def test_forced_failure_has_table_privileges_detects_a_real_missing_grant(conn) -> None:
+    # app_role_local_dev genuinely has no grant at all on
+    # investigation.investigation_runs (the whole point of this
+    # boundary) — proves the check can report False, not just True
+    # unconditionally.
+    assert await check_has_table_privileges(
+        conn, "investigation", "investigation_runs", "app_role_local_dev", ["SELECT"]
+    ) is False

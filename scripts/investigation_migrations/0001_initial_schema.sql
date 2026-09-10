@@ -27,6 +27,32 @@
 -- file reached its current, correct shape — kept here as the honest
 -- record of a real mistake made and fixed, not smoothed over).
 --
+-- SECOND, MORE SUBTLE INSTANCE OF THE SAME TRAP, found only at merge
+-- review by adding the first positive-grant check this project's
+-- verify_migration.py has ever had (Migration Plan Phase 4, CLAUDE.md
+-- Task 43 merge follow-up): fixing the SCHEMA's owner does NOT fix the
+-- owner of any TABLE already created inside it — schema ownership and
+-- table ownership are independent in Postgres. `investigation.
+-- investigation_runs` itself was still owned by `app_role_local_dev`
+-- (from the same original pre-migrate_investigation.py run that caused
+-- the schema-ownership bug above), silently giving the Reporting role
+-- full implicit access to the very table this whole phase exists to
+-- wall off — undetected by every existence/negative-privilege check
+-- already in place, since none of them asked "can this role positively
+-- use this object" for the table itself. Fixed live via `ALTER TABLE
+-- investigation.investigation_runs OWNER TO investigation_role_local_dev`
+-- (as the real Postgres Entra Administrator — `app_role_local_dev`
+-- cannot run it: it lacks USAGE on the schema, and ownership alone
+-- doesn't let it reference a schema-qualified name it can't resolve).
+-- Not a defect in this migration file's own SQL: a genuinely fresh
+-- environment applying this file via `migrate_investigation.py`
+-- (connecting as the Investigation role throughout) gets correct
+-- ownership on both the schema AND the table from the very first
+-- `CREATE SCHEMA`/`CREATE TABLE` — this was purely residue from the one
+-- historical bad run, now cleaned up. The lesson generalizes: after any
+-- ownership-transfer cleanup, verify ownership of every object the
+-- schema contains individually, not just the schema itself.
+--
 -- Real, deliberate consequence of the split (ADR-020's own accepted
 -- trade-off, implemented as such, not worked around): `findings`
 -- (public schema) has a real FK to `reports`. Across the service

@@ -404,6 +404,24 @@ mid-run has its work redelivered rather than lost.
   INSERT-only with no upsert, so a repeat run reports "not persisted" rather than corrupting data.
 - Poison messages become a real failure mode. A dequeue-count limit and a dead-letter path must be
   built deliberately, not discovered.
+- **A stalled-but-alive consumer is a worse failure mode than a dead one, and the dequeue-count
+  limit does not catch it.** Confirmed live (Migration Plan Phase 4, CLAUDE.md Task 43): the queue's
+  own visibility-timeout mechanism only recovers a message when the consumer holding it actually
+  dies — a hard-killed Investigation process stops renewing its lease, the message goes visible
+  again, and a fresh consumer picks it up. A consumer that is *alive but stuck* (the pre-existing,
+  unresolved MCP-child-stall finding from Migration Plan Phase 3, CLAUDE.md Task 42 — a spawned
+  `node.exe` process silently exits while the parent Python process never notices and never returns
+  from its next read) keeps calling `update_message()` on its own lease-renewal schedule
+  indefinitely, because the renewal loop has no way to know the work it's renewing for has stopped
+  progressing. The message therefore never becomes visible again on its own, and the dequeue-count
+  limit never fires either, since the message is never redelivered in the first place for a fresh
+  attempt to count against. Once deployed, this is the most likely way a run hangs invisibly: not a
+  crash anyone gets paged for, just a `cycle_id` stuck at `running` forever with a real, silently
+  renewing lease behind it. The real fix is a lease-renewal cap (stop renewing, and let the message
+  go visible, after some bounded number of renewals) or a wall-clock ceiling on a cycle's total
+  processing time (fail the cycle outright past a generous real-world bound, independent of whether
+  the lease is still being renewed) — not built now; recorded here so it is designed for
+  deliberately in whichever phase first puts this system somewhere nobody is watching it live.
 - **The rule that makes the split real**: the Reporting service obtains findings from the
   Investigation service over HTTP. It never connects to the investigation schema. See ADR-020 for
   how that is enforced.

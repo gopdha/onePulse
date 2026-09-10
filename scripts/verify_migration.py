@@ -97,6 +97,32 @@ async def check_column_exists(conn: asyncpg.Connection, table_name: str, column_
     return result is not None
 
 
+async def check_column_exists_in_schema(
+    conn: asyncpg.Connection, schema_name: str, table_name: str, column_name: str
+) -> bool:
+    """Same real check as check_column_exists, generalized past the
+    hardcoded `public` schema — needed for Phase 4's own `investigation`
+    schema, for the identical real reason check_table_exists_in_schema
+    exists rather than reusing check_table_exists: information_schema.
+    columns is itself visibility-filtered by the connecting role's own
+    grants, and the whole point of this schema is that the role
+    verify_migration.py normally connects as (app_role_local_dev) has
+    zero access to it. Uses pg_catalog.pg_attribute directly (every role
+    can read it, regardless of schema-level grants), not
+    information_schema.columns.
+    """
+    result = await conn.fetchval(
+        "SELECT 1 FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3 AND a.attnum > 0 AND NOT a.attisdropped",
+        schema_name,
+        table_name,
+        column_name,
+    )
+    return result is not None
+
+
 async def check_generated_column(conn: asyncpg.Connection, table_name: str, column_name: str) -> bool:
     """information_schema.columns.is_generated is 'ALWAYS' for a real
     GENERATED ALWAYS AS (...) STORED column — distinguishes a genuine
@@ -143,6 +169,36 @@ async def check_constraint_exists(conn: asyncpg.Connection, table_name: str, con
     """
     result = await conn.fetchval(
         "SELECT 1 FROM pg_constraint WHERE conrelid = $1::regclass AND conname = $2",
+        table_name,
+        constraint_name,
+    )
+    return result is not None
+
+
+async def check_constraint_exists_in_schema(
+    conn: asyncpg.Connection, schema_name: str, table_name: str, constraint_name: str
+) -> bool:
+    """Same real check as check_constraint_exists, but for a table
+    outside `public` reached by a role with zero USAGE on that schema.
+    Real, live-discovered gap (Migration Plan Phase 4 merge review):
+    check_constraint_exists's `$1::regclass` cast is NOT safe here —
+    unlike a plain pg_catalog WHERE-clause scan (what
+    check_table_exists_in_schema/check_column_exists_in_schema use),
+    regclass identifier RESOLUTION itself checks schema USAGE privilege,
+    and fails with a real `InsufficientPrivilegeError: permission denied
+    for schema investigation` for app_role_local_dev against
+    `'investigation.investigation_runs'::regclass` — confirmed live, not
+    assumed. Joins pg_constraint directly against pg_class/pg_namespace
+    instead, exactly like the other schema-safe checks above, so
+    verifying a constraint on a schema this role is deliberately locked
+    out of doesn't itself require access to that schema.
+    """
+    result = await conn.fetchval(
+        "SELECT 1 FROM pg_catalog.pg_constraint co "
+        "JOIN pg_catalog.pg_class c ON c.oid = co.conrelid "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = $1 AND c.relname = $2 AND co.conname = $3",
+        schema_name,
         table_name,
         constraint_name,
     )
@@ -214,6 +270,51 @@ async def check_privilege_revoked(
     )
     granted = {r["privilege_type"] for r in rows}
     return not (granted & set(privileges))
+
+
+async def check_has_table_privileges(
+    conn: asyncpg.Connection, schema_name: str, table_name: str, role_name: str, privileges: list[str]
+) -> bool:
+    """The positive counterpart to check_privilege_revoked — true iff
+    role_name genuinely holds EVERY given privilege on table_name. No
+    prior check in this file asserts a positive grant anywhere (every
+    existing check is either structural existence or a negative/REVOKE
+    proof); Migration Plan Phase 4 needs one for the first time, since
+    "the split is real" depends not only on Reporting's role having NO
+    access to the investigation schema, but also on Investigation's own
+    role genuinely being ABLE to use its own schema — a fact nothing
+    upstream currently proves.
+
+    Real, live-discovered gap, found only by actually running this check
+    against the real database (not assumed from `has_schema_privilege`'s
+    own text-argument behavior just above): `has_table_privilege(role,
+    'schema.table'::text, privilege)` fails with the identical real
+    `InsufficientPrivilegeError: permission denied for schema
+    investigation` check_constraint_exists hit — text-identifier
+    resolution for a table needs to see the schema; asking about the
+    schema's own USAGE privilege by name apparently doesn't. The real
+    fix is the OID-based overload: resolve the table's OID via the same
+    safe pg_catalog join used everywhere else in this file, then pass
+    that OID (not the name) to `has_table_privilege` — resolving by OID
+    performs no further name lookup, so it isn't gated on schema
+    visibility the same way.
+    """
+    oid = await conn.fetchval(
+        "SELECT c.oid FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = $1 AND c.relname = $2",
+        schema_name,
+        table_name,
+    )
+    if oid is None:
+        return False
+    for privilege in privileges:
+        result = await conn.fetchval(
+            "SELECT has_table_privilege($1, $2::oid, $3)", role_name, oid, privilege
+        )
+        if not result:
+            return False
+    return True
 
 
 async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
@@ -293,6 +394,27 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
         ("table exists: investigation.investigation_runs",
          await check_table_exists_in_schema(conn, "investigation", "investigation_runs"))
     )
+
+    # Real column-level shape of investigation.investigation_runs — every
+    # column the Investigation service's own store.py reads/writes,
+    # checked individually (not just "the table exists"), same rigor
+    # every other real table in this schema already gets.
+    for column in (
+        "cycle_id", "program_name", "requested_by_actor_id", "status",
+        "queried_item_count", "findings", "tower_hierarchy", "error_detail",
+        "trace_context", "created_at", "updated_at",
+    ):
+        results.append(
+            (f"column exists: investigation.investigation_runs.{column}",
+             await check_column_exists_in_schema(conn, "investigation", "investigation_runs", column))
+        )
+    results.append(
+        ("CHECK constraint: investigation.investigation_runs.status (running/completed/failed)",
+         await check_constraint_exists_in_schema(
+             conn, "investigation", "investigation_runs", "investigation_runs_status_check"
+         ))
+    )
+
     results.append(
         ("Reporting role (app_role_local_dev) has NO access to investigation schema",
          await check_no_schema_privilege(conn, "investigation", "app_role_local_dev"))
@@ -300,6 +422,14 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
     results.append(
         ("Investigation role (investigation_role_local_dev) has NO access to public schema",
          await check_no_schema_privilege(conn, "public", "investigation_role_local_dev"))
+    )
+    results.append(
+        ("Investigation role (investigation_role_local_dev) genuinely CAN use its own schema "
+         "(SELECT/INSERT/UPDATE on investigation.investigation_runs)",
+         await check_has_table_privileges(
+             conn, "investigation", "investigation_runs", "investigation_role_local_dev",
+             ["SELECT", "INSERT", "UPDATE"],
+         ))
     )
 
     return results
