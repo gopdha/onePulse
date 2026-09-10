@@ -76,6 +76,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 
 from agent_framework.foundry import FoundryChatClient
@@ -130,7 +131,14 @@ VISIBILITY_TIMEOUT_SECONDS = 90
 LEASE_RENEWAL_INTERVAL_SECONDS = 45
 POLL_INTERVAL_SECONDS = 2.0
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+# Migration Plan Phase 5: explicit stdout, not basicConfig's own default
+# stream (stderr) — real container log collection (docker logs,
+# Application Insights in Phase 7) treats stdout/stderr differently
+# enough that this project's own real per-tool-call detail should be
+# unambiguous rather than incidentally caught by "stderr also gets
+# collected." No file destination existed here to move away from — this
+# service's own detail was always process-output only.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stdout)
 logger = logging.getLogger("onepulse.investigation")
 _tracer = trace.get_tracer(__name__)
 

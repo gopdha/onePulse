@@ -1,0 +1,20 @@
+# Real, load-bearing exclusion, not just build-speed hygiene: investigation/
+# node_modules must NEVER enter any image via COPY — the whole point of this
+# phase (Migration Plan Phase 5) is that @azure-devops/mcp is installed via
+# a real `npm ci` INSIDE the Investigation image's own build, from the
+# committed package.json/package-lock.json, never resolved or copied in at
+# spawn/build time from whatever happens to be on the host.
+investigation/node_modules
+
+.venv
+__pycache__
+*.pyc
+.git
+.pytest_cache
+logs
+output
+*.log
+
+# Real historical rendered-report artifacts sitting at the repo root -
+# never real input decks a service reads, never something an image needs.
+onepulse_status_report_demo.pptx

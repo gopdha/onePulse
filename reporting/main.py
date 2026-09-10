@@ -53,13 +53,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import datetime as dt
 import json
 import logging
 import os
-import re
+import sys
 import time
-from pathlib import Path
 
 import httpx
 from arize.otel import set_routing_context
@@ -117,14 +115,21 @@ FINDINGS_READY_POLL_VISIBILITY_SECONDS = 60
 STATUS_DECK_PATH_BY_PROJECT = {
     "singleSlide": "sample_status_deck.pptx",
     "Leave Tracker": "leave_tracker_status_deck.pptx",
+    # Real, pre-existing gap found incidentally while auditing this
+    # service's file dependencies for containerization (Migration Plan
+    # Phase 5) — Agentic AI Observability Platform has had its own real
+    # status deck (aiobs_status_deck.pptx, Task 27) sitting at the repo
+    # root this whole time, never actually wired in here. Every real AOP
+    # run before this fix silently fell through to
+    # DEFAULT_STATUS_DECK_PATH (singleSlide's own deck) for Status Update
+    # Analysis instead — a real correctness gap, unrelated to
+    # containerization itself, fixed because it would otherwise make this
+    # phase's own full-scope verification silently test the wrong file.
+    "Agentic AI Observability Platform": "aiobs_status_deck.pptx",
 }
 DEFAULT_STATUS_DECK_PATH = os.environ.get("ONEPULSE_STATUS_DECK_PATH", "sample_status_deck.pptx")
 
 _tracer = trace.get_tracer(__name__)
-
-
-def _sanitize_for_filename(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "project"
 
 
 def _log_exception_group(exc: BaseException, logger: logging.Logger, depth: int = 0) -> None:
@@ -233,18 +238,27 @@ async def _execute_cycle(
     requested_by_actor_id = str(cycle["requested_by_actor_id"])
     status_deck_path = STATUS_DECK_PATH_BY_PROJECT.get(program_name, DEFAULT_STATUS_DECK_PATH)
 
-    logs_dir = Path("logs")
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / f"{_sanitize_for_filename(program_name)}_{dt.datetime.now():%Y%m%d_%H%M%S}.log"
+    # Migration Plan Phase 5: logs move to stdout, not a per-cycle file.
+    # Container filesystems are ephemeral — Trade-off #12 made
+    # logs/<project>_<timestamp>.log the ONLY route to real per-tool-call
+    # detail, so that detail would otherwise simply vanish on a container
+    # restart. stdout is what `docker logs` collects today and what
+    # Application Insights will pick up in Phase 7 — same real content
+    # (every tool call, the full draft/revision text, every PASS/FAIL
+    # check), only the destination changes. The logger name still
+    # carries the real cycle_id so multiple cycles' output stays
+    # attributable in one shared stream, even though this project's
+    # single-consumer design means only one cycle is ever actually
+    # in flight at a time.
     file_logger = logging.getLogger(f"onepulse.reporting.{cycle_id}")
     file_logger.setLevel(logging.INFO)
     file_logger.propagate = False
     file_logger.handlers.clear()
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    file_logger.addHandler(file_handler)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
+    file_logger.addHandler(stream_handler)
 
-    print(f"[reporting] claimed cycle {cycle_id} — program={program_name!r}, log={log_path}")
+    print(f"[reporting] claimed cycle {cycle_id} — program={program_name!r}, log=stdout")
 
     stages = new_stage_state(TOTAL_STAGES)
     shared: dict = {}

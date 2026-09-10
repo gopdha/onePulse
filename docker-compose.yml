@@ -1,0 +1,125 @@
+# Migration Plan Phase 5 (still local — no registry, no Azure deployment,
+# no Managed Identity; that's Phase 6/7). This file is now the real source
+# of truth for the four-service process shape — the Runbook points here
+# rather than restating startup order.
+#
+# Deliberately NOT using a blanket `env_file: .env` per service: docker
+# compose auto-loads `.env` from this file's own directory purely for
+# ${VAR} interpolation *within this YAML* — it does not, by itself, inject
+# anything into a container. Each service below lists exactly the real
+# env vars its own code reads (confirmed by grep, not assumed), so
+# ONEPULSE_ADO_PAT is referenced in exactly one place: investigation's own
+# `environment:` block. That is the real, structural proof (not just
+# convention) that the PAT is reachable only by that container — the same
+# standard already used for the BFF's no-data-access guarantee.
+#
+# Streamlit is deliberately NOT in this file — see the Runbook for the
+# reasoning (it stays a host process, unaffected by this phase; Phase 9
+# replaces it with a real React frontend rather than ever containerizing
+# it).
+#
+# az login credentials: real Managed Identity is Phase 6 work. Until
+# then, DefaultAzureCredential's AzureCliCredential fallback needs a real
+# `az` CLI binary (present in every image here) plus real, already-
+# authenticated CLI state. A bind-mount of the host's own ~/.azure does
+# NOT work across a Windows-host/Linux-container boundary — az CLI
+# encrypts its token cache with the host OS's native secret storage
+# (DPAPI on Windows), which a Linux container cannot decrypt (confirmed
+# live, CLAUDE.md Task 44: a bind-mounted Windows .azure directory
+# produces a real "User ... does not exist in MSAL token cache" error,
+# not a permissions problem). The real, working fix is the named volume
+# below: a one-time `az login --use-device-code` run once, inside a
+# container using this same volume, produces a genuinely Linux-native
+# token cache every container sharing the volume can then use — see the
+# Runbook for the exact one-time command.
+volumes:
+  azure_cli_state:
+
+services:
+  core_api:
+    build:
+      context: .
+      dockerfile: core_api/Dockerfile
+    image: onepulse-core-api:phase5
+    ports:
+      - "8000:8000"
+    volumes:
+      - azure_cli_state:/root/.azure
+      - ./docker_logs:/var/log/onepulse
+    environment:
+      ONEPULSE_PG_ROLE: app_role_local_dev
+      ONEPULSE_FOUNDRY_PROJECT_ENDPOINT: ${ONEPULSE_FOUNDRY_PROJECT_ENDPOINT}
+      ONEPULSE_FOUNDRY_DEPLOYMENT_NAME: ${ONEPULSE_FOUNDRY_DEPLOYMENT_NAME}
+      ONEPULSE_ENTRA_TENANT_ID: ${ONEPULSE_ENTRA_TENANT_ID}
+      ONEPULSE_CORE_API_APP_ID: ${ONEPULSE_CORE_API_APP_ID}
+      ONEPULSE_CORE_API_IDENTIFIER_URI: ${ONEPULSE_CORE_API_IDENTIFIER_URI}
+      ONEPULSE_ARIZE_SPACE_ID: ${ONEPULSE_ARIZE_SPACE_ID}
+      ONEPULSE_ARIZE_API_KEY: ${ONEPULSE_ARIZE_API_KEY}
+      ONEPULSE_DEBUG_SPAN_LOG: ${ONEPULSE_DEBUG_SPAN_LOG:-/var/log/onepulse/spans.jsonl}
+
+  bff:
+    build:
+      context: .
+      dockerfile: bff/Dockerfile
+    image: onepulse-bff:phase5
+    depends_on:
+      - core_api
+    ports:
+      - "8100:8100"
+    volumes:
+      - azure_cli_state:/root/.azure
+      - ./docker_logs:/var/log/onepulse
+    environment:
+      # Real container-network address — core API's published host port
+      # (8000) is irrelevant here; bff reaches it by compose service name
+      # on the shared bridge network, never localhost.
+      ONEPULSE_CORE_API_BASE_URL: http://core_api:8000
+      ONEPULSE_CORE_API_IDENTIFIER_URI: ${ONEPULSE_CORE_API_IDENTIFIER_URI}
+      ONEPULSE_STUB_ENTRA_OBJECT_ID: ${ONEPULSE_STUB_ENTRA_OBJECT_ID}
+      ONEPULSE_APPINSIGHTS_CONNECTION_STRING: ${ONEPULSE_APPINSIGHTS_CONNECTION_STRING}
+      ONEPULSE_ARIZE_SPACE_ID: ${ONEPULSE_ARIZE_SPACE_ID}
+      ONEPULSE_ARIZE_API_KEY: ${ONEPULSE_ARIZE_API_KEY}
+      ONEPULSE_DEBUG_SPAN_LOG: ${ONEPULSE_DEBUG_SPAN_LOG:-/var/log/onepulse/spans.jsonl}
+
+  investigation:
+    build:
+      context: .
+      dockerfile: investigation/Dockerfile
+    image: onepulse-investigation:phase5
+    ports:
+      - "8200:8200"
+    volumes:
+      - azure_cli_state:/root/.azure
+      - ./docker_logs:/var/log/onepulse
+    environment:
+      ONEPULSE_INVESTIGATION_PG_ROLE: investigation_role_local_dev
+      ONEPULSE_FOUNDRY_PROJECT_ENDPOINT: ${ONEPULSE_FOUNDRY_PROJECT_ENDPOINT}
+      ONEPULSE_FOUNDRY_DEPLOYMENT_NAME: ${ONEPULSE_FOUNDRY_DEPLOYMENT_NAME}
+      ONEPULSE_ADO_ORG: ${ONEPULSE_ADO_ORG}
+      # The one and only place this project ever wires this variable into
+      # a container environment — see this file's own header comment.
+      ONEPULSE_ADO_PAT: ${ONEPULSE_ADO_PAT}
+      ONEPULSE_ARIZE_SPACE_ID: ${ONEPULSE_ARIZE_SPACE_ID}
+      ONEPULSE_ARIZE_API_KEY: ${ONEPULSE_ARIZE_API_KEY}
+      ONEPULSE_DEBUG_SPAN_LOG: ${ONEPULSE_DEBUG_SPAN_LOG:-/var/log/onepulse/spans.jsonl}
+
+  reporting:
+    build:
+      context: .
+      dockerfile: reporting/Dockerfile
+    image: onepulse-reporting:phase5
+    depends_on:
+      - investigation
+    volumes:
+      - azure_cli_state:/root/.azure
+      - ./docker_logs:/var/log/onepulse
+    environment:
+      ONEPULSE_PG_ROLE: app_role_local_dev
+      ONEPULSE_FOUNDRY_PROJECT_ENDPOINT: ${ONEPULSE_FOUNDRY_PROJECT_ENDPOINT}
+      ONEPULSE_FOUNDRY_DEPLOYMENT_NAME: ${ONEPULSE_FOUNDRY_DEPLOYMENT_NAME}
+      # Real container-network address, same reasoning as bff's
+      # ONEPULSE_CORE_API_BASE_URL above.
+      ONEPULSE_INVESTIGATION_BASE_URL: http://investigation:8200
+      ONEPULSE_ARIZE_SPACE_ID: ${ONEPULSE_ARIZE_SPACE_ID}
+      ONEPULSE_ARIZE_API_KEY: ${ONEPULSE_ARIZE_API_KEY}
+      ONEPULSE_DEBUG_SPAN_LOG: ${ONEPULSE_DEBUG_SPAN_LOG:-/var/log/onepulse/spans.jsonl}

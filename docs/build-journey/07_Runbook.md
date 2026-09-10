@@ -33,25 +33,33 @@ the pipeline. See §6 for the failure signature when it has lapsed.
 
 ### Via the UI (recommended for demos)
 
-**As of Migration Plan Phase 4, FIVE processes must be running together** — Investigation is now
-its own service, coordinated with Reporting through two real Azure Storage Queues rather than an
-in-process function call. `worker/` was renamed `reporting/` (it's still the same claim-a-cycle,
-run-stages-2-7 process Phase 3 built); a new `investigation/main.py` service owns stage 1 entirely.
-Reviews, the report list/detail, and chat still go through the BFF → core API, unchanged from Phase
-2/3; the BFF/core API themselves never talk to Investigation directly — only Reporting does.
+**As of Migration Plan Phase 5, the four backend services run as containers, and `docker-compose.yml`
+(repo root) is the real source of truth for the process shape — not this document.** It defines all
+four service images, their dependency order, env var wiring, and port mapping directly; read it
+rather than looking here for the literal startup sequence, which this Runbook no longer restates.
+Streamlit stays a host process, deliberately not in the compose file — see its own header comment
+for why (still local-first, and Phase 9 replaces it with a real frontend rather than ever
+containerizing it).
+
+**One-time setup, before the first `docker compose up`:** real Managed Identity is Phase 6 work: for
+now, every container falls back to `DefaultAzureCredential`'s `AzureCliCredential`, same as every
+local process before this phase — but a bind-mount of your own `~/.azure` does **not** work across a
+Windows-host/Linux-container boundary (az CLI's token cache is DPAPI-encrypted on Windows, which a
+Linux container cannot decrypt — confirmed live, not assumed; see §6). Populate the shared named
+volume once instead, from inside a real container:
 
 ```powershell
-uvicorn core_api.main:app --port 8000        # terminal 1, from the repo root — start this first
-uvicorn bff.main:app --port 8100             # terminal 2 — depends on core_api already running
-uvicorn investigation.main:app --port 8200   # terminal 3 — the Investigation service; start before reporting
-python -m reporting.main                     # terminal 4 — polls cycles AND dispatches to Investigation over the queue
-streamlit run Home.py                        # terminal 5
+docker compose run --rm --entrypoint az core_api login --use-device-code
 ```
 
-Order matters more than in Phase 3: Reporting's first real action on claiming a cycle is sending an
-`investigation-requests` message, so Investigation should already be listening before Reporting
-claims real work (a message sent to a not-yet-running consumer just waits in the queue — nothing
-breaks, but it's a needless delay while you're paying attention to it live).
+Follow the printed URL/code once, in a browser, signing in with the same account you'd normally
+`az login` with. Every container mounts the same `azure_cli_state` volume, so this is genuinely a
+one-time step — not per-service, and not per-restart.
+
+```powershell
+docker compose up --build     # core_api, bff, investigation, reporting — in the order the file declares
+streamlit run Home.py         # separate terminal, host process, unchanged
+```
 
 Select a project from the dropdown (nothing loads until you do), then click Generate Status Report.
 
@@ -85,10 +93,27 @@ Reporting itself still loses the in-flight run (Reporting's own claim has no que
 it — same as Phase 3, deliberately unchanged, since Reporting's own dispatch-to-Investigation step is
 idempotent and safe to just re-trigger).
 
-The full-fidelity log file (`logs/<project>_<timestamp>.log`) is still written by Reporting, same
-real content as before for stages 2-7; Investigation's own per-tool-call detail is not in that file
-— it's in Investigation's own process output (or, when actually needed for live incident diagnosis,
-`ONEPULSE_DEBUG_SPAN_LOG` on both services shows the real span chain, see §4).
+**Re-confirmed unchanged in containers (Migration Plan Phase 5, CLAUDE.md Task 44):** `docker kill
+05onepulse-investigation-1` mid-run, then `docker compose up -d investigation` once the message
+reappears (watch with the same real queue-peek technique), reproduces the identical real
+before-and-after — the message goes invisible, reappears within the same real ~90s window, a fresh
+container consumes it, and the run completes. `docker kill` sends `SIGKILL` directly (confirmed via
+`docker compose ps -a` showing `Exited (137)`), an even more real "the process cannot clean up after
+itself" test than a process-tree `taskkill` was.
+
+**Real, expected asymmetry — don't try to shrink it:** `onepulse-investigation:phase5` is
+substantially larger than the other three images (~1.83GB vs. ~1.33GB each, confirmed via `docker
+images`) — the real cost of Node.js plus 219 npm packages living in exactly one container instead of
+being a tax every service pays. This is Phase 4's own split made visible, not a regression to
+optimize away this phase.
+
+**As of Migration Plan Phase 5, the full-fidelity log moved to stdout** — container filesystems are
+ephemeral, so the old `logs/<project>_<timestamp>.log` file would simply vanish on a container
+restart, losing the only route to real per-tool-call detail (Trade-off #12). Same real content as
+before (every tool call, the full draft/revision text, every PASS/FAIL check) for both Reporting and
+Investigation; view it with `docker compose logs -f reporting` / `docker compose logs -f
+investigation`. `ONEPULSE_DEBUG_SPAN_LOG` (see §4) still shows the real cross-service span chain when
+needed for trace diagnosis.
 
 **Why two services instead of one, as of Phase 2 (ADR-017/ADR-018):** the BFF owns session,
 identity resolution, and response shaping for the frontend — it holds no database connection, no
@@ -216,6 +241,43 @@ Empty output means it's genuinely never been committed.
 
 ## 6. Common Real Gotchas
 
+- **A stale host-level process bound to `127.0.0.1` on the same port a container publishes to
+  `0.0.0.0` can silently intercept traffic meant for the container — Windows allows both bindings to
+  coexist without a "port already in use" error.** Confirmed live (Migration Plan Phase 5): leftover
+  host processes from before this project's own local-process phase (never killed when switching to
+  containers) kept `127.0.0.1:8000/8100/8200` bound while the containers correctly bound
+  `0.0.0.0:8000/8100/8200` — `curl http://127.0.0.1:...` and every test against that address were
+  silently hitting the stale host process, not the container, producing a confusing "the container
+  never receives anything" symptom with no error anywhere. Before trusting any container-based test,
+  confirm nothing non-Docker still holds the same ports: `netstat -ano | grep LISTENING | grep
+  :8000` — if more than one PID appears, or a PID isn't the expected `com.docker.backend`-style
+  proxy, kill the extras first. The exact same underlying lesson as the stale-process gotcha above,
+  now recurring for a third time in this project's history — always confirm which process actually
+  answered before trusting a result.
+- **`@azure-devops/mcp` transitively depends on `keytar` (native credential-storage bindings), which
+  needs `libsecret-1.so.0` at real runtime — absent from a minimal `python:3.12-slim` + Node.js image,
+  and the resulting failure gives no hint of the real cause.** Confirmed live (Migration Plan Phase 5):
+  the ADO MCP server crashed immediately on spawn inside the Investigation container, surfacing all
+  the way up to Reporting as an opaque `mcp.shared.exceptions.MCPError: Connection closed` /
+  `unhandled errors in a TaskGroup (1 sub-exception)`, with the real cause (`Error: libsecret-1.so.0:
+  cannot open shared object file`) visible only by exec'ing into the running container and spawning
+  the server binary directly (`docker compose exec investigation node
+  investigation/node_modules/@azure-devops/mcp/dist/index.js ...`) — never in any log this project
+  already had, since the MCP client bridge doesn't surface the spawned child's own stderr. Fixed by
+  adding `libsecret-1-0` to the Investigation image's `apt-get install` list. If any future MCP-server
+  dependency changes, re-verify by spawning it directly inside the container rather than trusting a
+  clean `npm ci`.
+- **A bind-mounted `~/.azure` does not work across a Windows-host/Linux-container boundary — az
+  CLI's token cache is encrypted with the host OS's native secret storage (DPAPI on Windows) by
+  default, and a Linux container has no way to decrypt it.** Confirmed live (Migration Plan Phase 5):
+  `docker run -v "$USERPROFILE/.azure:/root/.azure" mcr.microsoft.com/azure-cli az account
+  get-access-token` correctly reads the plaintext `azureProfile.json` (enough to know which user
+  *should* have a cached token) but fails with `ERROR: User '...' does not exist in MSAL token
+  cache. Run az login.` — a real decode/lookup failure, not a missing-file or permissions problem.
+  The working fix is a real, one-time `az login --use-device-code` run inside a container using a
+  shared **named volume** (not a bind-mount of the host path) — see §2 — which produces a genuinely
+  Linux-native token cache every container sharing that volume can then use exactly like a normal
+  `az login` session, going forward.
 - **A Postgres Flexible Server client-IP allowlist rule drifts silently — a real network reconnect
   mid-session (a new public IP) causes every NEW connection to hang and time out
   (`OSError: [WinError 121] The semaphore timeout period has expired`) while already-open pool
