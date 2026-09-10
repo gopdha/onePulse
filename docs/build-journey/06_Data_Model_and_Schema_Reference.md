@@ -48,43 +48,68 @@ Before applying the schema, the actual real JSON shapes being produced by the li
 
 ## Real Application Role Privileges (as Actually Verified, Not Assumed)
 
-**Correction (2026-09-09):** this section previously claimed `app_role_local_dev` has "the same
-effective privileges as `app_role`... for testing purposes," and that both roles are limited to
-`SELECT`+`INSERT` on `findings`/`untracked_items` with no `UPDATE`/`DELETE` "at all." Both claims
-are false for `app_role_local_dev` — confirmed via a direct query of
-`information_schema.table_privileges` against every real table in the schema (11 tables, not one).
-`app_role_local_dev` holds strictly more privileges than `app_role` on every table except
-`approval_records`:
+**Superseded 2026-09-10 (Migration Plan Phase 6, CLAUDE.md Task 45).** The table this section
+previously carried (dated 2026-09-09) documented a real asymmetry that existed at the time —
+`app_role_local_dev` holding strictly more privileges than `app_role` on every table except
+`approval_records` — but that asymmetry was itself an artifact of table **ownership**, not a
+deliberate grant design: `app_role_local_dev` owned all 12 `public` tables (every migration had
+always connected as it), and Postgres gives an owner every privilege unconditionally regardless of
+any `GRANT`/`REVOKE` layered on top. ADR-023 (2026-09-10) retroactively transferred ownership to
+`app_role` — the real, already-provisioned workload identity — and in doing so found the true grant
+picture underneath was never what either the old table above or the original "same privileges"
+claim described. Both were wrong, in opposite directions, for the same underlying reason: nobody
+had checked whether an observed privilege was a real ACL entry or an ownership artifact. See
+ADR-023 and Governance & Security Reference §6 for the full account of both directions of this bug.
 
-| Table | `app_role` | `app_role_local_dev` |
-|---|---|---|
-| `actor_scope` | INSERT, SELECT | DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE |
-| `actors` | INSERT, SELECT | DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE |
-| `approval_records` | INSERT, SELECT | INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE |
-| `configurations` | INSERT, SELECT, UPDATE | DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE |
-| `findings` | INSERT, SELECT | DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE |
-| `portfolios` | INSERT, SELECT | DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE |
-| `programs` | INSERT, SELECT | DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE |
-| `reports` | INSERT, SELECT, UPDATE | DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE |
-| `tenants` | INSERT, SELECT | DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE |
-| `untracked_items` | INSERT, SELECT | DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE |
-| `usage_ledger` | INSERT, SELECT | DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE |
+**Current, live-verified state, both application schemas, confirmed by direct query of
+`information_schema`/`pg_catalog` — not the migration files' stated intent:**
 
-`app_role` — the production/workload identity — matches the original description: `UPDATE` allowed
-on `reports`/`configurations`, `DELETE` not granted anywhere (a real, deliberate gap, not an
-explicit `REVOKE`). `approval_records` is the **one** table where the original "same privileges"
-claim holds: both roles genuinely lack `UPDATE`/`DELETE` there — the one table with an *explicit*
-`REVOKE UPDATE, DELETE`, as opposed to every other table, where `app_role`'s narrower grants simply
-were never widened. This narrower fact is Task 15's actual, original finding
-("[`app_role_local_dev`] received the identical `REVOKE UPDATE, DELETE` in Task 14's migration" —
-true, but scoped to that one table). It was later over-generalized into a schema-wide equivalence
-claim that direct testing does not support.
+`app_role` and `app_role_local_dev` now hold **genuinely identical** real grants on every one of the
+12 `public` tables — the original design intent (`create_app_role_local_dev.sql`: "must grant this
+role the identical table-level privileges it grants `app_role`... divergence here would mean local
+dev stops being genuine evidence about what the deployed workload can actually do") is true for the
+first time, not merely stated:
 
-The two roles share no role-membership relationship in either direction (`pg_auth_members` confirms
-no nesting either way); the only real overlap is that the human developer identity is a plain member
-of both, which is how a local session can authenticate as either — not evidence they carry equal
-grants. Since this system is currently local-first, `app_role_local_dev` — the **more** permissive
-role — is also the one that runs everything today, including the full test suite, not `app_role`.
+| Table | Real grants (both roles, identical) |
+|---|---|
+| `tenants`, `portfolios`, `programs`, `findings`, `untracked_items`, `actors`, `actor_scope`, `usage_ledger`, `approval_records` | SELECT, INSERT |
+| `configurations`, `reports`, `cycles` | SELECT, INSERT, UPDATE |
+
+`approval_records` additionally has `UPDATE`/`DELETE` explicitly `REVOKE`d from both roles (the
+append-only guarantee — Governance & Security Reference §2), and `DELETE` is granted nowhere at all,
+same as always. **`app_role` genuinely owns all 12 tables and their 6 sequences** (confirmed by
+direct `pg_class.relowner` query) — `FORCE ROW LEVEL SECURITY` is set on `reports` specifically so
+this ownership cannot bypass `tenant_isolation` (see Trade-off #9).
+
+**One real, additional, narrowly-scoped grant beyond the flat table above, found and needed only
+because of a genuine Postgres mechanic, not a design choice:** both roles also hold column-level
+`UPDATE` on exactly one column each of `tenants`, `portfolios`, `programs`, `actors`, and `findings`
+— their own real primary key, the column every real foreign key in this schema references.
+Postgres's internal FK-check row lock (`SELECT ... FOR KEY SHARE`, run automatically on every
+`INSERT` into a table with a foreign key) requires `UPDATE` on the referenced table, not merely
+`SELECT` — confirmed by direct, isolated empirical test (ADR-023), not assumed from documentation.
+Scoped to the single referenced column specifically (not a blanket table-level `UPDATE`), confirmed
+sufficient by the same test.
+
+`investigation.investigation_runs` — `investigation_role` and `investigation_role_local_dev` are
+likewise identical: `SELECT, INSERT, UPDATE`, no `DELETE`/`TRUNCATE`/`REFERENCES`/`TRIGGER`. Real,
+if smaller, repeat of the exact ADR-023 finding: `investigation_role` picked up the same
+owner-implicit widening the moment it became the schema's real owner (Migration Plan Phase 6,
+Task 45), fixed by the identical `REVOKE ALL` + re-`GRANT` pattern
+(`investigation_migrations/0002_reassert_investigation_grants.sql`). This table has no foreign keys
+in or out, so the FK-check column-level grant does not apply here.
+
+**Cross-schema isolation, both directions, reconfirmed live as part of this same audit:**
+`app_role`/`app_role_local_dev` have zero `USAGE` on `investigation`; `investigation_role`/
+`investigation_role_local_dev` have zero `USAGE` on `public`. Structural, not disciplinary — the
+same real adversarial standard `tests/test_investigation_schema_isolation.py` already proves.
+
+The two role PAIRS (`app_role`/`app_role_local_dev`, `investigation_role`/`investigation_role_local_dev`)
+share no role-membership relationship with each other (`pg_auth_members` confirms no nesting). The
+human developer identity is a plain member of `app_role`, `app_role_local_dev`, and
+`investigation_role_local_dev` — which is how a local session can authenticate as any of them, not
+evidence any two of them carry equal grants by construction; each pair's equality above was verified
+independently, not inferred from membership.
 
 ---
 

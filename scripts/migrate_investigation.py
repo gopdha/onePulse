@@ -41,10 +41,20 @@ load_dotenv()
 MIGRATIONS_DIR = Path(__file__).parent / "investigation_migrations"
 
 TARGETS: dict[str, PostgresSettings] = {
+    # Real decision (Migration Plan Phase 6, mirroring migrate.py's own
+    # ADR-023 fix exactly): connects as investigation_role, not
+    # investigation_role_local_dev, by default. Same root cause this
+    # would otherwise repeat — whichever role runs a migration becomes
+    # the owner of anything it creates — confirmed live for this exact
+    # schema during Phase 6's own bootstrap: investigation_role picked
+    # up unintended owner-implicit DELETE/TRUNCATE/REFERENCES/TRIGGER/
+    # MAINTAIN on investigation_runs the moment ownership transferred,
+    # fixed by 0002_reassert_investigation_grants.sql. A fresh migration
+    # run under this new default never hits that gap in the first place.
     "dev": PostgresSettings(
         host="onepulse-pg-dev.postgres.database.azure.com",
         database="onepulse",
-        role_name=os.environ.get("ONEPULSE_INVESTIGATION_PG_ROLE", "investigation_role_local_dev"),
+        role_name=os.environ.get("ONEPULSE_INVESTIGATION_PG_ROLE", "investigation_role"),
     ),
 }
 

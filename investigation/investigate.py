@@ -34,6 +34,7 @@ from typing import Callable
 
 from agent_framework import Agent
 from agent_framework.foundry import FoundryChatClient
+from azure.keyvault.secrets.aio import SecretClient
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -369,6 +370,32 @@ def load_ado_pat(raw_pat: str | None = None) -> str:
             "Personal Access Token (Work Items: Read scope only)."
         )
     return base64.b64encode(f":{raw_pat}".encode()).decode()
+
+
+ADO_PAT_KEY_VAULT_URL = os.environ.get("ONEPULSE_ADO_PAT_KEY_VAULT_URL", "https://onepulse-kv-dev.vault.azure.net/")
+ADO_PAT_SECRET_NAME = "ado-pat"
+
+
+async def fetch_ado_pat_from_keyvault(async_credential, vault_url: str | None = None) -> str:
+    """Migration Plan Phase 6: the real, current source of the ADO PAT —
+    replaces the plain `ONEPULSE_ADO_PAT` env var this project used
+    through Phase 5. `scripts/run_pipeline.py` (the disclosed, kept-for-
+    history CLI exception — see its own docstring) deliberately still
+    reads the env var directly via `load_ado_pat()`'s original fallback;
+    this function is the real service's own path, called once here and
+    composed with `load_ado_pat(raw_pat)` for the actual base64 encoding,
+    so that encoding logic stays a single, pure implementation either way.
+
+    Access to this secret is granted, by real Key Vault RBAC role
+    assignment, to the Investigation service's own Managed Identity
+    ONLY — not core_api's, not bff's, not reporting's. See CLAUDE.md
+    Task 45 for the direct verification that this boundary actually
+    holds, not merely that it was configured.
+    """
+    vault_url = vault_url or ADO_PAT_KEY_VAULT_URL
+    async with SecretClient(vault_url=vault_url, credential=async_credential) as client:
+        secret = await client.get_secret(ADO_PAT_SECRET_NAME)
+        return secret.value
 
 
 def _ado_mcp_server_entry_path() -> Path:
