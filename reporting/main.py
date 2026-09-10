@@ -53,11 +53,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 import httpx
 from arize.otel import set_routing_context
@@ -128,6 +130,57 @@ STATUS_DECK_PATH_BY_PROJECT = {
     "Agentic AI Observability Platform": "aiobs_status_deck.pptx",
 }
 DEFAULT_STATUS_DECK_PATH = os.environ.get("ONEPULSE_STATUS_DECK_PATH", "sample_status_deck.pptx")
+
+# Task 44 follow-up (2026-09-10): the mapping above was never the only
+# thing that could go wrong. `sample_status_deck.pptx` — singleSlide's
+# own mapped file — was found to be silently holding a different
+# project's real content (most likely a stale artifact from real AOP
+# deck-preparation work, per docs/build-journey/03_Build_Timeline.md's
+# Phase 15, that saved to the wrong filename) for days, with nothing
+# ever checking that the bytes on disk still matched what the mapping
+# above intended. A dict entry pointing at the right PATH says nothing
+# about whether that path's CONTENT is still what it was when the
+# mapping was written. This is a real, deterministic content-hash pin,
+# not a text-search heuristic — deliberately NOT "does the deck mention
+# its own project name," since singleSlide's own real, original,
+# correct deck (scripts/create_sample_status_deck.py) never has and
+# still doesn't. Recompute and update the expected hash here ONLY as a
+# deliberate act (a real new deck was authored and reviewed), never as
+# a way to make a failing check pass.
+STATUS_DECK_SHA256_BY_PROJECT = {
+    "singleSlide": "b7384f261f4762927f96a9feee3b0063e6137d221555782145c05d3a6416bf10",
+    "Leave Tracker": "54edbb7c3898fb7fc72597a567d545723652a6f53c319cb0207b07172d95755f",
+    "Agentic AI Observability Platform": "c21ff3ee35ed2bf411ca55be575ba744473773528e2c560ca225a63b6a70d68c",
+}
+
+
+class StatusDeckIntegrityError(RuntimeError):
+    """Raised when the deck a run is about to read doesn't correspond to
+    the project it's supposedly for — either no known-good hash is
+    registered at all, or the file's real bytes have drifted since one
+    was. The failure mode this exists to eliminate: wrong input, no
+    error, believable output (Task 44's original finding)."""
+
+
+def _verify_status_deck_integrity(program_name: str, deck_path: str) -> None:
+    expected = STATUS_DECK_SHA256_BY_PROJECT.get(program_name)
+    if expected is None:
+        raise StatusDeckIntegrityError(
+            f"No known-good status deck hash registered for {program_name!r} — "
+            f"refusing to read {deck_path!r} unverified. Register its real sha256 "
+            f"in STATUS_DECK_SHA256_BY_PROJECT once its content has been reviewed "
+            f"and confirmed correct for this project."
+        )
+    actual = hashlib.sha256(Path(deck_path).read_bytes()).hexdigest()
+    if actual != expected:
+        raise StatusDeckIntegrityError(
+            f"Status deck integrity check failed for {program_name!r}: {deck_path!r} "
+            f"does not match its registered content (expected sha256 {expected}, got "
+            f"{actual}). Its bytes have changed since this mapping was established — "
+            f"do not trust its content until you've confirmed why and, if the new "
+            f"content is deliberate and correct, re-registered the new hash."
+        )
+
 
 _tracer = trace.get_tracer(__name__)
 
@@ -283,6 +336,12 @@ async def _execute_cycle(
             async with pg_client.pool.acquire() as writer_conn:
                 writer_task = asyncio.create_task(_progress_writer(writer_conn, cycle_id, queue))
                 try:
+                    # Checked before dispatching to Investigation at all —
+                    # fail fast and cheap rather than spend a real
+                    # Investigation run (Foundry cost, ADO calls) only to
+                    # find at Stage 2 that the deck it's about to read
+                    # doesn't correspond to this project (Task 44 follow-up).
+                    _verify_status_deck_integrity(program_name, status_deck_path)
                     on_stage(1, TOTAL_STAGES, f"Investigation — dispatched to Investigation service for '{program_name}'")
                     await _dispatch_investigation_request(
                         investigation_requests_client, cycle_id, program_name, requested_by_actor_id
