@@ -42,6 +42,11 @@ dependencies = [
     # is the real, confirmed-working path.
     "azure-search-documents>=12.0.0",
     "openai>=3.8.0",
+    # Migration Plan Phase 4 (ADR-019): real Azure Storage Queues
+    # (onepulsequeuesdev), Managed Identity / DefaultAzureCredential
+    # auth only (allowSharedKeyAccess=false on the storage account) —
+    # no account key, ever.
+    "azure-storage-queue>=12.17.0",
     # Local-first UI home (Home.py + pages/) — presentation layer only,
     # calls onepulse_common.pipeline / human_governance / chat_assistant
     # directly rather than reimplementing any of their logic.

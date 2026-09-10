@@ -66,13 +66,15 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+from agent_framework.foundry import FoundryChatClient
 from arize.otel import set_routing_context
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 from opentelemetry import trace
 
+from investigation.investigate import investigate, load_ado_pat
 from onepulse_common.observability import ARIZE_PROJECT_NAME, enable_observability
-from onepulse_common.pipeline import load_ado_pat, run_pipeline_cycle
+from onepulse_common.pipeline import TOTAL_STAGES, run_reporting_stages
 
 load_dotenv()
 
@@ -154,12 +156,43 @@ async def main(ado_project_name: str) -> None:
                 root_span.set_attribute("onepulse.ado_org", ADO_ORG_NAME)
                 root_span.set_attribute("onepulse.ado_project", ado_project_name)
 
-                result = await run_pipeline_cycle(
-                    ado_pat_b64=ado_pat_b64,
+                # Migration Plan Phase 4: this CLI is the one real,
+                # deliberate exception to "Investigation and Reporting
+                # are separate processes coordinated by a queue" — a
+                # standalone, un-queued, in-process composition for
+                # scripted/headless local use, same shape this project
+                # has kept since Task 9/18. It is the ONE place allowed
+                # to import both `investigation.investigate` (Node/ADO
+                # PAT-adjacent) and `onepulse_common.pipeline`
+                # (Reporting-stage logic) together — see
+                # `onepulse_common.pipeline.run_reporting_stages`'s own
+                # docstring for why that composition can't live in the
+                # shared library itself. Each function builds its own
+                # real FoundryChatClient internally — two lightweight
+                # instances instead of one shared one, the same real
+                # shape the actual Investigation/Reporting services have
+                # once split into separate processes, not a regression.
+                investigation_chat_client = FoundryChatClient(
+                    project_endpoint=PROJECT_ENDPOINT, model=DEPLOYMENT_NAME, credential=credential
+                )
+
+                print_stage(
+                    1, TOTAL_STAGES,
+                    f"Investigation — querying real Committed-tagged Features + children in '{ado_project_name}'",
+                )
+                findings, queried_item_count, tower_hierarchy = await investigate(
+                    investigation_chat_client, ado_pat_b64, ADO_ORG_NAME, ado_project_name, print_detail
+                )
+                for f in findings:
+                    print_detail(f"#{f['work_item_id']} {f['title']} — {f['status']}")
+
+                result = await run_reporting_stages(
+                    findings=findings,
+                    queried_item_count=queried_item_count,
+                    tower_hierarchy=tower_hierarchy,
                     project_endpoint=PROJECT_ENDPOINT,
                     deployment_name=DEPLOYMENT_NAME,
                     credential=credential,
-                    ado_org_name=ADO_ORG_NAME,
                     ado_project_name=ado_project_name,
                     status_deck_path=STATUS_DECK_PATH,
                     pptx_mcp_server_path=PPTX_MCP_SERVER_PATH,

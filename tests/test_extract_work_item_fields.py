@@ -36,7 +36,7 @@ import json
 
 import pytest
 
-from onepulse_common.pipeline import GuardMarkerParseError, _extract_work_item_fields
+from investigation.investigate import GuardMarkerParseError, _extract_work_item_fields
 
 _HASH = "fd4e0bd86b38dd826b0b861ce464bd4d"
 

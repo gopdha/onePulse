@@ -18,8 +18,8 @@ from pathlib import Path
 
 import pytest
 
-from onepulse_common import pipeline
-from onepulse_common.pipeline import _ado_mcp_server_entry_path, _ado_mcp_server_params
+import investigation.investigate as investigate_module
+from investigation.investigate import _ado_mcp_server_entry_path, _ado_mcp_server_params
 
 
 def test_ado_mcp_server_env_sets_project_to_skip_elicitation() -> None:
@@ -55,8 +55,11 @@ def test_ado_mcp_server_version_is_pinned_in_package_json() -> None:
     # Asserting it directly here means a future accidental un-pin (e.g.
     # someone bumping the dependency without reviewing it) fails a fast,
     # offline test instead of surfacing as another silent outage.
-    repo_root = Path(__file__).resolve().parents[1]
-    package_json = json.loads((repo_root / "package.json").read_text(encoding="utf-8"))
+    # Migration Plan Phase 4: package.json lives in investigation/ now,
+    # not the repo root — Node and this pinned package exist only inside
+    # the Investigation service's own directory.
+    investigation_dir = Path(__file__).resolve().parents[1] / "investigation"
+    package_json = json.loads((investigation_dir / "package.json").read_text(encoding="utf-8"))
     assert package_json["dependencies"]["@azure-devops/mcp"] == "2.10.0"
 
 
@@ -85,6 +88,6 @@ def test_ado_mcp_server_params_raises_a_clear_error_when_local_install_is_missin
     # entry-point resolver rather than deleting the real local install,
     # so this test doesn't disturb the actual installed dependency other
     # real tests/runs in this session rely on.
-    monkeypatch.setattr(pipeline, "_ado_mcp_server_entry_path", lambda: Path("/nonexistent/dist/index.js"))
+    monkeypatch.setattr(investigate_module, "_ado_mcp_server_entry_path", lambda: Path("/nonexistent/dist/index.js"))
     with pytest.raises(RuntimeError, match="npm install"):
         _ado_mcp_server_params("gopdha", "encoded-pat", "singleSlide")

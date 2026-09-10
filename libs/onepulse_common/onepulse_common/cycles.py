@@ -70,6 +70,12 @@ async def claim_next_queued_cycle(conn: asyncpg.Connection) -> dict | None:
     `programs` for the real ADO project name `run_pipeline_cycle` needs
     — returns None if nothing is queued right now (the worker's own
     polling loop sleeps and retries; there is no queue to block on yet).
+
+    `requested_by_actor_id` is returned too (Migration Plan Phase 4):
+    the Reporting service carries it into the real
+    `investigation-requests` message envelope — unused by Investigation
+    today, but needed later for FR-11's per-user rate limit/cost
+    attribution, and an awkward retrofit once messages are in flight.
     """
     row = await conn.fetchrow(
         """
@@ -84,7 +90,8 @@ async def claim_next_queued_cycle(conn: asyncpg.Connection) -> dict | None:
             FOR UPDATE SKIP LOCKED
         )
         AND p.program_id = c.program_id
-        RETURNING c.cycle_id, c.program_id, p.name AS program_name, c.trace_context
+        RETURNING c.cycle_id, c.program_id, p.name AS program_name, c.trace_context,
+                  c.requested_by_actor_id
         """
     )
     if row is None:
