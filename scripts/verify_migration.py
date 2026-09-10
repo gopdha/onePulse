@@ -52,6 +52,52 @@ EXPECTED_TABLES = [
     "cycles",
 ]
 
+# The real, intended table-level grant profile per 0004_reassert_public_
+# schema_ownership_and_grants.sql (ADR-023) — the single source this
+# file's new positive/negative privilege checks are both built from, so
+# the two can never silently drift apart from each other. 9 tables get
+# SELECT+INSERT only; configurations/reports/cycles additionally need
+# UPDATE for their own real update paths (config changes, approve/
+# reject, cycle status writes). Column-level UPDATE grants on 5 FK-
+# referenced tables (the FOR KEY SHARE fix) are deliberately NOT
+# reflected here — has_table_privilege's table-level OID form does not
+# count a column-scoped grant as satisfying it (confirmed empirically
+# before writing this file: tenants shows UPDATE=false via this form
+# even though `GRANT UPDATE (tenant_id) ON tenants` is real and live),
+# so checking against this profile cannot false-flag that real,
+# narrower grant as an unintended excess.
+PUBLIC_TABLE_PROFILES: dict[str, list[str]] = {
+    "tenants": ["SELECT", "INSERT"],
+    "portfolios": ["SELECT", "INSERT"],
+    "programs": ["SELECT", "INSERT"],
+    "configurations": ["SELECT", "INSERT", "UPDATE"],
+    "reports": ["SELECT", "INSERT", "UPDATE"],
+    "findings": ["SELECT", "INSERT"],
+    "untracked_items": ["SELECT", "INSERT"],
+    "actors": ["SELECT", "INSERT"],
+    "approval_records": ["SELECT", "INSERT"],
+    "actor_scope": ["SELECT", "INSERT"],
+    "usage_ledger": ["SELECT", "INSERT"],
+    "cycles": ["SELECT", "INSERT", "UPDATE"],
+}
+
+# investigation_migrations/0001_initial_schema.sql's own real grant:
+# GRANT SELECT, INSERT, UPDATE ON investigation.investigation_runs.
+INVESTIGATION_TABLE_PROFILES: dict[str, list[str]] = {
+    "investigation_runs": ["SELECT", "INSERT", "UPDATE"],
+}
+
+# The real privileges PostgreSQL's ACL system tracks separately from
+# ownership but that a naive "make the workload role the owner" fix
+# (ADR-023) silently confers via the automatic owner ACL entry unless
+# explicitly revoked — confirmed empirically, not assumed: none of
+# these are actually "owner-implicit and unrevokable" (a real,
+# necessary check before writing this constant, since if they were, no
+# REVOKE-based check against the owner role could ever pass). UPDATE is
+# handled separately per-table below since it IS part of several
+# tables' real intended profile, unlike these five.
+OWNERSHIP_IMPLIED_PRIVILEGES = ["DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"]
+
 
 async def check_table_exists(conn: asyncpg.Connection, table_name: str) -> bool:
     """Real information_schema.tables query — the exact technique DevOps
@@ -393,6 +439,85 @@ async def check_object_owner(
     return result == expected_owner
 
 
+async def check_schema_owner(conn: asyncpg.Connection, schema_name: str, expected_owner: str) -> bool:
+    """The schema-level counterpart to check_object_owner (which only
+    covers pg_class objects — tables and sequences, not schemas
+    themselves). Real, load-bearing gap this closes (pre-Phase-7 audit,
+    2026-09-10): investigation_migrations/0001's own header comment
+    documents fixing a schema-ownership bug live once already (`ALTER
+    SCHEMA investigation OWNER TO investigation_role_local_dev`) and a
+    SEPARATE table-ownership bug on investigation_runs found only at
+    Phase 4's merge review — nothing before this function ever asserted
+    the schema's own ownership stays correct going forward; the
+    investigation.investigation_runs check below covers the table, this
+    covers the schema, and neither substitutes for the other (Postgres
+    tracks them independently — see 0001's own comment on exactly this
+    point).
+    """
+    result = await conn.fetchval(
+        "SELECT r.rolname FROM pg_catalog.pg_namespace n "
+        "JOIN pg_catalog.pg_roles r ON r.oid = n.nspowner "
+        "WHERE n.nspname = $1",
+        schema_name,
+    )
+    return result == expected_owner
+
+
+async def check_no_excess_table_privileges(
+    conn: asyncpg.Connection, schema_name: str, table_name: str, role_name: str, intended_privileges: list[str]
+) -> bool:
+    """The negative counterpart to check_has_table_privileges — true iff
+    role_name holds NONE of the privileges that a bare ownership
+    transfer silently confers beyond intended_privileges: DELETE,
+    TRUNCATE, REFERENCES, TRIGGER, MAINTAIN always, plus UPDATE when
+    intended_privileges doesn't include it. This is the specific check
+    this project's own history has now needed twice for the identical
+    reason before this function existed to catch it automatically:
+    ADR-023's own finding (2) — app_role, as the new owner of all 12
+    public tables, silently picked up every one of these — and its
+    exact recurrence in the investigation schema at Phase 6's first
+    opportunity (investigation_role, as the new owner of
+    investigation_runs, picked up the identical set the moment its own
+    Managed Identity existed to map it to). Five real instances of this
+    bug class have been found by a person looking (Task 39, Task 43
+    twice, ADR-023 twice); this check exists so the sixth is found
+    automatically instead.
+
+    Verified empirically before this function was written, not assumed
+    from Postgres documentation: has_table_privilege's table-level OID
+    form correctly reflects REVOKE against these privileges even for
+    the object's own owner — none of DELETE/TRUNCATE/REFERENCES/
+    TRIGGER/MAINTAIN are "owner-implicit and unrevokable" the way DDL
+    actions (ALTER/DROP/GRANT) are, so this check is genuinely
+    satisfiable, not structurally doomed to always fail for whichever
+    role happens to own the object.
+
+    Same OID-resolution technique as check_has_table_privileges, for
+    the identical real reason: has_table_privilege's text-identifier
+    overload fails against a schema the connecting role has no USAGE
+    on.
+    """
+    forbidden = list(OWNERSHIP_IMPLIED_PRIVILEGES)
+    if "UPDATE" not in intended_privileges:
+        forbidden.append("UPDATE")
+    oid = await conn.fetchval(
+        "SELECT c.oid FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = $1 AND c.relname = $2",
+        schema_name,
+        table_name,
+    )
+    if oid is None:
+        return False
+    for privilege in forbidden:
+        result = await conn.fetchval(
+            "SELECT has_table_privilege($1, $2::oid, $3)", role_name, oid, privilege
+        )
+        if result:
+            return False
+    return True
+
+
 async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
     results: list[tuple[str, bool]] = []
 
@@ -503,14 +628,59 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
         ("Investigation role (investigation_role_local_dev) has NO access to public schema",
          await check_no_schema_privilege(conn, "public", "investigation_role_local_dev"))
     )
+
+    # Pre-Phase-7 audit (2026-09-10): the investigation schema had NO
+    # ownership check at all before this, and its one privilege check
+    # targeted only investigation_role_local_dev — never
+    # investigation_role, the role that actually carries load on
+    # deployed compute from Phase 7 on. Both gaps closed here, mirroring
+    # the exact positive-ownership/positive-grant/negative-excess triple
+    # the public schema gets below, for BOTH roles, not just the local
+    # one.
+    #
+    # Precise, checked scope of what the two ownership checks below can
+    # currently catch, found while demonstrating them against a
+    # deliberately wrong state: Postgres's ALTER TABLE/SCHEMA ... OWNER TO
+    # refuses to let a role become an owner inside a schema it has no
+    # CREATE privilege on (confirmed live — `app_role_local_dev` has zero
+    # privilege of any kind on `investigation`, including CREATE, and a
+    # direct attempt to hand it ownership here fails with a real
+    # InsufficientPrivilegeError before the ALTER even runs). That means
+    # the exact historical bug this check exists to catch (a
+    # cross-service role silently ending up as owner) is not reachable
+    # TODAY via that path for this schema specifically — it was only
+    # reachable, and only ever actually happened, via `migrate.py`
+    # connecting under the WRONG role at CREATE time (the real root cause
+    # both this schema's ownership bug and ADR-023's did originate from),
+    # not via a later ALTER. The check is not redundant, though: it
+    # guards against a real, plausible future change — anyone later
+    # granting CREATE on `investigation` to `app_role`/`app_role_local_dev`
+    # for some unrelated reason would silently reopen this exact path,
+    # and this check would be the thing that notices. Demonstrating it
+    # required working within the investigation role family instead
+    # (`investigation_role` <-> `investigation_role_local_dev`, which
+    # does have real CREATE on its own schema) — see ADR-023's own
+    # Consequences for what that demonstration then found.
     results.append(
-        ("Investigation role (investigation_role_local_dev) genuinely CAN use its own schema "
-         "(SELECT/INSERT/UPDATE on investigation.investigation_runs)",
-         await check_has_table_privileges(
-             conn, "investigation", "investigation_runs", "investigation_role_local_dev",
-             ["SELECT", "INSERT", "UPDATE"],
-         ))
+        ("schema owner: investigation is owned by investigation_role",
+         await check_schema_owner(conn, "investigation", "investigation_role"))
     )
+    for table, profile in INVESTIGATION_TABLE_PROFILES.items():
+        results.append(
+            (f"table owner: investigation.{table} is owned by investigation_role",
+             await check_object_owner(conn, "investigation", table, "investigation_role"))
+        )
+        for role in ("investigation_role", "investigation_role_local_dev"):
+            results.append(
+                (f"investigation.{table}: {role} has the intended grant profile {profile}",
+                 await check_has_table_privileges(conn, "investigation", table, role, profile))
+            )
+            results.append(
+                (f"investigation.{table}: {role} has NO ownership-implied excess privileges "
+                 f"(DELETE/TRUNCATE/REFERENCES/TRIGGER/MAINTAIN" +
+                 ("" if "UPDATE" in profile else "/UPDATE") + ")",
+                 await check_no_excess_table_privileges(conn, "investigation", table, role, profile))
+            )
 
     # Real, positive ownership assertion (Task 44 follow-up) for every
     # table and sequence in `public` — closes the exact gap that let all
@@ -530,6 +700,29 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
             (f"sequence owner: public.{sequence} is owned by app_role",
              await check_object_owner(conn, "public", sequence, "app_role"))
         )
+
+    # Pre-Phase-7 audit (2026-09-10): ownership alone (above) doesn't
+    # prove the ACTUAL grant profile is correct — a table can be owned
+    # correctly and still carry a silently-widened ACL if REVOKE ALL was
+    # never re-run, or a future migration change reintroduces it.
+    # Positive (has the intended set) and negative (has none of what
+    # ownership transfer silently confers beyond it) checks together are
+    # what actually proves the profile app_role/app_role_local_dev
+    # documented in 0004 is what's real today, for every table, for both
+    # roles — the same triple just added for the investigation schema
+    # above, applied here for the schema this bug was first found in.
+    for table, profile in PUBLIC_TABLE_PROFILES.items():
+        for role in ("app_role", "app_role_local_dev"):
+            results.append(
+                (f"public.{table}: {role} has the intended grant profile {profile}",
+                 await check_has_table_privileges(conn, "public", table, role, profile))
+            )
+            results.append(
+                (f"public.{table}: {role} has NO ownership-implied excess privileges "
+                 f"(DELETE/TRUNCATE/REFERENCES/TRIGGER/MAINTAIN" +
+                 ("" if "UPDATE" in profile else "/UPDATE") + ")",
+                 await check_no_excess_table_privileges(conn, "public", table, role, profile))
+            )
 
     return results
 

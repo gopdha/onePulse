@@ -639,6 +639,30 @@ from how ownership transfer "should" behave — all fixed in the same pass**:
   12 tables and 6 sequences — the gap that let all three real instances of this bug class go
   undetected until something else happened to expose them. Demonstrated live catching a real,
   deliberately wrong owner before being accepted as a permanent check.
+- **A second, distinct grant-to-owner mechanic, found live during the pre-Phase-7 audit
+  (2026-09-10) while demonstrating `verify_migration.py`'s new ownership checks against a
+  deliberately wrong state — the reverse of the one above, not the same bug restated.** The
+  original finding is that granting a privilege to a role that is *already* the owner is a no-op:
+  it silently fails to add a real ACL entry. This one runs in the opposite direction: when a
+  role that *already held a real, explicit grant* (`investigation_role_local_dev`, which genuinely
+  had `SELECT`/`INSERT`/`UPDATE` on `investigation.investigation_runs` and real `USAGE` on the
+  `investigation` schema) was temporarily made the *owner* of that table and schema — to
+  demonstrate the new ownership checks catching a wrong state, then reverted — its own
+  pre-existing grants were silently stripped by the round-trip and did not come back on their own
+  once ownership reverted. Confirmed directly via `relacl`/`nspacl`: after the revert, the table
+  and schema ACLs showed nothing for `investigation_role_local_dev` at all. Not a hypothetical —
+  it surfaced as a real, failing `test_verify_migration.py` assertion on the very next full-suite
+  run, not caught by inspection. Fixed by re-applying the idempotent
+  `investigation_migrations/0001_initial_schema.sql`/`0002_reassert_investigation_grants.sql`
+  (the same self-healing migrations already designed for this bug class), confirmed restored by
+  direct query, not just by the check passing again. **The two mechanics are opposite failure
+  directions of the identical underlying cause (ownership and ACL grants are two separate,
+  independently-tracked things in Postgres, and moving one can silently desynchronize the other):
+  the original bug silently fails to ADD access when granting to a current owner; this one
+  silently REMOVES a role's own pre-existing access when that role passes through ownership and
+  back out again.** Worth recording here, not left living only inside a migration file's comment
+  — this ADR is the reference for this whole bug class, and a reader relying on it should see both
+  directions the class actually takes, not just the one that motivated the original fix.
 
 **Not chosen**: A dedicated third "schema owner" role, separate from both `app_role` and
 `app_role_local_dev`, matching a common enterprise Postgres pattern (a DDL-only identity distinct from

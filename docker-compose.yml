@@ -79,6 +79,22 @@ services:
       ONEPULSE_ARIZE_SPACE_ID: ${ONEPULSE_ARIZE_SPACE_ID}
       ONEPULSE_ARIZE_API_KEY: ${ONEPULSE_ARIZE_API_KEY}
       ONEPULSE_DEBUG_SPAN_LOG: ${ONEPULSE_DEBUG_SPAN_LOG:-/var/log/onepulse/spans.jsonl}
+    # Real fix, not a documented note, for a real recurring race
+    # (CLAUDE.md Task 44/45): bff's first outbound call could land
+    # before this service's ASGI lifespan startup finished on every
+    # cold `docker compose up`, since a plain `depends_on: [core_api]`
+    # only waits for the container to START, not for it to be ready to
+    # serve a request. `python`, not `curl`, is the real, correct probe
+    # here — the base az-cli install step purges curl after use (see
+    # this image's own Dockerfile), so a curl-based healthcheck would
+    # fail structurally, unrelated to whether the app itself is ready.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
 
   bff:
     build:
@@ -86,7 +102,14 @@ services:
       dockerfile: bff/Dockerfile
     image: onepulse-bff:phase5
     depends_on:
-      - core_api
+      core_api:
+        # The real fix: bff's own container now literally cannot start
+        # until core_api's /health endpoint has answered a real 200 —
+        # not "core_api's process exists", which `depends_on: [core_api]`
+        # alone only ever guaranteed. Removes the startup race
+        # structurally rather than relying on bff's own httpx call
+        # retrying past it.
+        condition: service_healthy
     ports:
       - "8100:8100"
     volumes:

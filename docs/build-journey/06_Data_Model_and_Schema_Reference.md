@@ -46,75 +46,80 @@ Before applying the schema, the actual real JSON shapes being produced by the li
 
 ---
 
-## Real Application Role Privileges (as Actually Verified, Not Assumed)
+## Application Role Privileges — Design Intent, and Where the Real Numbers Actually Live
 
-**Superseded 2026-09-10 (Migration Plan Phase 6, CLAUDE.md Task 45).** The table this section
-previously carried (dated 2026-09-09) documented a real asymmetry that existed at the time —
-`app_role_local_dev` holding strictly more privileges than `app_role` on every table except
-`approval_records` — but that asymmetry was itself an artifact of table **ownership**, not a
-deliberate grant design: `app_role_local_dev` owned all 12 `public` tables (every migration had
-always connected as it), and Postgres gives an owner every privilege unconditionally regardless of
-any `GRANT`/`REVOKE` layered on top. ADR-023 (2026-09-10) retroactively transferred ownership to
-`app_role` — the real, already-provisioned workload identity — and in doing so found the true grant
-picture underneath was never what either the old table above or the original "same privileges"
-claim described. Both were wrong, in opposite directions, for the same underlying reason: nobody
-had checked whether an observed privilege was a real ACL entry or an ownership artifact. See
-ADR-023 and Governance & Security Reference §6 for the full account of both directions of this bug.
+**Rewritten 2026-09-10 (pre-Phase-7 audit, CLAUDE.md Task 45 follow-up), replacing a hand-maintained
+snapshot table with a pointer to the machine-checked source of truth.** This section previously
+restated the exact live grant set per table, twice — dated 2026-09-09, then corrected 2026-09-10
+after ADR-023's ownership fix. Both versions were wrong for the identical underlying reason: prose
+cannot distinguish a real ACL entry from an ownership artifact, and nobody had checked which one an
+observed privilege actually was before writing it down. A table like that is stale the instant the
+database changes under it, with nothing forcing it back into sync — precisely the shape of problem
+`scripts/verify_migration.py` exists to solve for the schema itself; the same fix now applies to
+its privileges. **What follows is the design intent — why two roles per service, why
+`approval_records` is revoked, what the schema boundary is and isn't — not a restated snapshot.**
 
-**Current, live-verified state, both application schemas, confirmed by direct query of
-`information_schema`/`pg_catalog` — not the migration files' stated intent:**
+**Why two roles per service, not one.** `app_role`/`investigation_role` are the real, deployed
+workload identities (Managed Identity-mapped, Phase 6) — the roles a running container actually
+authenticates as. `app_role_local_dev`/`investigation_role_local_dev` exist so a human developer can
+authenticate interactively against the identical grant surface, since the production roles cannot
+authenticate outside a real Managed Identity token (confirmed directly, ADR-023). The local-dev
+role is only useful as *evidence* about the deployed identity's real behavior if its grants
+genuinely match — `create_app_role_local_dev.sql`'s own stated design. That equality is not assumed
+here; it's one of the things `verify_migration.py` asserts directly, for both schemas, every run.
 
-`app_role` and `app_role_local_dev` now hold **genuinely identical** real grants on every one of the
-12 `public` tables — the original design intent (`create_app_role_local_dev.sql`: "must grant this
-role the identical table-level privileges it grants `app_role`... divergence here would mean local
-dev stops being genuine evidence about what the deployed workload can actually do") is true for the
-first time, not merely stated:
+**Ownership is not the same question as a grant, and conflating them is the specific, recurring bug
+this schema has produced.** A table's real owner (`pg_class.relowner`) has full access regardless of
+any `GRANT`/`REVOKE` layered on top, and — the less obvious half, found only by testing it directly —
+granting a privilege to an object's *own current owner* is a genuine Postgres no-op that never
+materializes as a real ACL entry. This produced the identical failure mode twice: once for all 12
+`public` tables (ADR-023), once for `investigation.investigation_runs` at the very next real
+opportunity (Migration Plan Phase 6). A verification check that only confirms a table *exists*, or
+that a role *has* an intended privilege, cannot catch this — proving the boundary is real requires a
+third, separate assertion: that the privileges ownership silently confers beyond what's
+intended (`DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, `MAINTAIN`, and `UPDATE` where it isn't
+meant to exist) are genuinely *absent*, not merely that the intended ones are present.
 
-| Table | Real grants (both roles, identical) |
-|---|---|
-| `tenants`, `portfolios`, `programs`, `findings`, `untracked_items`, `actors`, `actor_scope`, `usage_ledger`, `approval_records` | SELECT, INSERT |
-| `configurations`, `reports`, `cycles` | SELECT, INSERT, UPDATE |
+**Why `approval_records` has `UPDATE`/`DELETE` explicitly revoked, from every application role, in
+both schemas' terms.** It is this project's append-only audit trail of every approve/reject
+decision (FR-7/FR-13) — Governance & Security Reference §2 documents the guarantee having survived
+three separate, real, adversarial attempts to route around it, not merely a REVOKE statement nobody
+has tried to defeat.
 
-`approval_records` additionally has `UPDATE`/`DELETE` explicitly `REVOKE`d from both roles (the
-append-only guarantee — Governance & Security Reference §2), and `DELETE` is granted nowhere at all,
-same as always. **`app_role` genuinely owns all 12 tables and their 6 sequences** (confirmed by
-direct `pg_class.relowner` query) — `FORCE ROW LEVEL SECURITY` is set on `reports` specifically so
-this ownership cannot bypass `tenant_isolation` (see Trade-off #9).
+**What the `public`/`investigation` schema split is, and isn't.** It is a real, structural boundary
+between the Reporting service and the Investigation service (Migration Plan Phase 4/ADR-020) —
+neither service's role has any `USAGE` on the other's schema, adversarially proven in
+`tests/test_investigation_schema_isolation.py`, not merely undocumented. It is **not** an isolation
+boundary *within* either service's own role pair: the human developer identity is a plain member of
+both `app_role`/`app_role_local_dev` and `investigation_role`/`investigation_role_local_dev`
+(`pg_auth_members` confirms no nesting *between* the pairs, but real membership of the same human in
+all of them) — worth stating plainly rather than leaving for a reader to derive, per Governance &
+Security Reference §6.
 
-**One real, additional, narrowly-scoped grant beyond the flat table above, found and needed only
-because of a genuine Postgres mechanic, not a design choice:** both roles also hold column-level
-`UPDATE` on exactly one column each of `tenants`, `portfolios`, `programs`, `actors`, and `findings`
-— their own real primary key, the column every real foreign key in this schema references.
-Postgres's internal FK-check row lock (`SELECT ... FOR KEY SHARE`, run automatically on every
+**Why a real per-column `UPDATE` grant exists on one column each of `tenants`, `portfolios`,
+`programs`, `actors`, and `findings`, beyond what the flat SELECT/INSERT profile implies.**
+Postgres's internal foreign-key check (`SELECT ... FOR KEY SHARE`, run automatically on every
 `INSERT` into a table with a foreign key) requires `UPDATE` on the referenced table, not merely
 `SELECT` — confirmed by direct, isolated empirical test (ADR-023), not assumed from documentation.
-Scoped to the single referenced column specifically (not a blanket table-level `UPDATE`), confirmed
-sufficient by the same test.
+Scoped to each table's own real primary key column specifically, not a blanket table-level grant,
+also confirmed sufficient by the same test.
 
-`investigation.investigation_runs` — `investigation_role` and `investigation_role_local_dev` are
-likewise identical: `SELECT, INSERT, UPDATE`, no `DELETE`/`TRUNCATE`/`REFERENCES`/`TRIGGER`. Real,
-if smaller, repeat of the exact ADR-023 finding: `investigation_role` picked up the same
-owner-implicit widening the moment it became the schema's real owner (Migration Plan Phase 6,
-Task 45), fixed by the identical `REVOKE ALL` + re-`GRANT` pattern
-(`investigation_migrations/0002_reassert_investigation_grants.sql`). This table has no foreign keys
-in or out, so the FK-check column-level grant does not apply here.
-
-**Cross-schema isolation, both directions, reconfirmed live as part of this same audit:**
-`app_role`/`app_role_local_dev` have zero `USAGE` on `investigation`; `investigation_role`/
-`investigation_role_local_dev` have zero `USAGE` on `public`. Structural, not disciplinary — the
-same real adversarial standard `tests/test_investigation_schema_isolation.py` already proves.
-
-The two role PAIRS (`app_role`/`app_role_local_dev`, `investigation_role`/`investigation_role_local_dev`)
-share no role-membership relationship with each other (`pg_auth_members` confirms no nesting). The
-human developer identity is a plain member of `app_role`, `app_role_local_dev`, and
-`investigation_role_local_dev` — which is how a local session can authenticate as any of them, not
-evidence any two of them carry equal grants by construction; each pair's equality above was verified
-independently, not inferred from membership.
+**The real, current numbers — ownership of every table and sequence, the intended positive grant
+profile per production role, and the confirmed absence of ownership-implied excess — live in
+`scripts/verify_migration.py`, not here.** Run `python scripts/verify_migration.py --target dev`
+for the live state; `PUBLIC_TABLE_PROFILES`/`INVESTIGATION_TABLE_PROFILES` in that same file are the
+literal, single source the intended profile is defined from, read directly rather than transcribed.
+`check_object_owner`/`check_schema_owner` assert ownership; `check_has_table_privileges` asserts the
+intended profile is present; `check_no_excess_table_privileges` asserts nothing ownership silently
+conferred beyond it is. Every one of those checks has its own forced-failure test in
+`tests/test_verify_migration.py`, proving each can actually detect drift, not merely report success
+unconditionally — the same standard this document's own now-corrected history should have been held
+to from the start.
 
 ---
 
 ## Real Migration Tooling
 
-- `migrate.py` — idempotent, applies the full schema
-- `verify_migration.py` — independently confirms every table, the generated column, every CHECK constraint's real values, RLS + policy, and the REVOKE actually holding — verified against live `information_schema`/`pg_catalog`, not just a clean exit code
-- The verifier's own correctness was proven via 8 tests, each forcing a genuine failure mode against the real database — a verifier that has never been shown to catch drift is just a script that returns "OK" and hopes
+- `migrate.py`/`migrate_investigation.py` — idempotent, apply the full schema for `public`/`investigation` respectively
+- `verify_migration.py` — independently confirms, for **both** schemas: every table/column/sequence, the generated column, every CHECK constraint's real values, RLS + FORCE + policy, ownership of every table and sequence, the intended positive grant profile per production role, and the confirmed absence of the privileges ownership transfer silently confers — verified against live `information_schema`/`pg_catalog`, not just a clean exit code. This is the current source of truth for real application-role privileges; see the section above rather than a restated table.
+- The verifier's own correctness is proven test-by-test in `tests/test_verify_migration.py` (119 checks as of the pre-Phase-7 audit), each with a forced-failure counterpart against the real database — a verifier that has never been shown to catch drift is just a script that returns "OK" and hopes

@@ -26,12 +26,14 @@ from verify_migration import (
     check_force_rls_enabled,
     check_generated_column,
     check_has_table_privileges,
+    check_no_excess_table_privileges,
     check_no_schema_privilege,
     check_object_owner,
     check_policy_exists,
     check_privilege_revoked,
     check_rls_enabled,
     check_schema_exists,
+    check_schema_owner,
     check_table_exists,
     check_table_exists_in_schema,
 )
@@ -285,3 +287,88 @@ async def test_forced_failure_object_owner_detects_the_real_wrong_owner(conn) ->
     # False for the exact wrong-owner state this project's real history
     # had for months, not just True unconditionally.
     assert await check_object_owner(conn, "public", "programs", "app_role_local_dev") is False
+
+
+# --- Pre-Phase-7 audit (2026-09-10): schema owner, negative-excess- ---
+# --- privilege, and the investigation-role (not just local_dev)    ---
+# --- positive-grant checks — closing the exact gap the user named:  ---
+# --- the investigation schema had no ownership check at all, and    ---
+# --- its one privilege check targeted the local-dev role instead of ---
+# --- the role that actually carries load once deployed.             ---
+
+
+async def test_real_investigation_schema_is_owned_by_investigation_role(conn) -> None:
+    assert await check_schema_owner(conn, "investigation", "investigation_role") is True
+
+
+async def test_forced_failure_schema_owner_detects_a_wrong_owner(conn) -> None:
+    # investigation_role_local_dev genuinely does not own the schema
+    # (investigation_role does) — proves this reports False for a real,
+    # plausible-but-wrong role name, not just True unconditionally.
+    assert await check_schema_owner(conn, "investigation", "investigation_role_local_dev") is False
+
+
+async def test_real_investigation_runs_table_is_owned_by_investigation_role(conn) -> None:
+    # The exact gap the user's message named directly: no ownership
+    # check existed for this schema at all before this task. Real,
+    # live-fixed state (Task 43's merge-review finding, Phase 6's own
+    # re-transfer) — not assumed correct, queried directly.
+    assert await check_object_owner(conn, "investigation", "investigation_runs", "investigation_role") is True
+
+
+async def test_forced_failure_investigation_table_owner_detects_a_wrong_owner(conn) -> None:
+    # investigation_role_local_dev is a real, plausible wrong answer —
+    # it held this exact ownership by mistake once, historically (Task
+    # 43's own merge-review finding) — proves the check distinguishes
+    # it from the real current owner, not just True unconditionally.
+    assert await check_object_owner(conn, "investigation", "investigation_runs", "investigation_role_local_dev") is False
+
+
+async def test_real_investigation_role_has_intended_grant_profile(conn) -> None:
+    # The role gap the user named directly: the one prior privilege
+    # check in this file targeted investigation_role_local_dev only.
+    # investigation_role is the real production role Phase 7 deploys —
+    # this proves it genuinely holds the intended SELECT/INSERT/UPDATE,
+    # not merely that its local-dev mirror does.
+    assert await check_has_table_privileges(
+        conn, "investigation", "investigation_runs", "investigation_role",
+        ["SELECT", "INSERT", "UPDATE"],
+    ) is True
+
+
+async def test_real_public_table_has_no_ownership_implied_excess_privileges(conn) -> None:
+    # The specific bug class this task closes: app_role, as programs'
+    # new owner (ADR-023), silently picked up TRUNCATE/REFERENCES/
+    # TRIGGER/MAINTAIN/DELETE — this proves the current, fixed state
+    # genuinely has none of them, not just that the positive profile
+    # check above happens to pass.
+    assert await check_no_excess_table_privileges(
+        conn, "public", "programs", "app_role", ["SELECT", "INSERT"]
+    ) is True
+
+
+async def test_forced_failure_no_excess_check_detects_a_real_excess_without_mutating_the_database(conn) -> None:
+    # app_role genuinely DOES have real, intended UPDATE on `reports`
+    # (0004's own grant) — asking this check whether app_role has "no
+    # excess beyond SELECT alone" must report False, since UPDATE is
+    # then treated as an unintended excess under that narrower profile.
+    # Real, live data proves the check can detect an excess without any
+    # database mutation — the same discipline check_privilege_revoked's
+    # own forced-failure test above already uses.
+    assert (
+        await check_no_excess_table_privileges(conn, "public", "reports", "app_role", ["SELECT"])
+        is False
+    )
+
+
+async def test_real_investigation_runs_has_no_ownership_implied_excess_privileges(conn) -> None:
+    # Mirrors the public-schema check above for the exact schema the
+    # bug recurred in (Task 43/Phase 6's own re-discovery of the
+    # identical class). Uses investigation_role_local_dev, over the
+    # same app_role_local_dev connection every other test here uses —
+    # proves the OID-based resolution works for this schema too,
+    # regardless of the connecting role's own lack of access to it.
+    assert await check_no_excess_table_privileges(
+        conn, "investigation", "investigation_runs", "investigation_role_local_dev",
+        ["SELECT", "INSERT", "UPDATE"],
+    ) is True

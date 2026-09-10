@@ -139,6 +139,14 @@ async def tracing_middleware(request: Request, call_next):
     on_end() — so it must already be active before `start_as_current_
     span` runs, not merely before the span finishes).
     """
+    if request.url.path == "/health":
+        # Real, load-bearing exclusion: Docker's own HEALTHCHECK polls
+        # this every few seconds for as long as the container runs —
+        # tracing it would mean permanent background noise in every
+        # real trace tool this project uses, for a request that carries
+        # no real work and no caller-supplied traceparent to extract.
+        return await call_next(request)
+
     parent_ctx = extract(dict(request.headers))
     with set_routing_context(space_id=app.state.arize_space_id, project_name=ARIZE_PROJECT_NAME):
         with _tracer.start_as_current_span(
@@ -162,6 +170,25 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         if loc and loc[-1] == "notes":
             return JSONResponse(status_code=400, content={"error": "notes_required"})
     return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
+
+
+@app.get("/health")
+async def health_check() -> dict[str, str]:
+    """Real fix for the container-startup race Phase 5 only documented
+    and BFF's own retry-on-failure absorbed silently (CLAUDE.md Task
+    44/45): the BFF's first outbound call could land before this
+    service's ASGI startup finished, on every cold `docker compose up`.
+    Deliberately unauthenticated — Docker's own HEALTHCHECK has no way
+    to present a real Entra service token, and doesn't need one to
+    prove liveness. This route only becomes reachable once uvicorn
+    finishes running `lifespan()`'s own startup half (the ASGI lifespan
+    protocol does not begin accepting HTTP requests until that
+    completes) — a real 200 here is genuine proof `app.state.pg_client`
+    and every other lifespan-constructed client are already built, not
+    an assumption about container readiness inferred from the process
+    merely existing.
+    """
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------
