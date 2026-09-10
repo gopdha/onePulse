@@ -140,17 +140,35 @@ async def check_generated_column(conn: asyncpg.Connection, table_name: str, colu
 async def check_check_constraint_values(
     conn: asyncpg.Connection, table_name: str, column_name: str, expected_values: list[str]
 ) -> bool:
-    """information_schema.check_constraints stores the raw constraint
-    expression text; confirm every expected value literal appears in it
-    for the named column's CHECK.
+    """Confirms every expected value literal appears in the named
+    column's real CHECK constraint expression text.
+
+    Real, live-discovered gap (Task 44 follow-up, ownership-model
+    decision): `information_schema.check_constraints` joined to
+    `constraint_column_usage` used to work, but silently started
+    returning zero rows for `app_role_local_dev` the moment `cycles`
+    stopped being owned by it — confirmed directly, not assumed: as the
+    real Entra Administrator the query returns 2 rows; as
+    `app_role_local_dev` (same query, same grants otherwise) it returns
+    0. `information_schema`'s constraint views filter by the querying
+    role's relationship to the object (ownership-adjacent), not merely
+    schema USAGE — a different, narrower gap than the
+    regclass-needs-USAGE issue `check_constraint_exists_in_schema`
+    already found and fixed. Same real fix pattern: read `pg_catalog`
+    directly. `pg_get_constraintdef` returns the same expression text
+    (wrapped in `CHECK (...)`, harmless for the substring check below),
+    and the join here finds every CHECK constraint whose `conkey`
+    includes the named column's real `attnum` — no ownership-based
+    filtering anywhere in `pg_catalog`.
     """
     rows = await conn.fetch(
         """
-        SELECT cc.check_clause
-        FROM information_schema.check_constraints cc
-        JOIN information_schema.constraint_column_usage ccu
-          ON cc.constraint_name = ccu.constraint_name
-        WHERE ccu.table_schema = 'public' AND ccu.table_name = $1 AND ccu.column_name = $2
+        SELECT pg_get_constraintdef(co.oid) AS check_clause
+        FROM pg_catalog.pg_constraint co
+        JOIN pg_catalog.pg_class c ON c.oid = co.conrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(co.conkey)
+        WHERE n.nspname = 'public' AND c.relname = $1 AND a.attname = $2 AND co.contype = 'c'
         """,
         table_name,
         column_name,
@@ -317,6 +335,43 @@ async def check_has_table_privileges(
     return True
 
 
+async def check_object_owner(
+    conn: asyncpg.Connection, schema_name: str, object_name: str, expected_owner: str
+) -> bool:
+    """The positive-ownership counterpart to check_has_table_privileges —
+    true iff object_name (a table OR a sequence; relkind is not
+    constrained here on purpose, since both matter) is genuinely OWNED
+    by expected_owner, not merely reachable via some GRANT.
+
+    Real, load-bearing gap this closes (Task 44 follow-up, ownership-
+    model decision, 2026-09-10): every check in this file before this
+    one proved either existence or a GRANT — none of them would have
+    caught the real bug that motivated this whole investigation, all 12
+    `public` tables and their 6 sequences being silently owned by
+    app_role_local_dev instead of app_role, since ownership grants
+    access regardless of any GRANT/REVOKE layered on top of it. The
+    exact same class of gap already found and fixed twice before this
+    (app_role_local_dev's undocumented excess privileges, Task 39;
+    investigation.investigation_runs's wrong table owner, Task 43) — the
+    difference here is this check exists BEFORE the next instance of
+    this bug class ships silently, not after.
+
+    Uses pg_catalog directly, not information_schema — ownership is a
+    plain pg_class.relowner column, no view-level privilege filtering to
+    route around (unlike check_check_constraint_values's real,
+    separately-found information_schema gap).
+    """
+    result = await conn.fetchval(
+        "SELECT r.rolname FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_catalog.pg_roles r ON r.oid = c.relowner "
+        "WHERE n.nspname = $1 AND c.relname = $2",
+        schema_name,
+        object_name,
+    )
+    return result == expected_owner
+
+
 async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
     results: list[tuple[str, bool]] = []
 
@@ -431,6 +486,25 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
              ["SELECT", "INSERT", "UPDATE"],
          ))
     )
+
+    # Real, positive ownership assertion (Task 44 follow-up) for every
+    # table and sequence in `public` — closes the exact gap that let all
+    # 12 tables + 6 sequences silently belong to app_role_local_dev for
+    # this entire project's history, invisible to every check above.
+    for table in EXPECTED_TABLES:
+        results.append(
+            (f"table owner: public.{table} is owned by app_role",
+             await check_object_owner(conn, "public", table, "app_role"))
+        )
+    for sequence in (
+        "actor_scope_scope_id_seq", "approval_records_approval_id_seq",
+        "findings_finding_id_seq", "reports_report_id_seq",
+        "untracked_items_untracked_item_id_seq", "usage_ledger_usage_id_seq",
+    ):
+        results.append(
+            (f"sequence owner: public.{sequence} is owned by app_role",
+             await check_object_owner(conn, "public", sequence, "app_role"))
+        )
 
     return results
 

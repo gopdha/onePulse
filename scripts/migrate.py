@@ -39,10 +39,23 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 # adding them here before they're real would be exactly the kind of
 # untested config this project's own conventions warn against.
 TARGETS: dict[str, PostgresSettings] = {
+    # Real decision (ADR-023, Task 44 follow-up, 2026-09-10): migrations
+    # connect as app_role, not app_role_local_dev, by default. Whichever
+    # role runs a migration becomes the real owner of anything it
+    # creates — app_role_local_dev running every migration in this
+    # project's history was the root cause of a real ownership-bypasses-
+    # grants bug (all 12 public tables + 6 sequences silently owned by
+    # the local-dev role, not the deployed workload's role). Fixed
+    # retroactively (0004_reassert_public_schema_ownership_and_grants.sql)
+    # and now fixed at the root: any object created by a fresh
+    # migrate.py run from this point on is owned correctly from the
+    # start. Override with ONEPULSE_PG_ROLE for a one-off need (e.g.
+    # diagnosing an app_role_local_dev-specific issue) — never make that
+    # the standing default again.
     "dev": PostgresSettings(
         host="onepulse-pg-dev.postgres.database.azure.com",
         database="onepulse",
-        role_name=os.environ.get("ONEPULSE_PG_ROLE", "app_role_local_dev"),
+        role_name=os.environ.get("ONEPULSE_PG_ROLE", "app_role"),
     ),
 }
 

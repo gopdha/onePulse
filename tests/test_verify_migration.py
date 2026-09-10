@@ -26,6 +26,7 @@ from verify_migration import (
     check_generated_column,
     check_has_table_privileges,
     check_no_schema_privilege,
+    check_object_owner,
     check_policy_exists,
     check_privilege_revoked,
     check_rls_enabled,
@@ -251,3 +252,21 @@ async def test_forced_failure_has_table_privileges_detects_a_real_missing_grant(
     assert await check_has_table_privileges(
         conn, "investigation", "investigation_runs", "app_role_local_dev", ["SELECT"]
     ) is False
+
+
+async def test_real_public_table_is_owned_by_app_role(conn) -> None:
+    # Task 44 follow-up: the first positive-OWNERSHIP check in this file
+    # — every check above proves existence or a GRANT, none of them
+    # would have caught the real bug that motivated this (all 12 public
+    # tables silently owned by app_role_local_dev instead of app_role).
+    # Real, retroactively-fixed state, confirmed over the same
+    # app_role_local_dev connection every other test here uses.
+    assert await check_object_owner(conn, "public", "programs", "app_role") is True
+
+
+async def test_forced_failure_object_owner_detects_the_real_wrong_owner(conn) -> None:
+    # app_role_local_dev genuinely does NOT own `programs` anymore (the
+    # whole point of the retroactive fix) — proves the check reports
+    # False for the exact wrong-owner state this project's real history
+    # had for months, not just True unconditionally.
+    assert await check_object_owner(conn, "public", "programs", "app_role_local_dev") is False

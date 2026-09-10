@@ -541,3 +541,91 @@ easy default.
 - A `reindex` command that rebuilds the index from persisted reports should be built alongside
   `migrate.py` and `verify_migration.py` rather than improvised. Postgres is the source of truth;
   AI Search is derived and must be rebuildable.
+
+---
+
+## ADR-023: `migrate.py` connects as `app_role`, not `app_role_local_dev` — retroactive ownership fix plus a root-cause change
+
+**Context**: A pre-Phase-6 audit found that every real object in the `public` schema — all 12 tables
+and their 6 sequences — was owned by `app_role_local_dev`, the local-dev role, not `app_role`, the
+role Phase 2 created specifically for the deployed workload identity (`id-onepulse-app-dev`, a real,
+already-provisioned Managed Identity that has simply never been attached to a running workload).
+Ownership bypasses every GRANT/REVOKE layered on top of it — the third real instance of this bug
+class in this project (`app_role_local_dev`'s undocumented excess privileges; `investigation.
+investigation_runs`'s wrong table owner; this). Root cause: `migrate.py --target dev` has always
+defaulted to connecting as `app_role_local_dev`, since `app_role` requires a genuine Managed Identity
+token no interactive session can present — whichever role runs a migration becomes the owner of
+whatever it creates, and `app_role_local_dev` is the only role anything has ever run migrations as.
+
+**Decision**: Two parts, not one. (1) Retroactively reassign ownership of all 35 real objects (12
+tables, 6 sequences — indexes follow their table's owner automatically, confirmed by direct
+before/after query, not assumed) to `app_role`, run once by the real Postgres Entra Administrator.
+(2) Change `migrate.py`'s default connecting role for the `dev` target from `app_role_local_dev` to
+`app_role`, so every object created by a fresh migration run from this point on is owned correctly
+from the start — closing the root cause, not just its one visible symptom.
+
+**Reasoning**: The two application roles were never a real isolation boundary to begin with — the
+human Entra Administrator is a member of both (confirmed via `pg_auth_members`), so anyone who can
+act as `app_role_local_dev` can already `SET ROLE app_role`. What the two roles genuinely provide is
+different, deliberately narrower grant sets for `app_role`, matching least-privilege design; changing
+`migrate.py`'s connecting role leaves that distinction fully intact. Weighed against the alternative
+(leave the default alone and accept that the next schema change reintroduces the identical ownership
+drift by default, not by exception), the trade is clearly worth it. A third option — a self-asserting
+`OWNER TO app_role` block embedded directly in the routinely-executed migration file — was rejected:
+it can only succeed if the connecting role is already a member of `app_role` (Postgres requires this
+to reassign ownership), which `app_role_local_dev` is not, and is not planned to become, since
+granting that membership would let any local developer assume the production role outright — a
+materially bigger, undiscussed change to make solely in service of a self-healing migration step.
+
+**Consequences, three real and unanticipated, found only by actually performing the fix, not assumed
+from how ownership transfer "should" behave — all fixed in the same pass**:
+
+- **Granting a privilege to an object's own current owner is a genuine Postgres no-op that never
+  materializes a real ACL entry.** `app_role_local_dev`'s own `GRANT SELECT, INSERT ...` statements in
+  the original migrations had "succeeded" every time they ran, while it was the owner, without ever
+  producing a real grant — confirmed directly via `pg_class.relacl`: every table showed zero ACL
+  entries for `app_role_local_dev` immediately after ownership moved away. A real test
+  (`test_approve_report_end_to_end`) failed with a genuine `permission denied for table programs` the
+  moment ownership transferred, proving this wasn't theoretical. Fixed by re-running the same GRANT
+  statements now that they are no longer no-ops (`0004_reassert_public_schema_ownership_and_grants.sql`).
+- **The new owner automatically inherits every owner-implicit privilege it was never intended to
+  have.** `app_role`, as the new owner, silently gained `TRUNCATE`/`REFERENCES`/`TRIGGER`/`MAINTAIN` on
+  all 12 tables plus `DELETE` and unintended `UPDATE` — confirmed via `has_table_privilege`, not
+  assumed. The one bright spot: the original `REVOKE UPDATE, DELETE ON approval_records FROM
+  app_role` survived the ownership transfer intact, confirmed live — Postgres honors an explicit
+  REVOKE against a role even after it becomes an object's owner. Fixed by `REVOKE ALL` then
+  re-`GRANT`ing exactly the intended profile for both roles, rather than trying to enumerate every
+  owner-implied bit individually.
+- **Two more previously-invisible bugs surfaced only because a genuinely non-owner role finally tried
+  to use these tables for real.** (a) The `reports.tenant_isolation` RLS policy — enabled since Phase
+  2 but never actually evaluated, since its owner was always exempt — calls `current_setting('app.
+  current_tenant_id')` with no `missing_ok` flag in two places; nothing anywhere sets that GUC, so the
+  policy raised `unrecognized configuration parameter` the instant a non-owner role touched `reports`.
+  Fixed (`0005_fix_tenant_isolation_policy_unset_guc.sql`) to be permissive when the tenant context is
+  unset, matching this project's own Now-scope reality (single tenant, active enforcement deliberately
+  deferred) rather than either erroring or silently filtering every row to zero. (b) Postgres's
+  internal FK-check row lock (`SELECT ... FOR KEY SHARE`, run automatically on every INSERT into a
+  table with a foreign key) requires `UPDATE` privilege on the referenced table, not merely `SELECT` —
+  this is the exact question Task 31 hit and left unresolved for `approval_records`/`reports`, now
+  answered definitively by direct empirical test. Fixed with column-level grants scoped to just the
+  referenced primary-key column of each of the five real tables this schema's FKs reference (`tenants`,
+  `portfolios`, `programs`, `actors`, `findings`) — confirmed sufficient by direct test, avoiding a
+  blanket table-level `UPDATE` that would let these roles modify columns no FK check ever touches.
+- **`migrate.py --target dev` cannot be run interactively under its own new default.** Confirmed live:
+  `InvalidAuthorizationSpecificationError: Service principals cannot generate AAD_AUTH_TOKENTYPE_APP_USER
+  tokens for role "app_role"` — a real Azure AD token-type restriction, not a bug, and exactly the
+  correct behavior (`app_role` should only ever be usable by a genuine deployed identity). This means
+  the literal command cannot be exercised end-to-end until Phase 6 attaches `id-onepulse-app-dev` to a
+  real running workload; the underlying ownership mechanism was instead verified honestly via `SET
+  ROLE app_role` (a real, granted membership) creating a real table and confirming its owner, not by
+  papering over the limitation.
+- `verify_migration.py` gained its first positive-ownership check (`check_object_owner`), covering all
+  12 tables and 6 sequences — the gap that let all three real instances of this bug class go
+  undetected until something else happened to expose them. Demonstrated live catching a real,
+  deliberately wrong owner before being accepted as a permanent check.
+
+**Not chosen**: A dedicated third "schema owner" role, separate from both `app_role` and
+`app_role_local_dev`, matching a common enterprise Postgres pattern (a DDL-only identity distinct from
+every runtime role). Cleaner in the abstract, but more infrastructure to stand up for a problem the
+existing two-role design already has a correct answer for once its migration-runner default is fixed
+— not pursued without a concrete reason the existing roles can't serve this purpose.
