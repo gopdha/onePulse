@@ -22,7 +22,17 @@ COPY libs/onepulse_common ./libs/onepulse_common
 RUN pip install --no-cache-dir ./libs/onepulse_common
 
 COPY trace_debug.py ./trace_debug.py
-COPY scripts/pptx_mcp_server.py ./scripts/pptx_mcp_server.py
+COPY scripts/pptx_mcp_server.py scripts/verify_migration.py ./scripts/
+
+# Migration Plan Phase 7 bar-for-done: "verify_migration.py green against
+# the real database from the deployed environment" — a real, literal
+# requirement, not provable by running the same script from a laptop
+# against the same database (that proves the database, not that this
+# runs from deployed compute under the real app_role Managed Identity).
+# Reporting is the natural host: it already has the full onepulse_common
+# install, asyncpg, and the real app_role identity attached. Run via:
+#   az containerapp exec -g onepulse-gr -n onepulse-reporting \
+#     --command "python scripts/verify_migration.py --target dev"
 
 # The real status decks Status Update Analysis reads — one per real
 # registered program (reporting/main.py's STATUS_DECK_PATH_BY_PROJECT).

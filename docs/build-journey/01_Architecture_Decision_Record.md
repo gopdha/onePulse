@@ -402,6 +402,12 @@ fix requires.
 This is a decision that is easy to silently reverse later by adding MSAL to the frontend because a
 tutorial suggested it; it is recorded here so that reversal has to be a conscious one.
 
+**Real consequence found only at implementation time (Migration Plan Phase 7, ADR-025):** the
+platform-authentication mechanism this decision chose requires a real client secret for its own
+inbound OAuth exchange with Entra — a genuine, permanent exception to this project's zero-static-
+secrets principle, not something this ADR's own original reasoning anticipated. See ADR-025 for the
+full account of why no version of this decision avoids it, and what bounds the exception.
+
 ---
 
 ## ADR-019: Investigation extracted as its own service, coordinated by a storage queue
@@ -794,3 +800,97 @@ respectively) — `core_api`/`reporting` have no equivalent distinct resource to
 
 **Not chosen**: see Reasoning above — a Service Principal secret and local OIDC federation, both
 considered and both rejected for stated, specific reasons, not merely unconsidered.
+
+---
+
+## ADR-025: A real client secret for `bff`'s built-in Entra authentication — an unavoidable, permanent exception, not a disclosure footnote
+
+**Context**: ADR-018 decided that sign-in for the BFF happens via Azure Container Apps' own built-in
+authentication (Easy Auth) at the ingress, not a token held in the browser. Migration Plan Phase 7
+implemented that decision for real for the first time. Implementing it required registering a real
+Entra app for interactive sign-in (`onepulse-bff-signin`, distinct from `onepulse-core-api`, which
+represents an API for service-to-service tokens, not a principal a browser signs into) and configuring
+the platform's AAD identity provider against it. The only parameters `az containerapp auth microsoft
+update` accepts for that provider are a client secret or a certificate (`--client-secret`,
+`--client-secret-certificate-thumbprint`/`-issuer`/`-san`) — there is no Managed-Identity-federated or
+otherwise secretless option in the current API surface, confirmed by reading the actual parameter set
+before assuming one existed.
+
+**Decision**: Use a real client secret, generated once (`az ad app credential reset`) and stored only
+in the container app's own managed secret store (`az containerapp auth microsoft update
+--client-secret ...`), never echoed to a log, a commit, or `.env` — the same handling discipline this
+project already applies to every other real secret it has ever touched (Governance & Security
+Reference §7). Treat this as a second, permanent, explicitly-tracked exception to the zero-static-
+secrets principle, not a disclosure line inside a task summary — recorded here, and in Governance &
+Security Reference §1/§4, with the same weight the ADO PAT already gets.
+
+**Reasoning**: This is a structurally different problem from every case Managed Identity already
+solves in this project, and no version of ADR-018's own decision avoids it. Managed Identity lets a
+service prove *its own* identity when it calls *another* Azure resource — every real credential this
+project eliminated (Postgres, Foundry, Search, Storage Queues, the ADO PAT's own replacement path)
+was exactly that shape: an outbound call, this project's own code presenting a token it obtained for
+itself. Easy Auth is the opposite shape: the *platform*, on behalf of a *browser*, performs a
+server-side OAuth confidential-client authorization-code exchange with Entra — proving to Entra that
+the party redeeming the code is who it claims to be, which is precisely what a client secret (or
+certificate) exists to do, and which nothing about the caller's own identity (there isn't a caller's
+own identity yet — that is the entire thing being established) has any bearing on. Managed Identity
+has no role to play in this exchange because there is no "this project's own service" on either side
+of it at the moment it happens — only the platform and Entra.
+
+Two options were considered before accepting the secret:
+
+1. *A real client secret (chosen).* Genuinely unavoidable for the specific mechanism Container Apps'
+   own AAD provider implements — confirmed by reading the real parameter surface, not assumed from a
+   general aversion to secrets. Stored only in the platform's own secret store, never in this
+   project's code or config.
+2. *A client certificate instead of a secret — considered, not chosen for this phase, not ruled out
+   permanently.* `--client-secret-certificate-thumbprint`/`-issuer`/`-san` are real, supported
+   alternatives — a certificate is arguably a stronger credential shape (asymmetric, more naturally
+   scriptable rotation via Key Vault) but is real additional infrastructure (issuing and rotating a
+   certificate, wiring it through Key Vault) for a security property Governance & Security Reference
+   §4's own bar for a real exception doesn't demand: this is not a case of "any static credential is
+   too risky," it is a case of "the platform's own mechanism requires one kind or another" — a secret,
+   generated once and held only in Container Apps' own managed secret store, meets that bar today
+   without the extra infrastructure. Worth revisiting if this project ever needs real secret rotation
+   automation for other reasons; not a reason to build it solely for this.
+
+**This does not reopen or weaken ADR-024's own rejection of a Service Principal secret.** ADR-024
+rejected an SP secret specifically because it would have stood in *for Managed Identity itself* —
+authenticating this project's own outbound service calls, the exact thing Managed Identity already
+solves, for no reason but to satisfy a bar that turned out to be unachievable as worded. This secret
+authenticates a categorically different, real mechanism — the platform's own inbound sign-in exchange
+— that Managed Identity was never going to be able to touch regardless of how Phase 6/7 had gone. The
+two decisions are consistent, not in tension: reject a static credential when a real, live alternative
+(Managed Identity) already does the job; accept one, explicitly and boundedly, when the mechanism
+genuinely has no such alternative.
+
+**What bounds this exception, so it does not become a template for reaching for a secret elsewhere**:
+scoped to exactly one purpose (the AAD identity provider's own confidential-client exchange for one
+app registration, `onepulse-bff-signin`); held in exactly one place (Container Apps' own managed
+secret store for the `bff` app, never in this project's own code, `.env`, or version control); never
+presented by this project's own code to anything — the platform's Easy Auth sidecar is the only thing
+that ever reads it, at the same layer Governance & Security Reference already treats as the security
+boundary (Container Apps' own built-in authentication, ADR-018); set with a real 1-year expiry, not
+indefinite, giving it at least a bounded rotation cadence even though the underlying need for *a*
+secret here does not expire the way the ADO PAT's diagnostic need eventually should.
+
+**What would change if this ever became avoidable**: if Container Apps' own AAD provider ever adds a
+genuinely secretless authentication mode for its own inbound OAuth exchange (workload-identity
+federation on the platform side, not merely on this project's own outbound calls), or if this project
+moves off Container Apps' built-in authentication toward a model where this service itself validates
+tokens (reopening ADR-018's own choice, not merely this implementation detail), this exception would
+be removed then, not before — the same standard Governance & Security Reference §4 already applies to
+the ADO PAT.
+
+**Consequences**: Governance & Security Reference §1 now states two exceptions, not one — the count
+itself matters, since the document's own opening sentence is a specific, checkable claim. §4's
+structure (what it is / why it's unavoidable / what bounds it / what would change) is extended with a
+second entry at the same weight, not folded into a shorter note, precisely because this exception is
+**permanent** by its own nature (the mechanism does not expire the way a diagnostic PAT does) where
+the ADO PAT is explicitly time-boxed — the two exceptions are not interchangeable instances of "one
+kind of thing," and the document should not read as though they are.
+
+**Not chosen**: a certificate-based alternative (real, available, deferred rather than rejected — see
+Reasoning above); reopening ADR-018's own choice of Easy Auth over an application-level token
+validator, which would trade this exception for a different, larger scope of code this project would
+then own and have to get right itself.
