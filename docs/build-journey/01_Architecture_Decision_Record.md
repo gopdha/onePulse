@@ -1612,20 +1612,44 @@ close — citing a stale status with the same confidence as a current one — th
 before the model can get it wrong, not a instruction trusted to catch it after the fact. Same reasoning,
 arriving in a fourth place.
 
-**Verification, real reindex against the real corpus, run only after the code above was in place and the
-full 153-test suite was green**: `python scripts/ingest_reports_to_search.py --target dev`, no
-`--report-ids` scoping — the full, unscoped path. A real, live constraint hit on the first attempt, not
-anticipated in advance: the embedding deployment's GlobalStandard S0 tier rate-limited a single 963-text
-batch call (the real corpus size — 21 real reports + 942 real findings); fixed by batching the embed
-calls (`embed_all`, `EMBEDDING_BATCH_SIZE = 16`) with a real retry-after-cooldown loop on `RateLimitError`,
-a small, deliberate addition to the one caller that actually does bulk embedding — `embed_texts` itself
-stays a plain single-batch call, unchanged, since every other real caller only ever embeds one question at
-a time.
+**Real constraint found at corpus scale: the embedding deployment rate-limits a single large batch call,
+not just a note in this task's own history but something the next reindex at a larger corpus will hit
+again.** The first live reindex attempt against the full, unscoped real corpus (963 texts — 21 real
+reports + 942 real findings, embedded in one `client.embeddings.create(...)` call) failed with
+`openai.RateLimitError`: the `onePulse-text-embedding-3-small` deployment's GlobalStandard S0 tier rejects
+a single request of this size outright, not merely slows it down. This is a real property of the
+deployment's own tier, not a bug in `embed_texts` or a one-off fluke — any future reindex against a corpus
+at or above roughly this size will hit it again unless deliberately worked around, which is exactly why
+it's recorded here rather than left to be rediscovered as a fresh, surprising failure. **The fix**:
+`ingest_reports_to_search.py` gained `embed_all()` — splits the real texts into fixed-size batches
+(`EMBEDDING_BATCH_SIZE = 16`) and, on a `RateLimitError` for any one batch, sleeps
+`EMBEDDING_RETRY_SECONDS` (60) and retries that batch before continuing — a small, deliberate addition
+scoped to the one caller that actually does bulk embedding. `onepulse_common.embeddings.embed_texts` itself
+is deliberately left untouched as a plain single-batch call: every other real caller in this project (the
+chat assistant, one question at a time) never approaches this limit, and batching there would be
+unnecessary complexity for a call shape that doesn't need it. If a future corpus grows large enough that
+even 16-text batches start rate-limiting, or the run becomes slow enough that batch-by-batch retries add up
+to an unacceptable wall-clock cost, the real next step is requesting a quota increase for this deployment
+(the service's own error message names the exact mechanism, `https://aka.ms/oai/quotaincrease`) rather than
+shrinking the batch size further — noted here so that's a deliberate choice next time, not a guess.
 
-The real, completed run: **963/963 documents uploaded** (21 report chunks + 942 finding chunks — the exact
-real, current non-fixture counts), and **50 stale documents pruned** — `report-999` (the fixture that
-started this investigation) plus 49 superseded `report-1` through `report-50` chunks from Task 17's
-original singleSlide ingestion (`report-51`, still a real report, was correctly NOT pruned). **Report 999
+**Verification, real reindex against the real corpus, run only after the code above (prune step, scoring
+profile, prompt instruction, and the batching fix above) was in place and the full 153-test suite was
+green**: `python scripts/ingest_reports_to_search.py --target dev`, no `--report-ids` scoping — the full,
+unscoped path.
+
+The real, completed run: **963/963 documents uploaded** (21 report chunks + 942 finding chunks), and **50
+stale documents pruned** — `report-999` (the fixture that started this investigation) plus 49 superseded
+`report-1` through `report-50` chunks from Task 17's original singleSlide ingestion (`report-51`, still a
+real report, was correctly NOT pruned). **What the index reconciled to, and why that number is the real
+evidence:** 963 is the exact real, current non-fixture count in Postgres — 21 rows in `reports` plus 942
+rows in `findings`, both `WHERE NOT is_test_fixture`, confirmed by the same query `fetch_real_document_ids`
+itself runs. The index ending at precisely that number, not merely "having grown" or "having had some stale
+rows removed," is what demonstrates the prune step is a real reconciliation against Postgres's current
+state — not a partial cleanup that happened to catch report 999 and stop there. A step that only deleted
+report 999 specifically would have left the index at 964 (963 real + the one, now-gone, fixture); a step
+that pruned too aggressively would have landed below 963. It landed exactly on 963, matching Postgres
+exactly, which is the property ADR-022's "derived means reconcilable" claim actually requires. **Report 999
 confirmed gone by a direct, targeted post-reindex query** (`get_document(key="report-999")` → real
 `ResourceNotFoundError`), closing the specific instance that started this whole investigation.
 
