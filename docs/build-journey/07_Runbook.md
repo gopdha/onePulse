@@ -433,6 +433,35 @@ Empty output means it's genuinely never been committed.
   (the same real recipe already used for core_api in Phase 2) — a bare `az account get-access-token
   --resource <appId>` against an app with no exposed scope silently returns an opaque, non-JWT token
   that fails validation with a generic `400`, not a diagnosable error.
+- **There is no single obvious way to hard-kill a specific running replica on Azure Container Apps —
+  three real, plausible-looking mechanisms were tried and failed before the working one was found
+  (Task 47 follow-up, the queue-driven `reporting` kill test).** `az containerapp exec --command
+  "kill -9 1"` connects and appears to execute, but does not reach the real app process — confirmed
+  live: the target in-flight cycle completed uninterrupted (`restartCount: 0`, identical replica
+  start time before and after), and a follow-up, completely harmless `az containerapp exec --command
+  "ps aux"` produced the identical generic `ClusterExecFailure`/websocket-close-1011 disconnection
+  error with no output at all, proving that error is generic exec-session teardown noise in this
+  environment, not evidence that any command — kill or otherwise — actually ran inside the real
+  container's PID namespace. `az containerapp revision restart` is a **rolling** restart, not a hard
+  kill: a new replica is created alongside the existing one, and the original keeps running,
+  untouched, until it becomes idle on its own — an in-flight cycle on it completes normally,
+  unaffected. `az containerapp update --min-replicas 0 --max-replicas 0` is rejected outright by the
+  CLI itself (`--max-replicas must be in the range [1,1000]`) — Container Apps does not allow
+  `maxReplicas: 0` at all, even temporarily. **The real, working mechanism: `az containerapp revision
+  deactivate` (then `activate` to bring it back under normal KEDA control).** Confirmed live,
+  repeatedly: deactivating the currently active revision reliably tears every one of its replicas
+  down to zero within roughly 15-20 seconds — a genuine, disruptive stop, not a graceful drain — and
+  reactivating brings it back cleanly. **A real self-inflicted trap when using this for a timed kill
+  test:** the revision stays deactivated until explicitly reactivated — if the next action (e.g.
+  triggering a fresh cycle to retry a kill attempt) happens before reactivating, that cycle sits
+  `queued` indefinitely, never claimed, with no error anywhere; caught only by noticing
+  `az containerapp revision list` returning empty/inactive rather than assuming the trigger itself
+  failed. **A real timing lesson on top of the mechanism:** even with the right mechanism, catching a
+  real in-flight cycle mid-execution needs fast polling and near-immediate action — on this project's
+  own real ~30-70 second post-dispatch cycle tail (stages 2-7, faster with no revision, slower with
+  one), several attempts with 10-second polling and a few seconds of reaction lag still lost the race
+  to the cycle simply finishing first; polling at 8 seconds and issuing the deactivate command the
+  instant the target condition was observed was what finally worked.
 
 ---
 

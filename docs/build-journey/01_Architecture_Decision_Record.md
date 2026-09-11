@@ -959,9 +959,15 @@ answer lives.
 
 **Consequences**:
 
-- Every backend service in this deployment now scales to zero uniformly — no service is special. The
-  ~$22/month `reporting`-specific cost is removed; the real, revised total is reported in CLAUDE.md's
-  Task 47 follow-up entry against the same ~CA$35 baseline, not asserted here.
+- **`reporting` was the last `minReplicas: 1` exception in this deployment.** Every one of the four
+  backend services (`core_api`, `bff`, `investigation`, `reporting`) now scales to zero on the same
+  basis — a real KEDA `azure-queue` custom scale rule, Managed-Identity-authenticated, `minReplicas: 0`
+  — not merely "each happens to be able to go to zero for its own reasons." No service is special or
+  carries a standing always-on cost by design anymore; the deployment model is uniform. The
+  ~$22/month `reporting`-specific idle cost this removed is a real consequence of that uniformity, not
+  the goal itself — the real, revised total is reported in CLAUDE.md's Task 48 entry against the same
+  ~CA$35 baseline, not asserted here, and is itself a projection pending the scale-to-zero item that
+  same entry keeps open.
 - A `report-cycles` message now genuinely can be delivered to more than one `reporting` replica at once
   (KEDA queue-depth scaling, same as Investigation) — this is correct and safe under the queue's own
   exclusive-lease-per-message semantics, the same real guarantee Investigation has relied on since
@@ -1151,9 +1157,12 @@ mechanism above. Revised cost figure — done, with the platform-flake caveat st
 and `verify_migration.py` green — done (134/134, 119/119; five tests showed transient
 `AzureCliCredential`-related errors under this session's own heavy concurrent `az` CLI load during the
 kill-test attempts, confirmed non-reproducing on an immediate individual re-run — the same class of
-environment noise already documented in Task 45). **Not done, and not silently claimed: `reporting`
-has not been directly, visually confirmed reaching a KEDA-triggered zero-replica state** — its
-configuration is confirmed correct (byte-for-byte matching Investigation's own proven rule), and the
-mechanism blocking that specific observation is confirmed to be a real, external, intermittent Azure
-platform behavior affecting both queue-scaled services equally, not a defect in this task's own code
-or configuration.
+environment noise already documented in Task 45). **Kept open, not settled here: `reporting` has not
+been directly, visually confirmed reaching a KEDA-triggered zero-replica state.** Its configuration is
+confirmed correct (byte-for-byte matching Investigation's own proven rule), and the mechanism blocking
+that specific observation was checked against the real alternative (legitimately busy, not stuck) with
+direct evidence before being attributed to a real, external, intermittent Azure platform behavior
+affecting both queue-scaled services equally — but that conclusion is deliberately tracked as a dated
+open follow-up in CLAUDE.md's Task 48 entry, with a concrete next check named, rather than closed out
+by the strength of this investigation alone. The revised cost figure above is a projection contingent
+on this actually being observed, not an already-realized result.
