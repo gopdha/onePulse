@@ -18,6 +18,16 @@ Idempotent: every document's `id` is derived from its real primary key
 (`report-<report_id>`, `finding-<finding_id>`), and upload uses
 `merge_or_upload_documents` — safe to re-run.
 
+Real prune step (ADR-029), run on every real ingest, not opt-in:
+`merge_or_upload_documents` only ever adds or updates — it can never
+remove a document Postgres no longer accounts for (a reclassified
+report, a retired chunking scheme, a one-off test ingestion). ADR-022's
+own claim that "AI Search is derived" from Postgres is only true if the
+index can be reconciled back to Postgres's real current state, not
+merely rebuilt additively — `prune_stale_documents` is what makes that
+actually hold: it computes the real, full set of document IDs Postgres
+says should exist and deletes anything in the index that isn't in it.
+
 Run: python scripts/ingest_reports_to_search.py --target dev
 """
 
@@ -32,10 +42,41 @@ from azure.identity.aio import DefaultAzureCredential
 from azure.core.exceptions import ResourceNotFoundError
 from dotenv import load_dotenv
 
+from openai import RateLimitError
+
 from onepulse_common.config import PostgresSettings
 from onepulse_common.db import PostgresClient
 from onepulse_common.embeddings import build_embedding_client, embed_texts
 from onepulse_common.search_index import build_index_client, build_index_definition, build_search_client
+
+# Real limit hit live on the first full, unscoped reindex of this
+# project's real corpus (963 texts in one call): the embedding
+# deployment's GlobalStandard S0 tier rate-limits a single request.
+# `embed_texts` itself (onepulse_common/embeddings.py) stays a plain,
+# single real batch call — every other real caller only ever embeds one
+# question at a time. Batching + retry belongs here, in the one caller
+# that actually does bulk work.
+EMBEDDING_BATCH_SIZE = 16
+EMBEDDING_RETRY_SECONDS = 60
+
+# The real, documented Azure AI Search per-request $top cap. A single
+# search_text="*" listing call is only a complete enumeration of the
+# index below this — at or beyond it, some real documents are silently
+# missing from the page, and computing a prune set from that partial
+# list risks deleting documents that are still genuinely valid (they
+# just didn't fit on the page). See `prune_stale_documents`.
+MAX_INDEX_LISTING_PAGE = 1000
+
+
+class IndexListingTooLargeError(RuntimeError):
+    """Raised when the real index has grown to (or past) Azure AI
+    Search's own per-request $top cap — pruning refuses to proceed
+    against a listing that can no longer be trusted to be complete,
+    rather than silently computing a wrong (over-broad) deletion set.
+    Real pagination ($skip, or an orderby-based keyset) needs to be
+    added deliberately once the real corpus actually reaches this —
+    not guessed at in advance for a scale this project isn't at.
+    """
 
 load_dotenv()
 
@@ -121,6 +162,77 @@ async def fetch_finding_chunks(conn, report_ids: list[int] | None = None) -> lis
     ]
 
 
+async def fetch_real_document_ids(conn) -> set[str]:
+    """The full, real, unscoped set of document IDs that should exist in
+    the index right now — every non-fixture report and finding,
+    regardless of any `--report-ids` scoping this particular run's own
+    upload used. Pruning is a global consistency operation (does the
+    index match Postgres overall), not a per-batch one — a targeted
+    ingest of three report_ids still prunes against the *complete* real
+    state, not just those three.
+    """
+    report_rows = await conn.fetch("SELECT report_id FROM reports WHERE NOT is_test_fixture")
+    finding_rows = await conn.fetch(
+        "SELECT f.finding_id FROM findings f JOIN reports r ON r.report_id = f.report_id "
+        "WHERE NOT r.is_test_fixture"
+    )
+    return {f"report-{r['report_id']}" for r in report_rows} | {
+        f"finding-{r['finding_id']}" for r in finding_rows
+    }
+
+
+async def prune_stale_documents(search_client, real_ids: set[str]) -> int:
+    """Deletes every document in the real index that the real, current
+    Postgres state no longer accounts for. This is the property that
+    makes ADR-022's "AI Search is derived" claim actually true — derived
+    means reconcilable back to the source of truth, not just
+    rebuildable-in-principle by adding whatever's missing.
+    """
+    results = await search_client.search(search_text="*", top=MAX_INDEX_LISTING_PAGE, select=["id"])
+    index_ids = [doc["id"] async for doc in results]
+    if len(index_ids) >= MAX_INDEX_LISTING_PAGE:
+        raise IndexListingTooLargeError(
+            f"Index listing returned {len(index_ids)} documents, at or beyond the real "
+            f"{MAX_INDEX_LISTING_PAGE}-document Azure AI Search per-request cap — refusing to prune "
+            "against a listing that can no longer be trusted to be complete."
+        )
+
+    stale_ids = set(index_ids) - real_ids
+    if not stale_ids:
+        print("Prune: no stale documents found — index already matches Postgres.")
+        return 0
+
+    result = await search_client.delete_documents(documents=[{"id": i} for i in stale_ids])
+    failed = [r for r in result if not r.succeeded]
+    print(f"Pruned {len(result) - len(failed)}/{len(result)} stale document(s): {sorted(stale_ids)}")
+    for f in failed:
+        print(f"  FAILED TO PRUNE: {f.key} — {f.error_message}")
+    return len(result) - len(failed)
+
+
+async def embed_all(embedding_client, texts: list[str]) -> list[list[float]]:
+    """Embeds every real text in fixed-size batches, retrying a rate-limited
+    batch after the real cooldown rather than failing the whole run. Real,
+    observed constraint: the embedding deployment's GlobalStandard S0 tier
+    rejects one oversized single-shot call for this project's real corpus
+    size; it accepts the identical content split into smaller batches.
+    """
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch = texts[start : start + EMBEDDING_BATCH_SIZE]
+        while True:
+            try:
+                vectors.extend(await embed_texts(embedding_client, batch))
+                break
+            except RateLimitError:
+                print(
+                    f"Embedding batch {start}-{start + len(batch)}: rate limited, "
+                    f"retrying in {EMBEDDING_RETRY_SECONDS}s."
+                )
+                await asyncio.sleep(EMBEDDING_RETRY_SECONDS)
+    return vectors
+
+
 async def ingest(settings: PostgresSettings, report_ids: list[int] | None = None) -> None:
     pg_client = await PostgresClient.connect(settings, min_size=1, max_size=1)
     search_credential = DefaultAzureCredential()
@@ -128,13 +240,11 @@ async def ingest(settings: PostgresSettings, report_ids: list[int] | None = None
         async with pg_client.pool.acquire() as conn:
             report_chunks = await fetch_report_chunks(conn, report_ids)
             finding_chunks = await fetch_finding_chunks(conn, report_ids)
+            # Unscoped, regardless of report_ids — see fetch_real_document_ids's own docstring.
+            real_ids = await fetch_real_document_ids(conn)
 
         chunks = report_chunks + finding_chunks
         print(f"Fetched {len(report_chunks)} report chunk(s), {len(finding_chunks)} finding chunk(s) from Postgres.")
-
-        if not chunks:
-            print("Nothing to ingest.")
-            return
 
         index_client = build_index_client(search_credential)
         try:
@@ -147,23 +257,32 @@ async def ingest(settings: PostgresSettings, report_ids: list[int] | None = None
         finally:
             await index_client.close()
 
-        embedding_client = build_embedding_client(search_credential)
-        try:
-            vectors = await embed_texts(embedding_client, [c["content"] for c in chunks])
-        finally:
-            await embedding_client.close()
+        if chunks:
+            embedding_client = build_embedding_client(search_credential)
+            try:
+                vectors = await embed_all(embedding_client, [c["content"] for c in chunks])
+            finally:
+                await embedding_client.close()
 
-        for chunk, vector in zip(chunks, vectors):
-            chunk["content_vector"] = vector
+            for chunk, vector in zip(chunks, vectors):
+                chunk["content_vector"] = vector
+        else:
+            print("Nothing new to upload for this run's own scope.")
 
         search_client = build_search_client(search_credential)
         try:
-            result = await search_client.merge_or_upload_documents(documents=chunks)
-            failed = [r for r in result if not r.succeeded]
-            print(f"Uploaded {len(result) - len(failed)}/{len(result)} document(s) to the real index.")
-            if failed:
+            if chunks:
+                result = await search_client.merge_or_upload_documents(documents=chunks)
+                failed = [r for r in result if not r.succeeded]
+                print(f"Uploaded {len(result) - len(failed)}/{len(result)} document(s) to the real index.")
                 for f in failed:
                     print(f"  FAILED: {f.key} — {f.error_message}")
+
+            # Real prune step (ADR-029) — runs every time, regardless of
+            # whether this run's own upload was scoped or empty, since
+            # it reconciles against the FULL real Postgres state, not
+            # just this run's own batch.
+            await prune_stale_documents(search_client, real_ids)
         finally:
             await search_client.close()
     finally:

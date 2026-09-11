@@ -35,15 +35,44 @@ auth (API keys) is disabled service-wide on `onepulse-search-dev`
 (confirmed via a direct ARM PATCH — the CLI's own
 `--disable-local-auth` rejected the change until `authOptions` was also
 cleared).
+
+Real recency scoring profile (ADR-029): a program under active,
+repeated real investigation (Agentic AI Observability Platform's own
+weekly re-investigation of the same ~115 committed items) produces many
+finding-level chunks describing the same real work item across
+different weeks — near-identical content, differing mainly in
+`week_of` and, sometimes, status. Retrieved together, an older,
+superseded chunk can rank close enough to the current one that the
+model cites it with equal confidence — a retrieval-quality failure that
+looks like the assistant working, which is what makes it worth fixing
+at the ranking layer rather than trusting the model to sort it out
+after the fact every time. `RECENCY_SCORING_PROFILE_NAME` biases
+ranking toward more recent `week_of` values using Azure AI Search's own
+real `FreshnessScoringFunction` — real history stays fully queryable
+(nothing is excluded, unlike indexing only the latest report per
+program, which was considered and rejected: LLD Section 2.3 frames this
+assistant as an archive of what has already been reported, and
+"how has this item's status changed over time" is a real, intended
+question this system should stay able to answer). `interpolation=
+"quadratic"` was chosen deliberately over the default `"linear"` — a
+sharper, front-loaded preference for the most recent weeks specifically
+targets the near-duplicate case (consecutive weekly snapshots of the
+same item), rather than a gentle, evenly-graded preference across the
+whole `boosting_duration` window.
 """
 
 from __future__ import annotations
+
+import datetime as dt
 
 from azure.identity.aio import DefaultAzureCredential
 from azure.search.documents.aio import SearchClient
 from azure.search.documents.indexes.aio import SearchIndexClient
 from azure.search.documents.indexes.models import (
+    FreshnessScoringFunction,
+    FreshnessScoringParameters,
     HnswAlgorithmConfiguration,
+    ScoringProfile,
     SearchField,
     SearchFieldDataType,
     SearchIndex,
@@ -61,6 +90,18 @@ INDEX_NAME = "onepulse-reports"
 _VECTOR_PROFILE_NAME = "onepulse-vector-profile"
 _HNSW_ALGORITHM_NAME = "onepulse-hnsw"
 VECTOR_FIELD_NAME = "content_vector"
+
+RECENCY_SCORING_PROFILE_NAME = "recency_boost"
+# Real, deliberate values, not defaults left unexamined: `boost=3.0`
+# gives the freshest documents up to 3x their base relevance score —
+# strong enough to reliably separate "this week" from "three weeks ago"
+# for two otherwise near-identical chunks, without being so extreme
+# that a genuinely more relevant older chunk can never surface at all
+# (the boost multiplies, it doesn't replace, the underlying relevance
+# score). `boosting_duration=90 days` — comfortably longer than this
+# project's own real report cadence (weekly) or any real gap between
+# runs seen so far, so a chunk stays eligible for the boost across
+# several real weekly cycles, not just the single most recent one.
 
 
 def build_index_client(credential: DefaultAzureCredential) -> SearchIndexClient:
@@ -110,7 +151,24 @@ def build_index_definition() -> SearchIndex:
         algorithms=[HnswAlgorithmConfiguration(name=_HNSW_ALGORITHM_NAME)],
     )
 
-    return SearchIndex(name=INDEX_NAME, fields=fields, vector_search=vector_search)
+    recency_scoring_profile = ScoringProfile(
+        name=RECENCY_SCORING_PROFILE_NAME,
+        functions=[
+            FreshnessScoringFunction(
+                field_name="week_of",
+                boost=3.0,
+                interpolation="quadratic",
+                parameters=FreshnessScoringParameters(boosting_duration=dt.timedelta(days=90)),
+            )
+        ],
+    )
+
+    return SearchIndex(
+        name=INDEX_NAME,
+        fields=fields,
+        vector_search=vector_search,
+        scoring_profiles=[recency_scoring_profile],
+    )
 
 
 def _escape_odata_literal(value: str) -> str:
@@ -159,6 +217,9 @@ async def hybrid_search(
         vector_queries=[vector_query],
         filter=filter_expr,
         top=top,
+        # Explicit at the call site rather than a silent `default_scoring_profile`
+        # on the index — see the module docstring's ADR-029 note.
+        scoring_profile=RECENCY_SCORING_PROFILE_NAME,
         select=[
             "id",
             "chunk_type",

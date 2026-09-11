@@ -596,7 +596,12 @@ easy default.
   open; separate is cleaner for reindexing, folded-in is one fewer container.
 - A `reindex` command that rebuilds the index from persisted reports should be built alongside
   `migrate.py` and `verify_migration.py` rather than improvised. Postgres is the source of truth;
-  AI Search is derived and must be rebuildable.
+  AI Search is derived and must be rebuildable. **Real as of ADR-029**: `ingest_reports_to_search.py`
+  is that command — it upserts every current, non-fixture report/finding and, on every run, prunes any
+  document Postgres no longer accounts for, which is what makes "derived" actually mean reconcilable
+  rather than merely rebuildable-in-principle. See ADR-029 for the prune mechanism, its guard against a
+  partial listing, and the deferred alias-based rebuild for a schema change that can't be applied in
+  place.
 
 ---
 
@@ -1513,3 +1518,128 @@ and blocks it), not by weakening what it asserts.
 decayed," not "it holds for one identity and not another," but "it was proven exactly as far as it was
 tested, the tests were correctly chosen, and the document's own conclusion overstated their reach; both
 the test coverage and the claim now match, and the guarantee holds unconditionally."
+
+---
+
+## ADR-029: The RAG index gets a real prune step, and near-duplicate weekly findings are resolved by ranking, not by discarding history
+
+**Context**: the RAG index report (Task 48, pre-Phase-9) surfaced two real gaps, both traced back to the
+same root cause — the index has only ever grown. `ingest_reports_to_search.py` calls
+`merge_or_upload_documents` exclusively; nothing has ever deleted a document from it. Two concrete,
+observed consequences: (1) report 999, a fixture row from an earlier, since-abandoned test ingestion,
+was still live in the index and retrievable by the chat assistant, with no mechanism to ever remove it
+short of a manual, out-of-band delete; (2) Agentic AI Observability Platform's own weekly
+re-investigation of the same ~115 committed items produces near-identical finding-level chunks across
+consecutive weeks, differing mainly in `week_of` and sometimes status — a retrieval-quality risk once
+that program is actually reindexed, since an older, superseded chunk can rank close enough to the
+current one for the model to cite either with equal confidence.
+
+**Decision, prune step (Option A — reconcile against real Postgres state, not a targeted delete)**: the
+property this closes is "what's in the index that Postgres no longer accounts for" — not a one-off fix
+for report 999 specifically. `ingest_reports_to_search.py` now computes the real, full, unscoped set of
+document IDs Postgres says should exist (every non-fixture `reports`/`findings` row,
+`fetch_real_document_ids`), lists the real current index contents, and deletes the difference
+(`prune_stale_documents`) — on every real ingest run, not as an opt-in flag. This is what makes ADR-022's
+own "Postgres is the source of truth; AI Search is derived and must be rebuildable" claim actually true:
+derived means reconcilable back to the source of truth on an ongoing basis, not merely rebuildable in
+principle by adding whatever's missing. A purely additive reindex can leave a retired or reclassified row
+in the index forever; this prune step is what closes that gap for real, going forward, not just for the
+one report that happened to trigger this investigation.
+
+**The `$top=1000` cap is a guard in the code, not a note in a report.** Azure AI Search's own real
+per-request cap on a `search_text="*"` listing call means a listing above `MAX_INDEX_LISTING_PAGE` (1000)
+can no longer be trusted to be a complete enumeration — computing a prune set from a partial listing
+risks deleting documents that are still genuinely valid, just not on the page that was read. The real
+corpus will eventually cross this threshold silently; the failure mode of not guarding it is a wrong,
+over-broad deletion, not a loud error — worse than doing nothing. `prune_stale_documents` therefore raises
+`IndexListingTooLargeError` and refuses to prune at all once the listing reaches the cap, rather than
+proceeding against a listing it cannot vouch for. This project isn't at that scale, and real pagination
+(`$skip`, or an orderby-based keyset) is deliberately not built preemptively for a corpus size this
+project doesn't have yet — but the refusal-to-proceed is real code, live today, not a comment promising
+future caution.
+
+**Deferred, not silently dropped: index aliasing for a real schema-change rebuild.** Azure AI Search's
+real zero-downtime reindex mechanism — build a new index under a new name, then repoint a stable alias at
+it — is not used by this project today; `INDEX_NAME` is a hardcoded constant referenced directly by every
+caller, with no alias layer. The prune step above handles ongoing reconciliation against a stable schema;
+it does not handle a schema change that can't be applied in place to the live index (e.g. a new required
+field with no safe default, or a field whose type must change). **The explicit trigger for building the
+alias mechanism is exactly that condition** — a schema change unappliable in place — not a general
+"someday" item. Recording the trigger condition here is what turns this into a decision deferred with a
+condition attached, rather than an option left for someone to rediscover from scratch when the need
+arrives.
+
+**Decision, near-duplicates (scoring profile + prompt instruction, not index-time deduplication)**: the
+alternative seriously considered — index only the latest report per program, discarding older weeks'
+chunks entirely — was rejected. LLD Section 2.3 frames this assistant as an archive of what has already
+been reported, and "how has this item's status changed across weeks" is a real, intended question this
+system should stay well-placed to answer; discarding history to fix a ranking problem solves the wrong
+problem; the corpus is small (a handful of documents per item per week), so the storage/retrieval cost of
+keeping full history is real but not the constraint that decides this.
+
+Instead: a real Azure AI Search `ScoringProfile` (`RECENCY_SCORING_PROFILE_NAME`, `search_index.py`)
+applies a `FreshnessScoringFunction` on `week_of` — `boost=3.0`, `interpolation="quadratic"`,
+`boosting_duration=90 days` — biasing ranking toward the most recent week without excluding older weeks
+from being retrieved or cited when a question is actually about history. Applied explicitly at the
+`hybrid_search()` call site (`scoring_profile=RECENCY_SCORING_PROFILE_NAME`), not as a silent
+`default_scoring_profile` on the index, so the choice is visible at the point it takes effect. Paired with
+an explicit `CHAT_INSTRUCTIONS` addition (`chat_assistant.py`, instruction 5): when multiple retrieved
+chunks describe the same real item across different weeks, prefer the most recent one for a question
+about current status, and use the full set — stating explicitly what changed and when — for a question
+about history.
+
+**Why ranking, not the model, is where this gets fixed — the fourth instance of this project's own
+consistent pattern.** Relying on the model to notice which of several similar chunks is current and
+silently prefer it, unaided, is exactly the class of judgment call this project has repeatedly chosen not
+to leave to the model when a deterministic or structural fix is available instead:
+
+- **ADR-007**: deterministic scoping over adaptive summarization — the system decides what's in scope by
+  rule, not by asking a model to infer it well.
+- **The code-enforced risk floor** (`onepulse_common/quality_gate.py`, `code_enforced_risk_floor_check`):
+  a report cannot be approved with findings a deterministic check can prove are missing or incomplete,
+  regardless of how confident the model's own narrative sounds.
+- **The sha256 status-deck integrity pin** (Task 44, `STATUS_DECK_SHA256_BY_PROJECT`,
+  `reporting/main.py`): which deck is authoritative for a project is settled by a content hash, not by a
+  text heuristic asking whether a deck "looks like" it belongs to the right project.
+- **This decision**: which chunk is current is settled by a scoring function operating on `week_of`
+  before the model ever ranks or reads the results, not by a prompt instruction trusted to catch every
+  case unaided.
+
+The prompt instruction (point 5 above) is real and included — it is not redundant with the scoring
+profile, since a genuinely history-focused question still needs the model to reason correctly across
+multiple weeks' chunks once ranking has surfaced them. But for the specific failure this task set out to
+close — citing a stale status with the same confidence as a current one — the fix is structural, applied
+before the model can get it wrong, not a instruction trusted to catch it after the fact. Same reasoning,
+arriving in a fourth place.
+
+**Verification, real reindex against the real corpus, run only after the code above was in place and the
+full 153-test suite was green**: `python scripts/ingest_reports_to_search.py --target dev`, no
+`--report-ids` scoping — the full, unscoped path. A real, live constraint hit on the first attempt, not
+anticipated in advance: the embedding deployment's GlobalStandard S0 tier rate-limited a single 963-text
+batch call (the real corpus size — 21 real reports + 942 real findings); fixed by batching the embed
+calls (`embed_all`, `EMBEDDING_BATCH_SIZE = 16`) with a real retry-after-cooldown loop on `RateLimitError`,
+a small, deliberate addition to the one caller that actually does bulk embedding — `embed_texts` itself
+stays a plain single-batch call, unchanged, since every other real caller only ever embeds one question at
+a time.
+
+The real, completed run: **963/963 documents uploaded** (21 report chunks + 942 finding chunks — the exact
+real, current non-fixture counts), and **50 stale documents pruned** — `report-999` (the fixture that
+started this investigation) plus 49 superseded `report-1` through `report-50` chunks from Task 17's
+original singleSlide ingestion (`report-51`, still a real report, was correctly NOT pruned). **Report 999
+confirmed gone by a direct, targeted post-reindex query** (`get_document(key="report-999")` → real
+`ResourceNotFoundError`), closing the specific instance that started this whole investigation.
+
+**The near-duplicate fix proven with a real question against real data**, not a synthetic case: found the
+real work item (`source_item_ref=332`, "Testing: Write automated tests for workload identity
+authentication") whose `status_label` genuinely differs across real weekly Agentic AI Observability
+Platform reports — `Needs Human Review` in the weeks of 2026-08-21/22, `On Track` in every other real week
+including the current one (2026-09-07, report 454). Asked "What is the current status of the work item
+about writing automated tests for workload identity authentication in the Agentic AI Observability
+Platform program?" — the real assistant answer: *"Current status (most recent): ... On Track with
+System.State = Resolved... Previously (week of 2026-08-22) the program report listed WI 332
+(authentication/workload-identity tests) as pending human review."* Citations: `report_id=454,
+week_of=2026-09-07` (the current status, correctly primary) and `report_id=361, week_of=2026-08-22` (the
+superseded status, correctly offered as historical context rather than omitted or given equal weight) —
+exactly the behavior instruction 5 in `CHAT_INSTRUCTIONS` specifies. The reindex completing proves the
+mechanism; this answer picking the current week as primary, while still correctly surfacing the real
+history, proves the fix. Full detail recorded in CLAUDE.md's own phase-status log.
