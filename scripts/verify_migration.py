@@ -414,6 +414,28 @@ async def check_real_privilege_denied(
     return True
 
 
+async def check_trigger_exists_and_enabled(conn: asyncpg.Connection, table_name: str, trigger_name: str) -> bool:
+    """Migration 0011 (ADR-028): the real, ACL-independent enforcement
+    mechanism for `approval_records`' append-only guarantee against
+    `pg_write_all_data`-derived privilege (which `check_real_privilege_
+    denied` correctly reports as present for `azure_pg_admin` and always
+    will — that check proves the privilege exists, not that it's
+    effective; this one proves the trigger that makes it ineffective
+    actually exists and is armed). `tgenabled != 'D'` — Postgres's own
+    real encoding for "not disabled" (a trigger's enabled state has more
+    than two values — origin/replica/always — `'D'` is the only one that
+    means off).
+    """
+    row = await conn.fetchrow(
+        "SELECT tgenabled FROM pg_trigger WHERE tgrelid = $1::regclass AND tgname = $2 AND NOT tgisinternal",
+        f"public.{table_name}",
+        trigger_name,
+    )
+    # asyncpg returns pg_catalog's "char" type as raw bytes (confirmed
+    # live: b'O' for "origin"/enabled) — comparing against b"D", not "D".
+    return row is not None and row["tgenabled"] != b"D"
+
+
 async def check_has_table_privileges(
     conn: asyncpg.Connection, schema_name: str, table_name: str, role_name: str, privileges: list[str]
 ) -> bool:
@@ -648,25 +670,33 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
              await check_privilege_revoked(conn, "approval_records", role, ["UPDATE", "DELETE"]))
         )
 
-    # Migration Plan Phase 8 follow-up, real live finding: the two checks
-    # above only prove the ACL layer is clean for the two application
-    # roles — they say nothing about a role that reaches real UPDATE/
-    # DELETE via predefined-role membership (`pg_write_all_data`)
-    # instead of an explicit GRANT. `azure_pg_admin` (this server's real
-    # Entra Administrator role, and every role/human that is a member of
-    # it) is a member of `pg_write_all_data`, which grants UPDATE/DELETE/
-    # INSERT/TRUNCATE on every table in every schema unconditionally,
-    # with zero corresponding row in information_schema.role_table_grants
-    # — confirmed live: a direct `REVOKE DELETE, UPDATE ON
-    # approval_records FROM azure_pg_admin` runs with no error (nothing
-    # to revoke) and has_table_privilege still reports `True` afterward.
-    # This is the real, current, and — as far as this project can
-    # determine — structurally unfixable-at-the-ACL-level gap in the
-    # append-only guarantee: see ADR-028 and Governance & Security
-    # Reference §2 for the full account and the real fix options.
+    # Migration Plan Phase 8 follow-up, real live finding, then a real
+    # fix (ADR-028): the two ACL-based checks above prove nothing about
+    # a role that reaches real UPDATE/DELETE via predefined-role
+    # membership (`pg_write_all_data`) rather than an explicit GRANT.
+    # `azure_pg_admin` (this server's real Entra Administrator role, and
+    # every identity that is a member of it) is a member of
+    # `pg_write_all_data`, which grants UPDATE/DELETE/INSERT/TRUNCATE on
+    # every table in every schema unconditionally, with zero
+    # corresponding row in information_schema.role_table_grants —
+    # confirmed live: `has_table_privilege('azure_pg_admin', ...)`
+    # reports `true`, and a direct `REVOKE` runs with no error and
+    # changes nothing. `check_real_privilege_denied` (below, kept as a
+    # reusable, correct function) will therefore always, permanently,
+    # correctly report `False` for azure_pg_admin here — that is not a
+    # bug to chase, it is the real, structural fact a REVOKE cannot
+    # reach. The actual guarantee now rests on a trigger (migration
+    # 0011), which fires regardless of which privilege path let the
+    # statement reach the table — confirmed live, adversarially, as the
+    # raw admin identity: a real DELETE and a real UPDATE against a real
+    # existing row both raise `approval_records is append-only`, and the
+    # row is confirmed unchanged afterward (CLAUDE.md Task 49 follow-up;
+    # ADR-028 has the full account). The check that matters now is
+    # whether that trigger genuinely exists and is armed, not whether
+    # the underlying privilege is absent — it never can be.
     results.append(
-        ("approval_records append-only for azure_pg_admin (real privilege, not just ACL — see ADR-028)",
-         await check_real_privilege_denied(conn, "approval_records", "azure_pg_admin", ["UPDATE", "DELETE"]))
+        ("approval_records append-only enforcement: real trigger exists and is armed (ADR-028, migration 0011)",
+         await check_trigger_exists_and_enabled(conn, "approval_records", "approval_records_append_only"))
     )
 
     results.append(

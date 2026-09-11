@@ -1343,7 +1343,7 @@ stays exactly as it was).
 
 ---
 
-## ADR-028: The append-only guarantee on `approval_records` does not hold against this server's Postgres Entra Administrator role, and cannot be fixed by revoking anything
+## ADR-028: The append-only guarantee on `approval_records` was correctly built and tested, incompletely described, and is now closed unconditionally by a trigger
 
 **Context**: while checking whether the newly-discovered "an admin-privileged connection can delete
 fixture rows" fact (surfaced incidentally during Phase 8's own reviewer-identity work, while deciding
@@ -1427,3 +1427,89 @@ option set; it does not itself apply a fix.
    finding about historical DELETE activity) — a heavier, likely Next-scope lift.
 
 **Not chosen, yet — this ADR reports the option set for a decision, not a conclusion.**
+
+---
+
+**Decided, built, and adversarially verified, 2026-09-11 — Option 2 (the trigger), with the framing
+corrected.** Option 2 was chosen: it closes the gap rather than describing it, and the alternative
+(Option 1, re-scoping the guarantee's own documented claim) would have left this project's own
+most-cited guarantee needing a permanent footnote about which identity it covers. Building it was
+judged worth that.
+
+**The framing itself needed correcting first, and it is a different kind of correction than every
+prior instance of this project's own "designed correctly, documented confidently, never exercised"
+pattern (Governance & Security Reference §6).** This ADR's own first draft (and the conversation that
+produced it) described the gap as the guarantee having "decayed" or been "undone by a later change."
+Neither is true. The `REVOKE UPDATE, DELETE` on `approval_records` held continuously, for the
+identity it was written to constrain, from Phase 2 onward — confirmed unchanged before and after
+ADR-023's ownership transfer, the specific change first (wrongly) suspected as the cause. **What
+actually happened: Task 31 asked and rigorously, adversarially answered a real, correctly-posed
+question — can the application (`app_role`/`app_role_local_dev`, the only identity any real code path
+in this project ever authenticates as) mutate this table — and this document's own conclusion then
+generalized that specific, well-tested answer into a claim about the guarantee overall, which the
+four tests underlying it never established.** The other five instances in Governance & Security
+Reference §6 are all guarantees nobody had exercised at all. This one was exercised thoroughly and
+correctly, against the right identity, for the right reason — the gap was one sentence claiming more
+than the tests behind it proved, not a lapse in testing rigor. Worth keeping distinct: the fix for
+"never tested" is running the test; the fix for "tested narrowly, described broadly" is narrowing the
+claim to match the evidence, or — as chosen here — widening the enforcement to actually match the
+broader claim that had already, if prematurely, been made.
+
+**Real implementation** (`scripts/migrations/0011_approval_records_append_only_trigger.sql`):
+`reject_approval_records_mutation()`, a trivial `plpgsql` function that unconditionally
+`RAISE EXCEPTION`s naming the real operation and the real calling role, attached as
+`approval_records_append_only`, `BEFORE UPDATE OR DELETE ... FOR EACH ROW`. **A second, real,
+previously-unknown consequence of ADR-023's own "REVOKE ALL then re-GRANT exact intended profile"
+fix, found while writing this migration, not assumed:** `app_role` — the real, current table owner —
+does not itself hold `TRIGGER` privilege on `approval_records`; `has_table_privilege('app_role',
+'approval_records', 'TRIGGER')` is `false`, confirmed live, because ADR-023's own REVOKE ALL stripped
+even the owner's default at-creation-time grant of it, and nothing re-granted it back (the intended
+profile never included it, since nothing before this needed it). `CREATE TRIGGER` genuinely requires
+that ACL bit, ownership alone is not sufficient once it has been explicitly revoked. Resolved with the
+minimal-footprint form: `SET ROLE app_role` (session-level, reachable since `gopi` is a real, confirmed
+member — no interactive AAD auth needed, unlike connecting AS `app_role` directly), `GRANT TRIGGER ...
+TO app_role`, create the trigger, `REVOKE TRIGGER ... FROM app_role` again in the same migration —
+`app_role`'s own real, documented, minimal profile (`verify_migration.py`'s `PUBLIC_TABLE_PROFILES`)
+is unchanged before and after; only the trigger's own continued existence and firing persists, which
+needs no standing privilege once created.
+
+**Adversarial verification, the same rigor Task 31 applied to the application roles, now applied to
+the one identity that had never been covered — a real mutation attempt against a real, existing row,
+not a zero-match probe** (a first attempt using a deliberately nonexistent `report_id` was a real,
+disclosed methodology mistake — `FOR EACH ROW` triggers do not fire when zero rows match, so that
+attempt "succeeded" vacuously and proved nothing; caught and redone against a real row before drawing
+any conclusion):
+
+- Connected as `gopi@gopdhagmail.onmicrosoft.com` (this server's real Entra Administrator identity).
+- `UPDATE approval_records SET notes = 'tampered' WHERE approval_id = <a real, existing row>` →
+  `RaiseError: approval_records is append-only: UPDATE is not permitted (role=gopi@gopdhagmail.onmicrosoft.com)`.
+- `DELETE FROM approval_records WHERE approval_id = <the same real row>` → the identical real error,
+  naming `DELETE`.
+- The real row independently re-queried afterward and confirmed byte-for-byte unchanged — not merely
+  that an exception was raised for some unrelated reason.
+- **Confirmed the trigger does not interfere with legitimate use:** the full `tests/test_human_
+  governance.py` suite (real `approve_report`/`reject_report` end-to-end, both of which `INSERT` into
+  `approval_records`) re-run and passing unchanged — the trigger is scoped to `UPDATE`/`DELETE` only,
+  `INSERT` was never touched.
+- Both proofs are now permanent, repeatable tests, not one-off manual checks:
+  `tests/test_human_governance.py::test_approval_records_append_only_holds_against_the_real_admin_identity`
+  (a new `admin_conn` fixture, authenticated as the real administrator role, same transactional-
+  rollback discipline as every other test in that file) and `tests/test_verify_migration.py`'s two new
+  cases for `check_trigger_exists_and_enabled`.
+
+**`verify_migration.py` now asserts the real, current enforcement mechanism, not an assertion that can
+never be satisfied.** The prior check (`check_real_privilege_denied` against `azure_pg_admin`) was
+replaced, not merely fixed — it was asserting the *absence* of a privilege that structurally cannot be
+absent (`pg_write_all_data` membership is unconditional; no `REVOKE` reaches it), so it would have
+failed forever regardless of any real fix. The new check, `check_trigger_exists_and_enabled`, asserts
+the thing that actually determines whether the guarantee holds: does the real trigger exist and remain
+armed. `check_real_privilege_denied` itself is kept, unchanged, as a correct, reusable function — used
+elsewhere for claims that are actually achievable at the ACL level, not removed just because one use of
+it turned out to be asserting an impossibility. **`verify_migration.py`: 122/122** — the one check that
+had been the sole, documented, expected failure now passes for the right reason (a real trigger exists
+and blocks it), not by weakening what it asserts.
+
+**Governance & Security Reference §2 rewritten** with the corrected framing above — not "the guarantee
+decayed," not "it holds for one identity and not another," but "it was proven exactly as far as it was
+tested, the tests were correctly chosen, and the document's own conclusion overstated their reach; both
+the test coverage and the claim now match, and the guarantee holds unconditionally."

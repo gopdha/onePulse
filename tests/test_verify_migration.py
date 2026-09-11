@@ -34,6 +34,7 @@ from verify_migration import (
     check_privilege_revoked,
     check_real_privilege_denied,
     check_rls_enabled,
+    check_trigger_exists_and_enabled,
     check_schema_exists,
     check_schema_owner,
     check_table_exists,
@@ -162,6 +163,16 @@ async def test_real_privilege_denied_check_detects_the_real_azure_pg_admin_gap(c
         await check_real_privilege_denied(conn, "approval_records", "azure_pg_admin", ["UPDATE", "DELETE"])
         is False
     )
+
+
+async def test_real_trigger_exists_and_enabled_for_approval_records(conn) -> None:
+    # Migration 0011 (ADR-028): the real, ACL-independent enforcement
+    # mechanism for the append-only guarantee.
+    assert await check_trigger_exists_and_enabled(conn, "approval_records", "approval_records_append_only") is True
+
+
+async def test_forced_failure_trigger_check_detects_a_missing_trigger(conn) -> None:
+    assert await check_trigger_exists_and_enabled(conn, "approval_records", "this_trigger_does_not_exist") is False
 
 
 async def test_real_privilege_denied_check_can_report_a_genuine_pass(conn) -> None:
