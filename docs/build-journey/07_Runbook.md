@@ -499,8 +499,22 @@ requirement): Container Registry `onepulseacrdev` (Basic), Log Analytics workspa
 **How to deploy** (no IaC/Bicep yet this phase — real, disclosed scope gap, not an oversight; every
 step below was run directly via `az`, which is what actually exists today to repeat or extend):
 
+**Required step, every time code changes land on `main` — rebuild before verifying, not after
+assuming.** A deployed image reflects whatever commit was checked out when it was built, not
+whatever is currently on `main` — the two silently diverge the moment `main` moves and nobody
+rebuilds. This is a real, live-caught gap, not a hypothetical: a Migration Plan Phase 8 merge was
+verified against deployed compute that turned out to still be running a pre-merge image built
+several commits earlier — real fixture rows (already fixed in the merged code) showed up in a real
+authenticated response through the public FQDN, because the deployed `core_api` had never been
+rebuilt after the fix landed. **The fix is procedural, not automatable without real CI/CD (a
+Now-scope gap, same as the missing IaC above): after any merge to `main` intended to reach the
+deployed environment, rebuild every changed service from the post-merge checkout FIRST, deploy,
+*then* verify — never verify a "confirm deployed still works" claim against an image built before
+the merge, even if it looks close in time.**
+
 ```powershell
-# Build each service's image directly in ACR (no local docker push needed)
+# Build each service's image directly in ACR (no local docker push needed) — from a checkout of
+# the post-merge main, not the pre-merge branch tip.
 az acr build -r onepulseacrdev -t onepulse-core-api:<tag> -f core_api/Dockerfile .
 az acr build -r onepulseacrdev -t onepulse-bff:<tag> -f bff/Dockerfile .
 az acr build -r onepulseacrdev -t onepulse-investigation:<tag> -f investigation/Dockerfile .
