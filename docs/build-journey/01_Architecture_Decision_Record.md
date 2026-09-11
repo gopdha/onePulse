@@ -289,6 +289,22 @@ nonetheless **not chosen**: FastAPI will serve the built bundle, because a singl
 second deployment and a CORS surface, and a CDN provides no measurable benefit for an internal tool
 with a handful of users.
 
+**Real finding, Migration Plan Phase 9, that turns "avoids a CORS surface" from a preference into a
+requirement**: a cross-origin architecture (the React build on one origin, `bff` on another) was tried
+first, on the reasoning that Phase 10's same-origin serving could wait. It cannot. Container Apps' own
+Easy Auth intercepts every request — including a CORS preflight `OPTIONS` — before it ever reaches this
+project's own FastAPI code, and its own unauthenticated response carries no `Access-Control-*` headers
+at all. That defeats every credentialed, preflight-requiring cross-origin request outright, regardless
+of sign-in state — every real POST this frontend makes (trigger, approve, reject, chat) sends a JSON
+body, which is exactly what forces a preflight. No `CORSMiddleware` inside this project's own app can
+fix this, because Easy Auth sits in front of the app, not behind it. Confirmed live: an `OPTIONS`
+preflight with a real `Origin` header returned a bare `401` with zero CORS headers, from Easy Auth
+itself, before this project's own request handling ever ran. Same-origin serving was therefore pulled
+forward into Phase 9 itself, in minimal form (a `StaticFiles` mount in `bff/main.py`, not yet the full
+build/deploy pipeline Phase 10 will formalize) — not because the original reasoning above was wrong, but
+because "avoids a CORS surface" turned out to be load-bearing immediately, not merely a tidiness
+preference for later.
+
 ---
 
 ## ADR-016: Azure Container Apps as the compute target

@@ -23,5 +23,15 @@ RUN pip install --no-cache-dir ./libs/onepulse_common
 COPY trace_debug.py ./trace_debug.py
 COPY bff ./bff
 
+# Migration Plan Phase 9: the real React build, served same-origin —
+# see bff/main.py's own module docstring for why this lives here rather
+# than waiting for Phase 10 (Easy Auth blocks cross-origin CORS
+# preflight before this app's own code ever runs). Must exist on disk
+# BEFORE this image builds: run `npm run build` in frontend/ first —
+# not automated in this Dockerfile, since that would mean a Node build
+# stage in a Python image only to discard it, for a bundle this project
+# already builds via a real, separate `npm run build` step.
+COPY frontend/dist ./frontend/dist
+
 EXPOSE 8100
 CMD ["python", "-m", "uvicorn", "bff.main:app", "--host", "0.0.0.0", "--port", "8100"]

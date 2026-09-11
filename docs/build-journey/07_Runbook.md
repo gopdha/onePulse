@@ -647,3 +647,69 @@ itself (real Easy Auth, deployed only), acquire a real token for `onepulse-bff-s
 `access_as_user` scope instead (`az account get-access-token --scope
 "api://<bff-signin-app-id>/access_as_user"`) — `bff` decodes the real `X-MS-CLIENT-PRINCIPAL` header
 Easy Auth injects and forwards the real `oid` claim on to `core_api`.
+
+## 9. The React Frontend (Migration Plan Phase 9)
+
+**No authentication library, no token in browser JavaScript, ever (ADR-018).** Every real API call
+from `frontend/src/api/client.ts` uses `credentials: "include"` and nothing else — the only real
+mechanism is the HttpOnly session cookie Container Apps' own Easy Auth sets after a real interactive
+sign-in. If a future change adds MSAL or reads/stores a token in this app, that is the exact silent
+reversal ADR-018 exists to prevent.
+
+**Real, load-bearing finding: this app must be served from the same origin as `bff`, not a separate
+dev-server origin — not a preference, a requirement.** Container Apps' Easy Auth intercepts every
+request, including a CORS preflight `OPTIONS`, before it ever reaches this project's own code, and its
+own unauthenticated response carries no `Access-Control-*` headers — confirmed live via a direct
+preflight request. That defeats every real POST this app makes (trigger/approve/reject/chat, all of
+which carry a JSON body and therefore force a preflight) regardless of sign-in state, no matter what
+CORS configuration lives inside `bff`'s own FastAPI app. `bff/main.py` therefore serves the real built
+bundle directly (`StaticFiles` mount at `/`, `frontend/dist`) — a minimal, real version of what
+Migration Plan Phase 10 formalizes, pulled forward because Phase 9's own real end-to-end verification
+needed it now. See ADR-015's own Phase 9 amendment for the full finding.
+
+**How to build and deploy:**
+
+```powershell
+# From the repo root — builds the real static bundle bff/main.py serves.
+cd frontend
+npm install
+npm run build
+cd ..
+
+# bff's own Dockerfile COPYs frontend/dist at build time — must exist
+# on disk first, not generated inside the image (no Node build stage
+# in a Python image, for a bundle already built separately).
+az acr build -r onepulseacrdev -t onepulse-bff:<tag> -f bff/Dockerfile .
+az containerapp update -g onepulse-gr -n onepulse-bff --image onepulseacrdev.azurecr.io/onepulse-bff:<tag>
+```
+
+**Real gotcha, found live: reusing the same image tag across two real deploys is not reliable.**
+`az containerapp update --image ...:<same-tag>` was observed to leave the *previous* revision serving
+100% of traffic even after the command reported success, on at least one real deploy this phase — the
+underlying digest had changed but Container Apps did not necessarily notice. **Always use a distinct
+tag per real deploy** (or check `az containerapp revision list ... --query "[].{name:name,
+traffic:properties.trafficWeight}"` and confirm the new revision shows `100` before trusting anything
+tested against it) — this is what actually caught it, not assumed from the deploy command's own exit
+code.
+
+**How to reach it**: `https://onepulse-bff.<environment-default-domain>.azurecontainerapps.io/` —
+signing in there for real (a genuine interactive Microsoft login, MFA included) sets the session cookie
+for that exact origin; the app then works from that same URL, no separate frontend URL to remember.
+
+**Local dev iteration** (`npm run dev`, Vite on `localhost:5173`) is real but limited: it is a
+different origin from `bff`, so every GET-driven view works once a valid session cookie already exists
+(the browser still sends it cross-site — Easy Auth's own cookies are `SameSite=None`, confirmed live),
+but every real POST hits the exact same preflight block described above, authenticated or not. This is
+a genuine, disclosed limitation of the dev workflow, not a bug to chase — full verification needs the
+real same-origin build.
+
+**Testing the real UI without a human completing MFA each time**: Easy Auth accepts a real delegated
+bearer token in the `Authorization` header as an alternative to the cookie (the same mechanism
+`api_client.py` already uses for Streamlit) — but the *shipped app itself* must never do this (see
+above). For external test automation specifically (a real headless browser session, driven the same
+way every prior UI verification in this project has been done), a real token
+(`az account get-access-token --resource "api://<bff-signin-app-id>"`) can be injected via
+`Network.setExtraHTTPHeaders` over the Chrome DevTools Protocol, outside the app's own code entirely —
+this drives real, unmodified app code end to end without needing an interactive sign-in for every
+check. The one thing this cannot substitute for is proving the real interactive cookie-based sign-in
+flow itself works — that needs a real human to complete it at least once.

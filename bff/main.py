@@ -39,6 +39,23 @@ contract Phase 1 established. There is nothing left to reshape today
 data has come up yet); this file is where that would happen if one did,
 not a promise that reshaping is currently happening.
 
+Migration Plan Phase 9: this service now also serves the real React
+build (`frontend/dist`, `StaticFiles` mount at the bottom of this file)
+from this exact origin — a real, live-checked finding, not a design
+preference, forced by how Easy Auth actually behaves: it intercepts
+every request, including CORS preflight OPTIONS, before this app's own
+code ever runs, and its own unauthenticated 401 carries no CORS headers
+at all. That defeats every credentialed, preflight-requiring
+cross-origin POST (trigger/approve/reject/chat, every one of which
+sends a JSON body) regardless of sign-in state — no CORSMiddleware
+inside this app can fix it, because Easy Auth sits in front of it, not
+behind it. Same-origin serving sidesteps the problem entirely: one real
+browser session cookie, one real origin, no preflight involved. This is
+genuinely what Migration Plan Phase 10 formalizes (build/deploy
+pipeline, cache headers); this is its minimal version, built here
+because real Phase 9 end-to-end verification needed it, not a claim
+that Phase 10 itself is done.
+
 Run: uvicorn bff.main:app --port 8100 (from the repo root). Requires
 core_api running first (`uvicorn core_api.main:app --port 8000`) — see
 the Runbook.
@@ -56,6 +73,7 @@ import httpx
 from azure.identity.aio import DefaultAzureCredential
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
+from fastapi.staticfiles import StaticFiles
 from opentelemetry import trace
 from opentelemetry.propagate import inject
 
@@ -66,6 +84,23 @@ load_dotenv()
 
 CORE_API_BASE_URL = os.environ.get("ONEPULSE_CORE_API_BASE_URL", "http://127.0.0.1:8000")
 CORE_API_IDENTIFIER_URI = os.environ.get("ONEPULSE_CORE_API_IDENTIFIER_URI", "")
+
+# Migration Plan Phase 9: real, live-checked finding, not assumed — a
+# cross-origin CORS approach (dev server on one origin, this service on
+# another, browser fetches with `credentials: "include"`) was tried
+# first and found structurally broken: Container Apps' own Easy Auth
+# intercepts every request, including CORS preflight OPTIONS, BEFORE it
+# ever reaches this app's own code — an unauthenticated preflight gets a
+# bare 401 with no Access-Control-* headers at all, since Easy Auth has
+# no CORS awareness of its own. That defeats every credentialed,
+# preflight-requiring cross-origin request (every real POST this app
+# makes — trigger/approve/reject/chat all send a JSON body) regardless
+# of sign-in state; CORSMiddleware inside this app can never run early
+# enough to fix it, because Easy Auth sits in front of this app, not
+# behind it. The real, working fix is same-origin serving — see the
+# `StaticFiles` mount at the bottom of this file, which is genuinely
+# what Migration Plan Phase 10 formalizes; this is the minimal version
+# of it, built here because real end-to-end verification needed it now.
 STUB_ENTRA_OBJECT_ID = os.environ.get("ONEPULSE_STUB_ENTRA_OBJECT_ID", "local-dev-standin-reviewer")
 
 _tracer = trace.get_tracer(__name__)
@@ -174,6 +209,13 @@ def _proxy_response(upstream: httpx.Response) -> Response:
 # ---------------------------------------------------------------------
 
 
+@app.get("/api/v1/me")
+async def get_me(request: Request) -> Response:
+    headers = await _core_headers(request)
+    resp = await request.app.state.http_client.get("/api/v1/me", headers=headers)
+    return _proxy_response(resp)
+
+
 @app.get("/api/v1/programs")
 async def list_programs(request: Request) -> Response:
     headers = await _core_headers(request)
@@ -250,6 +292,22 @@ async def get_report(request: Request, report_id: int) -> Response:
     return _proxy_response(resp)
 
 
+@app.get("/api/v1/reports/{report_id}/download")
+async def download_report(request: Request, report_id: int) -> Response:
+    """Migration Plan Phase 9: a real, previously-unnoticed gap closed —
+    core_api's own real SAS download route (Phase 8, ADR-021) never had
+    a BFF proxy, since nothing reachable only through the BFF (the real
+    React frontend didn't exist yet) had needed it. Phase 8's own SAS
+    verification reached core_api directly (its own internal-only
+    ingress, reachable via `az containerapp exec`) — the real gap only
+    surfaced once a real browser client, which can only ever reach the
+    BFF's public ingress, needed this specific call.
+    """
+    headers = await _core_headers(request)
+    resp = await request.app.state.http_client.get(f"/api/v1/reports/{report_id}/download", headers=headers)
+    return _proxy_response(resp)
+
+
 @app.post("/api/v1/chat/query")
 async def chat_query(request: Request) -> Response:
     body = await request.json()
@@ -260,3 +318,23 @@ async def chat_query(request: Request) -> Response:
         headers=headers,
     )
     return _proxy_response(resp)
+
+
+# ---------------------------------------------------------------------
+# The real React build, served from this exact origin — see the module
+# docstring's own real finding for why this exists in Phase 9 rather
+# than waiting for Phase 10: cross-origin CORS cannot work here at all,
+# since Easy Auth intercepts and 401s every preflight OPTIONS request
+# before this app's own code ever runs, defeating every credentialed
+# POST regardless of sign-in state. Serving same-origin sidesteps the
+# problem entirely — no preflight, no cross-site cookie question, the
+# browser just has one real session cookie for one real origin. Must
+# stay the LAST route registered: FastAPI/Starlette match routes in
+# registration order, and a mount at "/" would otherwise shadow every
+# `/api/v1/...` route above it. `html=True` serves `index.html` for any
+# path that isn't a real static file — the SPA's own client-side
+# routing (none exists yet; this just means a hard refresh on any real
+# future deep link still resolves to the app instead of a 404).
+_frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+if os.path.isdir(_frontend_dist):
+    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="spa")
