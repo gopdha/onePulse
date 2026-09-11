@@ -1340,3 +1340,90 @@ larger, separate scope, not required for the rate limit to work correctly); migr
 rendering pipeline onto Blob Storage (rejected — the bar needed a real, working SAS mechanism to test
 isolation against, not a full storage migration; every existing `file://` report is unaffected and
 stays exactly as it was).
+
+---
+
+## ADR-028: The append-only guarantee on `approval_records` does not hold against this server's Postgres Entra Administrator role, and cannot be fixed by revoking anything
+
+**Context**: while checking whether the newly-discovered "an admin-privileged connection can delete
+fixture rows" fact (surfaced incidentally during Phase 8's own reviewer-identity work, while deciding
+how to clean up historical test debris in `reports`) had any bearing on `approval_records`'
+append-only guarantee — the single most-tested guarantee in this project (Governance & Security
+Reference §2, three separate prior adversarial attempts, Task 31) — a direct, live check found that
+it does not hold against the real Postgres Entra Administrator role on this server, and has most
+likely never held there.
+
+**The investigation, including a real, corrected hypothesis, not the first one reached for**: the
+first plausible-looking explanation was that ADR-023's retroactive ownership transfer
+(`approval_records`'s owner moved from `app_role_local_dev` to `app_role`) gave the administrator a
+new path to `app_role`'s own privileges via role membership. **This was checked directly and is
+wrong**: `has_table_privilege('app_role', 'approval_records', 'DELETE')` and the same for
+`app_role_local_dev` both correctly return `false` — the explicit `REVOKE UPDATE, DELETE` from
+migration 0001, reasserted by ADR-023's own migration 0004, genuinely holds for both application
+roles, exactly as documented. The real mechanism, found by checking `has_table_privilege` for the
+administrator's own role name directly: `azure_pg_admin` — the role every Entra Administrator on this
+Postgres Flexible Server, including this project's own human operator, is a member of — is itself a
+member of PostgreSQL's built-in `pg_write_all_data` role. That predefined role grants `INSERT`/
+`UPDATE`/`DELETE`/`TRUNCATE` on every table in every schema, unconditionally, to every member, via a
+mechanism that never creates a corresponding row in `pg_class.relacl` or
+`information_schema.role_table_grants` — confirmed live: `pg_default_acl` for this database is
+completely empty (ruling out a default-privileges grant), and `azure_pg_admin`'s own `pg_auth_members`
+row shows direct membership in `pg_write_all_data` alongside `pg_read_all_data`, `pg_monitor`, and
+several other real built-in administrative roles. This is very likely present since this Postgres
+server was first provisioned — long before this project's own schema existed — not something any
+migration in this project introduced or changed.
+
+**Why this was never caught by three prior adversarial tests (Task 31) that specifically tried to
+defeat this guarantee**: every one of those tests connected as `app_role_local_dev` (matching this
+project's own established, correct discipline that local testing should use the real application
+role, not a human's own elevated session) or checked the ACL layer directly. None of them tested the
+guarantee against a connection authenticated as the raw administrator identity itself. The guarantee
+was real, and rigorously tested, for the identity class it was actually built to constrain — it was
+simply never tested against a different identity class that turns out to bypass it by a completely
+unrelated mechanism.
+
+**Confirmed the gap cannot be closed by revoking anything, not merely assumed**: a real, live
+`REVOKE DELETE, UPDATE ON approval_records FROM azure_pg_admin` was executed directly — it completes
+with no error (there was no ACL entry for `azure_pg_admin` to revoke in the first place) and
+`has_table_privilege` reports `true` immediately afterward, unchanged. `pg_write_all_data`'s grant is
+not a per-table ACL entry that a `REVOKE` can remove; it is a structural property of PostgreSQL's
+predefined-role system.
+
+**`verify_migration.py` now asserts this directly, and honestly fails today**: `check_real_privilege_
+denied` (using `has_table_privilege`, which accounts for every real grant path — ACL, ownership, and
+predefined-role membership — unlike the existing `check_privilege_revoked`, which only reads
+`information_schema.role_table_grants` and would report "safe" for `azure_pg_admin` on
+`approval_records` right now, since no ACL entry exists to find) is asserted against `azure_pg_admin`
+specifically. Demonstrated failing against the real, current, unfixed state before any decision was
+made about what to do next — per explicit instruction, this ADR records the finding and the real
+option set; it does not itself apply a fix.
+
+**Real fix options, none applied here — a decision, not a default**:
+
+1. **Accept and document this as an inherent platform boundary**, scoping the guarantee's own stated
+   claim precisely to "holds against the application's own service identity; does not and structurally
+   cannot hold against this server's designated super-administrator role" — the real, corrected
+   framing Governance & Security Reference §2 now states. A real, defensible position: an
+   append-only guarantee that even a legitimate database administrator could never override in a
+   genuine emergency (a legal hold, a compliance-mandated erasure, disaster recovery) would itself be
+   an operational risk, and `pg_write_all_data`-style administrative bypass is standard, expected
+   PostgreSQL/Azure behavior, not a defect specific to this project.
+2. **A `BEFORE DELETE OR UPDATE` trigger on `approval_records` that unconditionally raises an
+   exception.** Real, load-bearing distinction checked, not assumed: Postgres triggers fire for every
+   role executing DML against a table, independent of the ACL/predefined-role layer that grants
+   `pg_write_all_data`'s bypass — a trigger cannot be skipped by having broader read/write privilege
+   the way an ACL check can be. Disabling a trigger requires `ALTER TABLE`, which requires table
+   ownership (`app_role`, not `azure_pg_admin`) or genuine superuser (`azure_pg_admin` is confirmed
+   `rolsuper = false`) — meaning `azure_pg_admin` could not disable this trigger to route around it
+   without first being granted ownership or superuser, neither of which exists today. This would be
+   real, table-level, ACL-independent enforcement — a materially different and stronger mechanism than
+   another `REVOKE`, not evaluated further than this design note pending the user's decision.
+3. **Reduce membership in `azure_pg_admin` to the minimum real operators needed.** Does not close the
+   structural gap (anyone who legitimately needs to be the Entra Administrator still carries it), but
+   reduces blast radius. Likely already minimal today (one real human operator).
+4. **Real-time auditing** (e.g. `pgaudit`) to at least detect if this bypass is ever exercised against
+   `approval_records`, given it cannot be prevented at the grant level. Not currently installed on this
+   server (a real, pre-existing gap independently noted in CLAUDE.md Task 39's own "not determined"
+   finding about historical DELETE activity) — a heavier, likely Next-scope lift.
+
+**Not chosen, yet — this ADR reports the option set for a decision, not a conclusion.**

@@ -540,7 +540,7 @@ async def list_recent_reports(
                     WHERE report_id = r.report_id
                     ORDER BY decided_at DESC LIMIT 1
                 ) ar ON true
-                WHERE r.program_id = ANY($2::uuid[])
+                WHERE r.program_id = ANY($2::uuid[]) AND NOT r.is_test_fixture
                 ORDER BY r.created_at DESC
                 LIMIT $1
                 """,
@@ -561,7 +561,7 @@ async def list_recent_reports(
                     WHERE report_id = r.report_id
                     ORDER BY decided_at DESC LIMIT 1
                 ) ar ON true
-                WHERE r.program_id = $2
+                WHERE r.program_id = $2 AND NOT r.is_test_fixture
                 ORDER BY r.created_at DESC
                 LIMIT $1
                 """,

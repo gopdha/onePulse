@@ -55,16 +55,19 @@ def _to_datetimeoffset(value: dt.date) -> str:
 async def fetch_report_chunks(conn, report_ids: list[int] | None = None) -> list[dict]:
     # `report_ids`, when given, is a real, minimal scoping addition
     # (Migration Plan Phase 8) — indexing exactly one deliberate,
-    # attributable set of report_ids without touching the still-open,
-    # already-documented "no filter at all" gap (Task 39/40) for the
-    # default, unfiltered case, which stays out of this phase's scope.
+    # attributable set of report_ids. The separate, already-documented
+    # "no filter at all" gap (Task 39/40) for the default, unfiltered
+    # case is now half-closed: `is_test_fixture` (Task 49 follow-up)
+    # excludes the real ~440-row test_human_governance.py debris from
+    # ever being indexed, unconditionally, whether or not report_ids is
+    # given.
     rows = await conn.fetch(
         """
         SELECT r.report_id, r.program_id, p.name AS program_name, r.week_of,
                r.rag_status, r.executive_summary
         FROM reports r
         JOIN programs p ON p.program_id = r.program_id
-        WHERE ($1::bigint[] IS NULL OR r.report_id = ANY($1::bigint[]))
+        WHERE ($1::bigint[] IS NULL OR r.report_id = ANY($1::bigint[])) AND NOT r.is_test_fixture
         ORDER BY r.report_id
         """,
         report_ids,
@@ -95,7 +98,7 @@ async def fetch_finding_chunks(conn, report_ids: list[int] | None = None) -> lis
         FROM findings f
         JOIN reports r ON r.report_id = f.report_id
         JOIN programs p ON p.program_id = r.program_id
-        WHERE ($1::bigint[] IS NULL OR f.report_id = ANY($1::bigint[]))
+        WHERE ($1::bigint[] IS NULL OR f.report_id = ANY($1::bigint[])) AND NOT r.is_test_fixture
         ORDER BY f.finding_id
         """,
         report_ids,

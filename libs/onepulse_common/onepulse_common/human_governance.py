@@ -180,7 +180,7 @@ async def list_pending_reviews(conn: asyncpg.Connection, program_id: str, tenant
             """
             SELECT report_id, week_of, rag_status, rendered_artifact_uri, quality_gate_outcome
             FROM reports
-            WHERE program_id = $1 AND reviewed = FALSE
+            WHERE program_id = $1 AND reviewed = FALSE AND NOT is_test_fixture
             ORDER BY week_of
             """,
             program_id,

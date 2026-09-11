@@ -366,6 +366,22 @@ async def check_privilege_revoked(
     table_name — the real proof the LLD's REVOKE actually held, not
     merely that it was never granted in the first place (both produce
     the same absence, which is exactly what matters here).
+
+    Real, load-bearing limitation, found live (Migration Plan Phase 8
+    follow-up): this reads `information_schema.role_table_grants`, which
+    reflects ONLY the explicit ACL layer — a genuine, effective privilege
+    reaching a role via membership in a PostgreSQL *predefined* role
+    (`pg_write_all_data`, granting INSERT/UPDATE/DELETE on every table in
+    every schema to every member, with no per-table ACL entry ever
+    created) is real and enforced by Postgres, but invisible to this
+    query. `azure_pg_admin` is a member of `pg_write_all_data` — this
+    check reports "safe" for it on `approval_records` while `has_table_
+    privilege('azure_pg_admin', 'approval_records', 'DELETE')` correctly
+    reports `True`. Use `check_real_privilege_denied` (below) for any
+    claim that actually needs to hold against every real grant path, not
+    only the ACL one — this function is kept for the checks that
+    specifically are about the ACL layer (e.g. confirming `app_role`'s
+    own explicit grant profile), where it remains correct.
     """
     rows = await conn.fetch(
         "SELECT privilege_type FROM information_schema.role_table_grants "
@@ -375,6 +391,27 @@ async def check_privilege_revoked(
     )
     granted = {r["privilege_type"] for r in rows}
     return not (granted & set(privileges))
+
+
+async def check_real_privilege_denied(
+    conn: asyncpg.Connection, table_name: str, role_name: str, privileges: list[str]
+) -> bool:
+    """True iff `role_name` genuinely cannot exercise any of `privileges`
+    on `table_name` — via `has_table_privilege`, the real Postgres
+    function that accounts for every actual grant path (explicit ACL,
+    ownership, AND predefined-role membership like `pg_write_all_data`),
+    not just the ACL layer `check_privilege_revoked` reads. The real
+    proof the append-only guarantee on `approval_records` holds against
+    a given role, not merely that no `GRANT` statement targets it by
+    name.
+    """
+    for priv in privileges:
+        allowed = await conn.fetchval(
+            "SELECT has_table_privilege($1, $2, $3)", role_name, f"public.{table_name}", priv
+        )
+        if allowed:
+            return False
+    return True
 
 
 async def check_has_table_privileges(
@@ -552,6 +589,9 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
     results.append(
         ("column dropped: reports.curated_features", not await check_column_exists(conn, "reports", "curated_features"))
     )
+    results.append(
+        ("column exists: reports.is_test_fixture (0009)", await check_column_exists(conn, "reports", "is_test_fixture"))
+    )
 
     results.append(
         ("generated column: configurations.manifest_complete",
@@ -607,6 +647,27 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
             (f"approval_records append-only for {role}",
              await check_privilege_revoked(conn, "approval_records", role, ["UPDATE", "DELETE"]))
         )
+
+    # Migration Plan Phase 8 follow-up, real live finding: the two checks
+    # above only prove the ACL layer is clean for the two application
+    # roles — they say nothing about a role that reaches real UPDATE/
+    # DELETE via predefined-role membership (`pg_write_all_data`)
+    # instead of an explicit GRANT. `azure_pg_admin` (this server's real
+    # Entra Administrator role, and every role/human that is a member of
+    # it) is a member of `pg_write_all_data`, which grants UPDATE/DELETE/
+    # INSERT/TRUNCATE on every table in every schema unconditionally,
+    # with zero corresponding row in information_schema.role_table_grants
+    # — confirmed live: a direct `REVOKE DELETE, UPDATE ON
+    # approval_records FROM azure_pg_admin` runs with no error (nothing
+    # to revoke) and has_table_privilege still reports `True` afterward.
+    # This is the real, current, and — as far as this project can
+    # determine — structurally unfixable-at-the-ACL-level gap in the
+    # append-only guarantee: see ADR-028 and Governance & Security
+    # Reference §2 for the full account and the real fix options.
+    results.append(
+        ("approval_records append-only for azure_pg_admin (real privilege, not just ACL — see ADR-028)",
+         await check_real_privilege_denied(conn, "approval_records", "azure_pg_admin", ["UPDATE", "DELETE"]))
+    )
 
     results.append(
         ("CHECK constraint: cycles.status covers all 4 ADR-021 terminal outcomes + queued/running/failed (0003)",

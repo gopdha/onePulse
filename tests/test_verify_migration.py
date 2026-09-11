@@ -32,6 +32,7 @@ from verify_migration import (
     check_policy_definition_contains,
     check_policy_exists,
     check_privilege_revoked,
+    check_real_privilege_denied,
     check_rls_enabled,
     check_schema_exists,
     check_schema_owner,
@@ -139,6 +140,41 @@ async def test_forced_failure_revoke_check_detects_a_real_grant(conn) -> None:
     assert (
         await check_privilege_revoked(conn, "findings", "app_role_local_dev", ["INSERT"])
         is False
+    )
+
+
+async def test_real_privilege_denied_check_passes_for_app_role_local_dev(conn) -> None:
+    # The real, still-correct case: app_role_local_dev's own ACL grant
+    # on approval_records is genuinely SELECT+INSERT only.
+    assert (
+        await check_real_privilege_denied(conn, "approval_records", "app_role_local_dev", ["UPDATE", "DELETE"])
+        is True
+    )
+
+
+async def test_real_privilege_denied_check_detects_the_real_azure_pg_admin_gap(conn) -> None:
+    # The real, live gap this task found (ADR-028): azure_pg_admin
+    # reaches real DELETE/UPDATE via predefined-role membership
+    # (pg_write_all_data), invisible to check_privilege_revoked's own
+    # information_schema-based query. This must FAIL today, honestly —
+    # it is the exact assertion the fix (once decided) needs to flip.
+    assert (
+        await check_real_privilege_denied(conn, "approval_records", "azure_pg_admin", ["UPDATE", "DELETE"])
+        is False
+    )
+
+
+async def test_real_privilege_denied_check_can_report_a_genuine_pass(conn) -> None:
+    # Proves this isn't hardcoded to always return False for
+    # azure_pg_admin-like inputs: a privilege it genuinely lacks
+    # (a role with no real access to a completely unrelated,
+    # nonexistent-for-it privilege combination) still reports True.
+    # tenants has no CHECK/RLS/anything special — app_role_local_dev's
+    # own real grant there is SELECT+INSERT, same shape as
+    # approval_records, confirming the function isn't just special-cased.
+    assert (
+        await check_real_privilege_denied(conn, "tenants", "app_role_local_dev", ["UPDATE", "DELETE"])
+        is True
     )
 
 
