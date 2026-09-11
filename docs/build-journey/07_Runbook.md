@@ -511,6 +511,32 @@ from earlier phases, "raise `minReplicas` to 1 temporarily before a demo, return
 discipline is what makes leaving `minReplicas` at 1 indefinitely the wrong *default*, not because
 warming itself is discretionary.
 
+**`reporting` joined the scale-to-zero set in the Task 47 follow-up (ADR-026) — it is no longer the
+one `minReplicas: 1` exception, and its own warm-up need is real but shaped differently from the
+other three.** Real, measured cold start: a genuinely fresh replica (confirmed by pod name, not
+assumed), started from a confirmed zero-replica state, went from replica-creation to actually
+claiming a real `report-cycles` message in **~21.6 seconds** (~27.4 seconds counting from the moment
+the message was published) — the fastest cold start of the four services, despite carrying the bulk
+of the real business logic (Synthesis, Self-critique, Rendering, persistence). **Honest caveat on
+the measurement itself:** this was timed via a forced `az containerapp revision deactivate` /
+`activate` cycle, not a genuine KEDA queue-triggered scale-from-zero event — the KEDA scaler for both
+queue-driven services (`investigation` and `reporting`) was independently confirmed, the same day,
+to be affected by a real, intermittent Azure Container Apps platform flake (`KEDAScalerFailed: error
+parsing azure queue metadata: no connection setting given`, recurring every 5-17 minutes on both
+services regardless of real queue activity — see ADR-026's own appended finding) that made observing
+a literal KEDA-triggered cold start impractical on the day this was measured. The revision
+deactivate/activate mechanism is the closest available real proxy — a genuinely new pod, from zero,
+timed against a real external event — not a theoretical estimate.
+
+**Because `reporting`'s trigger is now a queue message, not an HTTP endpoint, warming it needs a
+different action than warming `bff`/`core_api`/`investigation`.** A plain throwaway `curl` against
+`bff` warms `bff` and, if it calls through, `core_api` — it does **not** reach `reporting` at all,
+since nothing about a read-only request touches `report-cycles`. Warming `reporting` before a demo
+means triggering one real, throwaway report cycle (`POST /api/v1/programs/{programId}/reports`
+through `bff`) a few minutes beforehand, same as the other three services' warm-up, just via a
+different real action — not an oversight to fix, a real consequence of this service's own trigger
+shape.
+
 **Proving no interactive credential is present, the literal Phase 7 bar:** `az containerapp exec`
 into any of the four apps and run `az account show` — it fails with `Please run 'az login' to setup
 account`, confirmed live; there is no shared `azure_cli_state`-equivalent volume mounted anywhere in

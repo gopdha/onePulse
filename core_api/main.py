@@ -17,11 +17,18 @@ added is *service* authentication (proving the caller is really the
 BFF) and real identity *resolution* (turning a forwarded object ID into
 a real actor), neither of which is reviewer auth; `onepulse_common` is
 not modified by this file's own routes. The third — no report-trigger
-endpoint — is real now (Migration Plan Phase 3, ADR-021): `POST
+endpoint — is real now (Migration Plan Phase 3, ADR-021, made
+queue-driven in a Phase 7 follow-up, ADR-026): `POST
 /api/v1/programs/{programId}/reports` inserts a real `queued` row into
-the `cycles` status table and returns `202` immediately; it does not
-execute the pipeline itself. A separate worker process (`worker/main.py`)
-polls that table and does the real work — see its own module docstring.
+the `cycles` status table AND publishes a real, thin `report-cycles`
+queue message (`cycle_id` only — `cycles` itself stays the source of
+truth for everything else) so the Reporting service can be woken from a
+real scaled-to-zero state, then returns `202` immediately; it does not
+execute the pipeline itself. The Reporting service (`reporting/main.py`)
+consumes that queue and does the real work — see its own module
+docstring, including the real ADR-026 resume check that makes a
+redelivered message skip re-dispatching Investigation when it already
+completed.
 Real deviation from LLD 2.1's literal body shape (`{"requestedBy":
 "<actorId>"}`), stated plainly: identity here follows the same real
 ADR-017 pattern as approve/reject/chat — resolved server-side from the
@@ -48,6 +55,7 @@ import asyncpg
 from agent_framework.foundry import FoundryChatClient
 from arize.otel import set_routing_context
 from azure.identity import DefaultAzureCredential
+from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -63,6 +71,7 @@ from onepulse_common.config import PostgresSettings
 from onepulse_common.cycles import create_cycle, get_cycle
 from onepulse_common.db import PostgresClient
 from onepulse_common.embeddings import build_embedding_client
+from onepulse_common.queues import REPORT_CYCLES_QUEUE, get_queue_client, send_json_message
 from onepulse_common.human_governance import (
     NotesRequiredError,
     approve_report,
@@ -95,9 +104,16 @@ _tracer = trace.get_tracer(__name__)
 async def lifespan(app: FastAPI):
     pg_client = await PostgresClient.connect(PG_SETTINGS, min_size=1, max_size=5)
     credential = DefaultAzureCredential()
+    async_credential = AsyncDefaultAzureCredential()
     search_client = build_search_client(credential)
     embedding_client = build_embedding_client(credential)
     chat_client = FoundryChatClient(project_endpoint=PROJECT_ENDPOINT, model=DEPLOYMENT_NAME, credential=credential)
+
+    # Real ADR-026 addition: the trigger endpoint's own queue client,
+    # held open for the process lifetime (the same real pattern as
+    # every other client here) rather than opened/closed per request.
+    report_cycles_client = get_queue_client(REPORT_CYCLES_QUEUE, async_credential)
+    await report_cycles_client.__aenter__()
 
     # Real dual-export observability (Application Insights + Arize),
     # the identical function every other real entry point in this
@@ -112,10 +128,13 @@ async def lifespan(app: FastAPI):
     app.state.embedding_client = embedding_client
     app.state.chat_client = chat_client
     app.state.arize_space_id = arize_space_id
+    app.state.report_cycles_client = report_cycles_client
 
     try:
         yield
     finally:
+        await report_cycles_client.__aexit__(None, None, None)
+        await async_credential.close()
         await pg_client.close()
         await search_client.close()
         await embedding_client.close()
@@ -361,13 +380,26 @@ async def trigger_report(
     module docstring for why this deviates from the LLD's literal
     body-supplied `requestedBy` field.
 
-    Real API-to-worker tracing (this phase's own bar): captures the
-    current active span's context (this route's own span, nested under
-    whatever `tracing_middleware` already extracted from the BFF) as a
-    real W3C traceparent via `opentelemetry.propagate.inject`, stored on
-    the cycle row so the worker can nest its own root span under this
-    exact request — the same real mechanism Phase 2 already proved
-    across the BFF-to-core-API hop, now proved a second time.
+    Real API-to-Reporting tracing (Phase 3's own bar, unaffected by the
+    ADR-026 queue-driven trigger): captures the current active span's
+    context (this route's own span, nested under whatever
+    `tracing_middleware` already extracted from the BFF) as a real W3C
+    traceparent via `opentelemetry.propagate.inject`, stored on the
+    cycle row so Reporting can nest its own root span under this exact
+    request — the same real mechanism Phase 2 already proved across the
+    BFF-to-core-API hop, now proved a third time.
+
+    ADR-026: after the real `cycles` INSERT, publishes a real, thin
+    `report-cycles` message (`cycle_id` only) so the Reporting service
+    can be woken from a real scaled-to-zero state — `cycles` itself
+    stays the source of truth for program_name/requested_by_actor_id/
+    trace_context, so nothing needs duplicating into the envelope.
+    Real, disclosed, accepted gap: if the publish itself fails after the
+    INSERT already committed, the cycle row is left `queued` with
+    nothing to ever wake Reporting for it — no distributed transaction
+    exists between Postgres and Storage Queues to prevent this, and no
+    sweep/retry mechanism was built for it here, since it wasn't asked
+    for and the failure window is real but narrow.
     """
     carrier: dict[str, str] = {}
     inject(carrier)
@@ -382,6 +414,8 @@ async def trigger_report(
             result = await create_cycle(conn, program_id, str(actor["actor_id"]), trace_context)
         except asyncpg.exceptions.ForeignKeyViolationError:
             raise HTTPException(status_code=404, detail={"error": "program_not_found"})
+
+    await send_json_message(request.app.state.report_cycles_client, {"cycle_id": str(result["cycle_id"])})
     return TriggerResponse(cycleId=str(result["cycle_id"]), status=result["status"])
 
 

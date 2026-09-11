@@ -6,19 +6,20 @@ module is the actual Postgres I/O, same split as
 quality_gate` (pure) elsewhere in this project.
 
 The real job this closes: pipeline execution moves out of the request
-path into a worker (a separate local process today — no queue exists
-yet, that's Phase 4/ADR-019). `create_cycle` is what the core API's
-trigger endpoint calls to enqueue real work and return `202` immediately
-without executing anything; `claim_next_queued_cycle` is what the worker
-calls to atomically pick up the next real job (`FOR UPDATE SKIP LOCKED`
-— the standard Postgres job-queue idiom; there is exactly one worker
-process today, but the claim is already correct if a second one is ever
-run, at zero extra cost now); `write_cycle_stages`/`mark_cycle_terminal`/
-`mark_cycle_failed` are what the worker calls to persist real progress
-DURING execution and the real terminal outcome; `get_cycle` is what the
-core API's polling endpoint calls to answer a client's status question
-from the database, not from whatever process happens to be running the
-work.
+path into a service (Reporting) reached over a real queue, not a
+request. `create_cycle` is what the core API's trigger endpoint calls
+to enqueue real work and return `202` immediately without executing
+anything; `get_cycle_for_execution` is what Reporting calls when a real
+`report-cycles` queue message is delivered (ADR-026, Phase 7 follow-up
+— the outer trigger's own DB-polling claim,
+`claim_next_queued_cycle`/`FOR UPDATE SKIP LOCKED`, is retired: the
+queue's own visibility-timeout lease is now the real concurrency
+control, the same role it already plays for Investigation since Phase
+4); `write_cycle_stages`/`mark_cycle_terminal`/`mark_cycle_failed` are
+what Reporting calls to persist real progress DURING execution and the
+real terminal outcome; `get_cycle` is what the core API's polling
+endpoint calls to answer a client's status question from the database,
+not from whatever process happens to be running the work.
 """
 
 from __future__ import annotations
@@ -65,34 +66,35 @@ async def create_cycle(
     return {"cycle_id": row["cycle_id"], "status": row["status"]}
 
 
-async def claim_next_queued_cycle(conn: asyncpg.Connection) -> dict | None:
-    """Atomically claims the oldest real `queued` cycle, joining
-    `programs` for the real ADO project name `run_pipeline_cycle` needs
-    — returns None if nothing is queued right now (the worker's own
-    polling loop sleeps and retries; there is no queue to block on yet).
+async def get_cycle_for_execution(conn: asyncpg.Connection, cycle_id: str) -> dict | None:
+    """Real read-and-mark-running for the queue-driven Reporting
+    consumer (ADR-026, Phase 7 follow-up) — called every time a real
+    `report-cycles` message is delivered, including redeliveries.
+    Unlike the retired `claim_next_queued_cycle`, concurrency is no
+    longer a SQL row lock (`FOR UPDATE SKIP LOCKED`): the queue's own
+    visibility-timeout lease is what guarantees only one consumer holds
+    a given message at a time, the same real mechanism already proven
+    for Investigation since Phase 4. This function therefore marks the
+    row 'running' unconditionally on every delivery — idempotent, not
+    exclusive — so `cycles` stays an accurate live status mirror
+    regardless of how many times the same cycle_id is redelivered.
+    `started_at` uses `COALESCE` so a redelivery does not reset the
+    real original start time.
 
     `requested_by_actor_id` is returned too (Migration Plan Phase 4):
     the Reporting service carries it into the real
-    `investigation-requests` message envelope — unused by Investigation
-    today, but needed later for FR-11's per-user rate limit/cost
-    attribution, and an awkward retrofit once messages are in flight.
+    `investigation-requests` message envelope.
     """
     row = await conn.fetchrow(
         """
         UPDATE cycles c
-        SET status = 'running', started_at = now(), updated_at = now()
+        SET status = 'running', started_at = COALESCE(c.started_at, now()), updated_at = now()
         FROM programs p
-        WHERE c.cycle_id = (
-            SELECT cycle_id FROM cycles
-            WHERE status = 'queued'
-            ORDER BY created_at
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-        )
-        AND p.program_id = c.program_id
+        WHERE c.cycle_id = $1 AND p.program_id = c.program_id
         RETURNING c.cycle_id, c.program_id, p.name AS program_name, c.trace_context,
                   c.requested_by_actor_id
-        """
+        """,
+        cycle_id,
     )
     if row is None:
         return None

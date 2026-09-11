@@ -894,3 +894,266 @@ kind of thing," and the document should not read as though they are.
 Reasoning above); reopening ADR-018's own choice of Easy Auth over an application-level token
 validator, which would trade this exception for a different, larger scope of code this project would
 then own and have to get right itself.
+
+---
+
+## ADR-026: `reporting`'s outer trigger becomes queue-driven — the last `minReplicas: 1` exception removed, and redelivery made cheap, not just safe
+
+**Context**: Migration Plan Phase 7's own deployment gave every service `minReplicas: 0` except
+`reporting`, for a real, disclosed reason: `reporting`'s outer loop was a plain Postgres `cycles`-table
+poll (`FOR UPDATE SKIP LOCKED`, unchanged since Phase 3), triggered by nothing the platform could ever
+observe — no HTTP request, no queue message — so nothing could ever wake it from a scaled-to-zero
+state. That exception cost roughly $21.71/month (Task 47's own real Azure Retail Prices calculation),
+the dominant line item in the ~$30-40/month this phase added against the ~CA$35 baseline. A same-turn
+report (recorded in Task 47's own follow-up, CLAUDE.md) found converting this to queue-driven was a
+small, bounded change: `onepulse_common/queues.py` was already generic and reusable, and
+Investigation's own consumer-loop shape (lease renewal, poison dead-lettering, delete-only-after-
+terminal — Phase 4, ADR-019/020) was an already-proven pattern to copy, not a design to invent. That
+report also named one real property worth a deliberate decision rather than silently accepting:
+Investigation dispatch is ~80% of a real cycle's runtime and where its real Foundry/ADO token spend
+concentrates — a message redelivered after a kill (the same real property Phase 4's kill test proved
+for Investigation) would, under a naive copy of that pattern, simply re-run the whole cycle from
+scratch, including a full, real, paid-for re-investigation. Safe (nothing corrupts), but not free.
+
+**Decision**: Convert `reporting`'s outer trigger to a real Azure Storage Queue consumer on a new
+`report-cycles` queue (core_api's trigger endpoint publishes a real, thin message — `cycle_id` only —
+immediately after its existing `cycles` INSERT), matching Investigation's already-proven shape exactly:
+`CYCLE_VISIBILITY_TIMEOUT_SECONDS = 90`, `CYCLE_LEASE_RENEWAL_INTERVAL_SECONDS = 45`, poison
+dead-lettering at the same shared `MAX_DEQUEUE_COUNT`, and delete-only-after-terminal (`cycles` reaching
+either a real success outcome via `mark_cycle_terminal` or a real, recorded application failure via
+`mark_cycle_failed` — both terminal, both correctly stop redelivery; only a genuine crash before either
+of those writes leaves the message to redeliver). `reporting` moves to `minReplicas: 0` with a real KEDA
+`azure-queue` custom scale rule on `report-cycles` (the identical no-identity-block configuration
+already proven for Investigation — the platform falls back to the container app's own attached Managed
+Identity automatically). The Phase 3 DB-polling claim, `claim_next_queued_cycle`
+(`FOR UPDATE SKIP LOCKED`), is retired outright and removed from the codebase, not left dormant — the
+queue's own visibility-timeout lease is now the real concurrency control, replacing the SQL row lock the
+same way it already replaced it for Investigation.
+
+**The redelivery-is-cheap fix, the actual new design work**: before ever dispatching to Investigation,
+`reporting` now asks whether Investigation's own store already has a real, completed result for this
+exact `cycle_id` — over the identical real HTTP route (`GET /internal/investigations/{cycle_id}`)
+Reporting already uses to fetch results once dispatch has happened, extended to also serve as the resume
+check (a 404 means "not yet," a real body means "already answered — use it"). No new state was added to
+`cycles` for this: Investigation's own `investigation_runs` table is already keyed on `cycle_id`
+(`ON CONFLICT DO UPDATE`, Phase 4's own upsert design, specifically so redelivery there overwrites
+rather than accumulates) and is therefore already the single, authoritative place to ask "has this
+finished." Reusing it here means the resume check needed exactly one new function
+(`_resolve_investigation_result`) wrapping the existing fetch, not a second tracking mechanism that
+could drift out of sync with the first. The result: a redelivered `report-cycles` message (Reporting
+killed mid-cycle, the message's lease expiring and becoming visible again) now skips the expensive
+re-dispatch entirely whenever Investigation already answered, and resumes straight into rendering off
+the real, already-paid-for findings — turning "redelivery is safe" into "redelivery is cheap," the
+property that makes at-least-once delivery comfortable to rely on rather than merely tolerable.
+
+**Reasoning — why this belongs in `cycles`/`investigation_runs`'s existing shape rather than a new
+mechanism**: the alternative (e.g., a separate "has Investigation been dispatched for this cycle" flag
+written by `reporting` itself before dispatching) would create two sources of truth that could disagree
+— `reporting`'s own flag saying "dispatched" while Investigation's own store says "never received it,
+or received it and crashed before completing" — exactly the kind of drift this project's own governance
+record (Governance & Security Reference §6) has repeatedly found and corrected elsewhere (documented
+privilege assumptions, ownership assumptions) never checked against what the code actually does. Asking
+Investigation directly, every time, is slower by exactly one real HTTP round-trip per cycle (negligible
+against a multi-minute real run) and structurally cannot drift, because there is only ever one place the
+answer lives.
+
+**Consequences**:
+
+- Every backend service in this deployment now scales to zero uniformly — no service is special. The
+  ~$22/month `reporting`-specific cost is removed; the real, revised total is reported in CLAUDE.md's
+  Task 47 follow-up entry against the same ~CA$35 baseline, not asserted here.
+- A `report-cycles` message now genuinely can be delivered to more than one `reporting` replica at once
+  (KEDA queue-depth scaling, same as Investigation) — this is correct and safe under the queue's own
+  exclusive-lease-per-message semantics, the same real guarantee Investigation has relied on since
+  Phase 4; `reporting` was never actually single-consumer by any code-level guarantee, only by
+  `minReplicas: 1`'s own accident.
+- A real, permanent trade-off, stated plainly rather than glossed over: the resume check adds one real
+  HTTP round-trip to `investigation`'s own service at the start of every cycle, dispatched or resumed —
+  a real, small, constant cost paid on every run (not only redeliveries) in exchange for redelivery
+  never re-paying the ~80%-of-runtime cost. Judged worthwhile given how much more expensive a
+  redelivered full re-investigation would be, but not free.
+- `claim_next_queued_cycle` is gone; any future code that assumed a `cycles`-table poll still existed as
+  Reporting's own trigger mechanism would need to be aware of this — `get_cycle_for_execution` is its
+  real replacement, called on every `report-cycles` delivery (first or redelivered) rather than only
+  when claiming fresh work.
+
+**Not chosen**: a separate `reporting`-owned "already dispatched" flag (rejected — see Reasoning, a
+second source of truth that could drift from Investigation's own real record); keeping `reporting` at
+`minReplicas: 1` and only fixing the redelivery-cost problem (rejected — the always-on cost was the
+original, stated motivation for doing this work at all, not a side effect to leave standing once the
+resume logic existed).
+
+**A real, live-discovered CLI gap found while deploying this, extending Phase 7's own "omit the
+identity block" finding rather than repeating it:** `az containerapp update --scale-rule-name ...
+--scale-rule-type azure-queue --scale-rule-metadata ...` (no `--scale-rule-auth` passed) does not, in
+fact, produce a scale rule with no auth/identity block at all — it produces one with an explicit,
+present-but-empty `"auth": []` array. Investigation's own real, working rule (Phase 7) has no `auth`
+key whatsoever. Deployed this way, `reporting` sat at a real, live-confirmed `minReplicas: 1`
+equivalent — never scaling down — with Container Apps' own system log recording a real, repeated
+`KEDAScalerFailed`: `error parsing azure queue metadata: no connection setting given`. The empty array
+is evidently not treated as "no auth specified, fall back to the attached Managed Identity" the way an
+absent key is — a real, narrow distinction between "empty" and "absent" in how Container Apps'
+CLI-generated payload differs from a direct ARM PATCH. **Fixed** the same way Phase 7's own original
+finding was fixed: a direct `az rest --method patch` against the `Microsoft.App/containerApps` resource,
+setting the scale rule's `custom` object with only `type` and `metadata`, omitting `auth` from the JSON
+body entirely rather than passing an empty value for it — confirmed live: the `KEDAScalerFailed` errors
+stopped immediately after, and `reporting` scaled to zero on its own within one real cooldown period.
+Worth carrying forward: for this project's own real Managed-Identity-fallback KEDA pattern, prefer a
+direct ARM PATCH over `az containerapp update --scale-rule-*` for the auth-sensitive part of a custom
+scale rule, or verify the resulting JSON has no `auth` key at all (not merely an empty one) before
+trusting it.
+
+**A second, real, more consequential finding, surfaced only because this deployment was watched for
+scale-to-zero this closely and this patiently for the first time:** even with the ARM shape corrected
+(no `auth` key, byte-for-byte matching Investigation's own real, working rule), `reporting`'s system
+log kept recording the identical `KEDAScalerFailed: error parsing azure queue metadata: no connection
+setting given` sporadically — roughly every 5-15 minutes — well after the fix. Checked directly whether
+this was specific to the new rule, not assumed: Investigation's own already-proven, unchanged-since-
+Phase-7 `investigation-requests-queue-scale` rule shows the **identical** error, at the identical
+cadence, in the same real time window (confirmed via a direct Log Analytics query against
+`onepulse-investigation`'s own system logs). **This is a real, intermittent Azure Container Apps
+platform behavior in the KEDA-to-Managed-Identity resolution path, affecting both queue-scaled services
+equally — not a defect introduced by this task, and not something client-side RBAC, ARM shape, or
+identity-attachment configuration can fix** (all three independently confirmed correct for both apps
+before this was found). The practical consequence: `cooldownPeriod`'s 300-second countdown appears not
+to survive a failed scaler evaluation cleanly — a single sporadic failure seems to interrupt or reset
+accumulated "confirmed empty" time, so a service whose failures recur more frequently than the cooldown
+window can complete (as `reporting`'s did during this task's own observation) can be kept at a
+persistent 1 replica indefinitely by an error that never actually reflects real work. Investigation's
+own sparser failure cadence apparently leaves it enough clean windows to reach zero in practice (this
+project's own prior real deployment history shows it scaling from zero repeatedly), but this had never
+been watched continuously long enough before to notice the same underlying flake was present there too.
+**Not a client-side bug to chase further; recorded here as a real, disclosed platform characteristic**
+worth knowing before assuming a stuck-at-N-replicas Consumption app is a code or config defect —
+check the app's own `KEDAScalerFailed` history in its system logs before assuming that.
+
+**Follow-up, same task, 2026-09-10/11 — the platform-flake conclusion checked with real evidence
+before proceeding, not assumed, per an explicit instruction to rule out the alternative explanation
+first: the services could simply be legitimately busy, not stuck.** Checked directly, not inferred:
+`report-cycles` and `investigation-requests` (the two queues each app's own scale rule watches) both
+showed `approximate_message_count=0` — a count that includes invisible/leased messages, so this rules
+out "a message is mid-lease and correctly keeping the app warm." Investigation's own real, live SDK-
+level HTTP logs (`azure-storage-queue`'s own request/response tracing) showed it performing a genuine
+empty poll (`GET .../investigation-requests/messages... → 200`, no message body) at the exact moment
+checked — direct proof of idleness, not absence of evidence. A `findings-ready` message that did
+exist (1 message, `dequeue_count=0`) was traced to its real, harmless origin: the earlier local kill
+test's own redelivered attempt took the resume shortcut and never called `_await_findings` again,
+orphaning the original completion notification (7-day TTL, irrelevant to either scale rule). With the
+"legitimately busy" alternative ruled out by direct evidence, the platform-flake conclusion stood, and
+work proceeded exactly as authorized: real full-scope AOP run, kill test, and redelivery proof against
+deployed compute, with the zero-replica/cold-start items measured via a real, disclosed proxy
+mechanism where KEDA's own scale-from-zero stayed blocked by the flake for the remainder of this
+session.
+
+**The real full-scope AOP run, triggered through the deployed `bff`, completed end to end through the
+new queue-driven path:** 115 items across 7 committed features, `route_to_human_review after 1
+revision`, correctly hit the pre-existing weekly collision (`not_persisted_already_exists`, report
+454), 2m59s total — `core_api` → `report-cycles` → `reporting` → `investigation-requests` →
+`investigation` → `findings-ready` → `reporting` (resume fetch) → rendering/persistence, all on real
+deployed compute.
+
+**The kill test, done for real against deployed compute, took five real attempts to get a genuine hard
+kill — each failed mechanism reported here rather than silently discarded, since the failures
+themselves are real findings about this platform:**
+1. `az containerapp exec --command "kill -9 1"` — connected, appeared to execute, but the target cycle
+   completed uninterrupted (`restartCount: 0`, identical replica start time before and after). A
+   follow-up `ps aux` via the same mechanism produced the identical generic `ClusterExecFailure`
+   disconnection error with no output at all — for a completely harmless command — proving the error
+   is generic exec-session teardown noise in this environment, not evidence the kill command itself
+   ran inside the real app's PID namespace. **`az containerapp exec` is not a reliable hard-kill
+   mechanism for this platform** — recorded as a real, disclosed platform characteristic, not chased
+   further.
+2. `az containerapp revision restart` — a real, live-discovered behavior distinct from what a name
+   like "restart" implies: it performs a **rolling** restart (a new replica is created alongside the
+   existing one; the original keeps running, untouched, until it becomes idle). The in-flight cycle
+   completed normally on the original, never-interrupted replica. Not a hard kill; not used further
+   for this purpose.
+3. `az containerapp update --min-replicas 0 --max-replicas 0` — rejected outright by the CLI itself
+   (`--max-replicas must be in the range [1,1000]`) — Container Apps does not allow `maxReplicas: 0`
+   at all. A real, simple constraint, not a bug.
+4. **The real, working mechanism: `az containerapp revision deactivate`.** Confirmed live, twice,
+   independently: issuing it against the currently active revision reliably tears every one of its
+   replicas down to zero within roughly 15-20 seconds — a genuine, disruptive stop, not a graceful
+   drain. `az containerapp revision activate` on the same revision brings it back under normal KEDA
+   control. **One real self-inflicted gap along the way, disclosed rather than smoothed over:** after
+   the first genuine kill attempt, the revision was left deactivated without being reactivated before
+   triggering the next cycle — that cycle sat `queued` for several minutes, never claimed, until the
+   oversight was caught via an empty `az containerapp revision list` result and fixed by reactivating.
+5. **Timing, not mechanism, was the remaining obstacle on four separate real attempts:** `reporting`'s
+   own stages 2-7 take anywhere from ~30-70 seconds depending on whether Self-critique's one permitted
+   revision fires, and issuing `revision deactivate` even a few seconds after Stage 1 (Investigation
+   resolution) completed was, on four consecutive real tries, still too late — the cycle finished
+   before the teardown took effect. The fifth attempt, polling every 8 seconds (not 10) and issuing
+   the deactivate command the instant Stage 1's `done` status was observed, caught the cycle
+   genuinely mid-flight, during Self-critique's own revision call.
+
+**The successful kill test, full result:** `reporting` was confirmed torn down to zero real replicas
+(`az containerapp replica list` → `0`) while the cycle's own status was independently confirmed
+`running`, `finishedAt: null`, with Stage 5 mid-`"revising for tone (1 of 1 permitted)"` — a genuine,
+verified mid-cycle crash, not an assumption from the deactivate command merely succeeding. The
+`report-cycles` message for this cycle was confirmed still present and invisible
+(`approximate_message_count=1`, nothing returned by `peek_messages`) — the lease outliving the dead
+consumer, exactly as designed. After reactivating the revision, the message's lease expired and it
+was redelivered to a freshly claimed replica (a second, distinct `"[reporting] claimed cycle ..."`
+log line for the identical `cycle_id`), and the cycle reached a real terminal state
+(`not_persisted_already_exists`, report 454) roughly 3.5 minutes after the kill.
+
+**Redelivery proven NOT to re-dispatch Investigation — shown via two independent real log trails, not
+asserted from the design:**
+- **Reporting's own log, the redelivered attempt:** `[STAGE 1/7] Investigation — already completed
+  for this cycle, resuming for 'Agentic AI Observability Platform' (no re-dispatch)` — the literal
+  resume-path text, printed for real, with the real elapsed time for this stage measured at **0.15
+  seconds** (`start_ts`/`end_ts` a fraction of a second apart in the `cycles.stages` JSON) — versus
+  85-110 seconds for every genuine fresh Investigation dispatch observed this session.
+- **Investigation's own log, independently, for the identical `cycle_id`:** exactly ONE `received
+  investigation request: cycle_id=...` line and exactly ONE `cycle ... completed: 115 finding(s)`
+  line, despite two separate real reporting execution attempts (the original, killed mid-flight, and
+  the redelivered one) — proving Investigation itself was dispatched, and did its real Foundry/ADO
+  work, exactly once. Two `GET /internal/investigations/{cycle_id}` calls appear (200 OK each) — one
+  from the original attempt's own post-dispatch fetch, one from the redelivered attempt's resume
+  check — the second one being the real, observed mechanism that let it skip re-dispatch.
+
+**Real cold start, `reporting`, measured via a disclosed proxy mechanism (`revision deactivate` /
+`activate`) since KEDA's own scale-from-zero stayed blocked by the platform flake for the remainder of
+this session:** confirmed a genuinely fresh replica (a new pod name, distinct from any prior one) was
+created at the moment of reactivation, and that replica claimed a real `report-cycles` message
+**~21.6 seconds** after its own creation (~27.4 seconds counting from the moment the message was
+published, including real Azure API scheduling latency before the replica even appeared) — faster
+than either `bff`→`core_api`'s chained 55.7 seconds or `investigation`'s own ~50-second figure (both
+Phase 7), despite `reporting` carrying the bulk of the real business logic. See the Runbook's own
+warm-up section for the full, honestly-caveated writeup and the resulting change to demo warm-up
+guidance (`reporting`'s trigger is a queue message, not an HTTP endpoint — warming it now needs a real
+throwaway report-cycle trigger, not just a `curl` against `bff`).
+
+**Revised cost, against the same ~CA$35 baseline and the same Azure Retail Prices methodology Task 47
+used:** removing `reporting`'s forced `minReplicas: 1` exception removes its ~$21.71/month idle-vCPU
+line item outright — the dominant term in Phase 7's own ~$30-40/month total. The remaining real costs
+are unchanged by this task: ACR Basic (~$5.00/month), Log Analytics (a few dollars/month, the one
+real usage-based unknown, same as Phase 7), and real active-request Consumption usage across all four
+now-uniformly-scale-to-zero services — each individual real cycle's active compute cost is small
+(well under a cent per triggered run, by the same per-second Consumption rate arithmetic Task 47
+used), so this line item is expected to stay a few dollars a month at this project's current real
+usage volume. **Revised estimate: roughly $10-18/month**, down from Phase 7's ~$30-40/month — a
+genuine, large reduction, not a rounding correction, driven almost entirely by removing the one
+`minReplicas: 1` exception this whole task exists to close. **One real, honest caveat on this
+number:** it assumes `reporting`'s KEDA scaler eventually behaves the way Investigation's own
+historical pattern shows it can (reaching zero in practice despite the same intermittent flake) — for
+as long as the platform-level `KEDAScalerFailed` flake keeps a queue-scaled app pinned at 1 replica,
+that app bills at the old always-on idle rate regardless of its `minReplicas: 0` configuration being
+byte-for-byte correct. Recommend checking Azure Cost Management after a real billing cycle for ground
+truth, same recommendation Task 47 made and for the identical reason.
+
+**Bar-for-done status, honest and itemized:** real full-scope AOP run end-to-end on deployed
+compute — done. Kill test on `reporting`, mid-cycle, confirmed redelivery and completion — done, five
+real attempts, the failures reported above. Redelivery proven not to re-dispatch Investigation — done,
+shown two independent ways. Cold start measured, Runbook updated — done, via the disclosed proxy
+mechanism above. Revised cost figure — done, with the platform-flake caveat stated plainly. Full suite
+and `verify_migration.py` green — done (134/134, 119/119; five tests showed transient
+`AzureCliCredential`-related errors under this session's own heavy concurrent `az` CLI load during the
+kill-test attempts, confirmed non-reproducing on an immediate individual re-run — the same class of
+environment noise already documented in Task 45). **Not done, and not silently claimed: `reporting`
+has not been directly, visually confirmed reaching a KEDA-triggered zero-replica state** — its
+configuration is confirmed correct (byte-for-byte matching Investigation's own proven rule), and the
+mechanism blocking that specific observation is confirmed to be a real, external, intermittent Azure
+platform behavior affecting both queue-scaled services equally, not a defect in this task's own code
+or configuration.

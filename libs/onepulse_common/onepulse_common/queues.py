@@ -11,10 +11,18 @@ phase — `allowSharedKeyAccess=false`, Managed Identity / Entra ID only
 (Storage Queue Data Contributor), no account key anywhere, per this
 project's zero-static-secrets discipline.
 
-Real queue names, two, not one with mixed message types — per the
+Real queue names, three, not one with mixed message types — per the
 Migration Plan's own explicit reasoning: a shared queue would force each
 consumer to inspect and discard the other's messages, and blocks
-scaling each queue's own backlog independently (KEDA, later phases):
+scaling each queue's own backlog independently (KEDA):
+  - report-cycles: core_api -> Reporting (ADR-026, Phase 7 follow-up —
+    the real outer trigger, replacing Phase 3's `cycles`-table DB poll
+    with the same queue-driven shape Investigation already proved.
+    Deliberately thin, same reasoning as findings-ready below: carries
+    only `cycle_id`, since `cycles` itself is already the real source
+    of truth for program_name/requested_by_actor_id/trace_context, kept
+    live and current regardless of how many times this message
+    redelivers.)
   - investigation-requests: Reporting -> Investigation
   - findings-ready: Investigation -> Reporting (a real, deliberately
     thin notification only — cycle_id + trace_context. The actual
@@ -40,6 +48,8 @@ from azure.storage.queue.aio import QueueClient
 
 QUEUE_ACCOUNT_URL = "https://onepulsequeuesdev.queue.core.windows.net"
 
+REPORT_CYCLES_QUEUE = "report-cycles"
+REPORT_CYCLES_POISON_QUEUE = "report-cycles-poison"
 INVESTIGATION_REQUESTS_QUEUE = "investigation-requests"
 INVESTIGATION_REQUESTS_POISON_QUEUE = "investigation-requests-poison"
 FINDINGS_READY_QUEUE = "findings-ready"

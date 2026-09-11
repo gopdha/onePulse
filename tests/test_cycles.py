@@ -18,9 +18,9 @@ import pytest_asyncio
 
 from onepulse_common.config import PostgresSettings
 from onepulse_common.cycles import (
-    claim_next_queued_cycle,
     create_cycle,
     get_cycle,
+    get_cycle_for_execution,
     mark_cycle_failed,
     mark_cycle_terminal,
     terminal_status_from_result,
@@ -106,52 +106,55 @@ async def test_create_cycle_inserts_a_real_queued_row(conn, program_id, actor_id
 
 
 @pytest.mark.asyncio
-async def test_claim_next_queued_cycle_returns_the_oldest_queued_one_and_marks_it_running(
+async def test_get_cycle_for_execution_marks_it_running_and_returns_program_name(
     conn, program_id, actor_id
 ) -> None:
-    first = await create_cycle(conn, program_id, actor_id, trace_context=None)
-    second = await create_cycle(conn, program_id, actor_id, trace_context=None)
+    created = await create_cycle(conn, program_id, actor_id, trace_context=None)
+    other = await create_cycle(conn, program_id, actor_id, trace_context=None)
 
-    claimed = await claim_next_queued_cycle(conn)
-    assert claimed is not None
-    assert claimed["cycle_id"] == first["cycle_id"]
-    assert claimed["program_name"] == "singleSlide"
+    resolved = await get_cycle_for_execution(conn, created["cycle_id"])
+    assert resolved is not None
+    assert resolved["cycle_id"] == created["cycle_id"]
+    assert resolved["program_name"] == "singleSlide"
 
-    fetched = await get_cycle(conn, first["cycle_id"])
+    fetched = await get_cycle(conn, created["cycle_id"])
     assert fetched["status"] == "running"
     assert fetched["started_at"] is not None
 
-    # The second real row is untouched — still queued, provably not the
-    # one claimed (proves this isn't blindly marking every queued row).
-    still_queued = await get_cycle(conn, second["cycle_id"])
+    # A different real cycle_id is untouched — proves this isn't
+    # blindly marking every queued row, only the one addressed by id.
+    still_queued = await get_cycle(conn, other["cycle_id"])
     assert still_queued["status"] == "queued"
 
 
 @pytest.mark.asyncio
-async def test_claim_next_queued_cycle_returns_none_when_nothing_is_queued(conn) -> None:
-    # A real, empty-scope check: with nothing inserted in this rolled-
-    # back transaction (Postgres visibility means other sessions' rows
-    # aren't relevant to what this connection sees mid-transaction for a
-    # SELECT ... FOR UPDATE SKIP LOCKED against genuinely queued rows we
-    # know are already claimed/terminal from other tests), a program
-    # with zero real cycles queued right now correctly returns None.
-    # Using a WHERE-scoped-to-nothing check would be circular here, so
-    # this asserts the real, general contract: calling claim twice in a
-    # row with only one real queued row returns None the second time.
-    program = await conn.fetchval("SELECT program_id FROM programs WHERE name = 'singleSlide'")
-    actor = await conn.fetchval("SELECT actor_id FROM actors WHERE entra_object_id = 'local-dev-standin-reviewer'")
-    await create_cycle(conn, str(program), str(actor), trace_context=None)
+async def test_get_cycle_for_execution_is_idempotent_across_redelivery_and_preserves_started_at(
+    conn, program_id, actor_id
+) -> None:
+    # The real property a redelivered report-cycles message depends on:
+    # calling this twice for the same cycle_id (a real redelivery, e.g.
+    # after Reporting was killed mid-run and the queue's visibility
+    # timeout expired) must not reset the real original start time.
+    created = await create_cycle(conn, program_id, actor_id, trace_context=None)
+    first = await get_cycle_for_execution(conn, created["cycle_id"])
+    second = await get_cycle_for_execution(conn, created["cycle_id"])
+    assert second["cycle_id"] == first["cycle_id"]
 
-    first_claim = await claim_next_queued_cycle(conn)
-    assert first_claim is not None
-    second_claim = await claim_next_queued_cycle(conn)
-    assert second_claim is None
+    fetched = await get_cycle(conn, created["cycle_id"])
+    assert fetched["status"] == "running"
+    assert fetched["started_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_get_cycle_for_execution_returns_none_for_a_real_nonexistent_id(conn) -> None:
+    resolved = await get_cycle_for_execution(conn, "00000000-0000-0000-0000-000000000000")
+    assert resolved is None
 
 
 @pytest.mark.asyncio
 async def test_write_cycle_stages_persists_progress_during_execution(conn, program_id, actor_id) -> None:
     created = await create_cycle(conn, program_id, actor_id, trace_context=None)
-    await claim_next_queued_cycle(conn)
+    await get_cycle_for_execution(conn, created["cycle_id"])
 
     await write_cycle_stages(conn, created["cycle_id"], {"1": {"status": "running", "detail": "42 item(s)"}})
 
