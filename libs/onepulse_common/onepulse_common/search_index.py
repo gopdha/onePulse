@@ -113,21 +113,46 @@ def build_index_definition() -> SearchIndex:
     return SearchIndex(name=INDEX_NAME, fields=fields, vector_search=vector_search)
 
 
+def _escape_odata_literal(value: str) -> str:
+    return value.replace(chr(39), chr(39) * 2)
+
+
 async def hybrid_search(
     search_client: SearchClient,
     *,
     query_text: str,
     query_vector: list[float],
     program_id: str | None = None,
+    authorized_program_ids: frozenset[str] | None = None,
     top: int = 5,
 ) -> list[dict]:
     """Real hybrid (keyword + vector) search — BM25 keyword ranking and
     HNSW vector similarity fused by the service's own reciprocal-rank
     fusion, not a client-side blend.
+
+    Migration Plan Phase 8 (ADR-027): `authorized_program_ids` is the
+    real, mandatory retrieval filter LLD Section 2.3/ADR-022 always
+    required and this project never built until now — the caller's
+    resolved scope, never a caller-supplied value. When given, the real
+    OData filter is `search.in(program_id, 'id1,id2,...')`, restricting
+    every retrieved chunk (report- and finding-level alike) to programs
+    the asker is actually authorized to see — this is what actually
+    stands between a visitor and reports outside their scope, since
+    filtering the model's *answer* after the fact would be too late (the
+    model already saw the content). `program_id` narrows further within
+    that set (a caller asking about one specific, already-authorized
+    program); passing a `program_id` outside `authorized_program_ids` is
+    the caller's own bug, not handled specially here — `core_api`'s own
+    route validates that before ever calling this.
     """
     vector_query = VectorizedQuery(vector=query_vector, k_nearest_neighbors=top, fields=VECTOR_FIELD_NAME)
-    # OData string literals escape an embedded single quote by doubling it.
-    filter_expr = f"program_id eq '{program_id.replace(chr(39), chr(39) * 2)}'" if program_id else None
+    filter_clauses = []
+    if authorized_program_ids is not None:
+        ids_csv = ",".join(_escape_odata_literal(pid) for pid in authorized_program_ids)
+        filter_clauses.append(f"search.in(program_id, '{ids_csv}', ',')")
+    if program_id:
+        filter_clauses.append(f"program_id eq '{_escape_odata_literal(program_id)}'")
+    filter_expr = " and ".join(filter_clauses) if filter_clauses else None
 
     results = await search_client.search(
         search_text=query_text,

@@ -1,7 +1,8 @@
 """Real service-to-service authentication and identity resolution for
-the core API (Migration Plan Phase 2, ADR-017).
+the core API (Migration Plan Phase 2, ADR-017; extended for real
+reviewer identity/roles/scope in Phase 8, ADR-027).
 
-Two distinct, deliberately separate real checks, not one:
+Three distinct, deliberately separate real checks, not one:
 
 1. Service-token validation (`verify_service_token`) — proves the
    *caller* is really the BFF, not anyone who can reach this port. A
@@ -25,24 +26,41 @@ Two distinct, deliberately separate real checks, not one:
    only assert *who* the user is, and *what they may do* is always
    computed by the component that owns the data.
 
-No real reviewer authentication exists yet (Phase 8) — the object ID
-arriving here is currently always the BFF's own stubbed value, forwarded
-unchanged from `ONEPULSE_STUB_ENTRA_OBJECT_ID`. Nothing about this
-module's own real logic changes when Phase 8 lands: it already resolves
-whatever object ID it's given against `actors` for real. Only the BFF's
-own source of that value changes then, not this module and not the
-shape of what it receives.
+3. Role/scope resolution (`get_current_actor`) — real as of Phase 8: a
+   single FastAPI dependency every route depends on, resolving role
+   (owner/visitor, see `onepulse_common.roles`), the real tenant this
+   actor's own `actor_scope` resolves to (the identical join `reports`'
+   own `tenant_isolation` RLS policy performs — not `actors.tenant_id`
+   directly, so the RLS setter and the RLS policy can never disagree),
+   and the real set of `program_id`s this actor is authorized to see.
+   **Deliberately resolved fresh on every single request, with no
+   session-lifetime cache of any kind** — revoking access by deleting an
+   `actor_scope` row must take effect on the very next request, which is
+   the one real advantage a server-side session model has over a
+   browser-held token that can't be invalidated server-side; caching
+   this resolution for any period would give that advantage back.
+
+No real reviewer authentication for the BFF's *own* sign-in exists in
+this module — that's Container Apps' Easy Auth (Phase 7) plus `bff`'s
+own real Entra-object-id extraction (`bff/main.py`). What lands here is
+already a platform-verified Entra object ID (or, only for local dev
+with no Easy Auth in front, `ONEPULSE_STUB_ENTRA_OBJECT_ID`) — this
+module's own real logic doesn't change based on which; it already
+resolves whatever object ID it's given against `actors` for real.
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 import asyncpg
 import jwt
 from dotenv import load_dotenv
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Request
 from jwt import PyJWKClient
+
+from onepulse_common.roles import is_owner_role
 
 # Real bug found live (2026-09-10): this module reads env vars at
 # import time to build the JWKS URL below. `core_api/main.py` imports
@@ -152,12 +170,113 @@ async def resolve_actor(conn: asyncpg.Connection, entra_object_id: str) -> dict:
     return dict(row)
 
 
-async def get_entra_object_id(
-    x_onepulse_entra_object_id: str = Header(..., alias="X-Onepulse-Entra-Object-Id")
-) -> str:
-    """Real FastAPI dependency for routes that need to know who the
-    request is on behalf of. A header, not a body field — identity is
-    auth-plane metadata the BFF asserts, never a domain field a caller
-    fills in as part of what they're asking for.
+async def resolve_tenant_id(conn: asyncpg.Connection, actor_id: str) -> str | None:
+    """Migration Plan Phase 8: the real tenant this actor's own
+    `actor_scope` resolves to, via the IDENTICAL join `reports`' own
+    `tenant_isolation` RLS policy performs (`actor_scope` ->
+    portfolio_id/program_id -> `portfolios.tenant_id`) — deliberately
+    NOT `actors.tenant_id` directly, so the value this module sets via
+    `SET LOCAL app.current_tenant_id` and the value the RLS policy
+    itself checks against can never structurally disagree.
+
+    Returns `None` when the actor has no `actor_scope` row at all — a
+    real, clean "no access" case (an `actors` row exists, but nothing
+    authorizes it to see anything yet), not an error.
     """
-    return x_onepulse_entra_object_id
+    row = await conn.fetchrow(
+        """
+        SELECT pf.tenant_id
+        FROM actor_scope s
+        JOIN portfolios pf ON pf.portfolio_id = COALESCE(
+            s.portfolio_id,
+            (SELECT p.portfolio_id FROM programs p WHERE p.program_id = s.program_id)
+        )
+        WHERE s.actor_id = $1
+        LIMIT 1
+        """,
+        actor_id,
+    )
+    return str(row["tenant_id"]) if row else None
+
+
+async def resolve_authorized_program_ids(conn: asyncpg.Connection, actor_id: str) -> frozenset[str]:
+    """Migration Plan Phase 8: every real `program_id` this actor may
+    see — via a direct `program_id` scope row, or every program under a
+    `portfolio_id` scope row. This is the real, program-granular half of
+    "scope" that tenant-level RLS alone cannot express (an actor scoped
+    to one program within a multi-program tenant must not see that
+    tenant's *other* programs either) — checked explicitly at each route
+    that accepts a `programId`/derives one from a `report_id`, alongside
+    RLS's own tenant-level filter, not instead of it.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT DISTINCT p.program_id
+        FROM actor_scope s
+        JOIN programs p ON p.program_id = s.program_id OR p.portfolio_id = s.portfolio_id
+        WHERE s.actor_id = $1
+        """,
+        actor_id,
+    )
+    return frozenset(str(r["program_id"]) for r in rows)
+
+
+@dataclass(frozen=True)
+class CurrentActor:
+    """Migration Plan Phase 8: the complete real identity/role/scope
+    resolution for one request — `actor_id` (real, internal, never
+    caller-supplied), `role` (real `actors.role`, owner-tier or
+    'visitor' — see `onepulse_common.roles.is_owner_role`), `tenant_id`
+    (for `SET LOCAL app.current_tenant_id`), and `authorized_program_ids`
+    (for the real, additional program-level scope check every
+    `programId`-accepting route performs).
+    """
+
+    actor_id: str
+    role: str
+    tenant_id: str
+    authorized_program_ids: frozenset[str]
+
+    @property
+    def is_owner(self) -> bool:
+        return is_owner_role(self.role)
+
+
+_NO_ACCESS_DETAIL = {
+    "error": "no_access",
+    "message": "This identity is authenticated but not provisioned for OnePulse. Ask a "
+    "platform admin to provision access.",
+}
+
+
+async def get_current_actor(
+    request: Request,
+    x_onepulse_entra_object_id: str = Header(..., alias="X-Onepulse-Entra-Object-Id"),
+) -> CurrentActor:
+    """The real Migration Plan Phase 8 dependency every route in this
+    service depends on. Deliberately does its own, separate, short-lived
+    pool acquisition rather than sharing a route's own connection — this
+    resolution has nothing to do with any one route's later transaction,
+    and keeping it self-contained means no route needs to thread a
+    connection through this function just to use it.
+
+    Raises a real, clean `403` (never a stack trace, never a silent
+    default scope) for both real "no access" shapes this phase names
+    explicitly: no matching `actors` row at all (the common case —
+    anyone the URL is shared with before being provisioned), and an
+    `actors` row with no `actor_scope` at all (provisioned but not yet
+    scoped to anything).
+    """
+    async with request.app.state.pg_client.pool.acquire() as conn:
+        try:
+            actor = await resolve_actor(conn, x_onepulse_entra_object_id)
+        except ActorNotFoundError:
+            raise HTTPException(status_code=403, detail=_NO_ACCESS_DETAIL)
+        actor_id = str(actor["actor_id"])
+        tenant_id = await resolve_tenant_id(conn, actor_id)
+        if tenant_id is None:
+            raise HTTPException(status_code=403, detail=_NO_ACCESS_DETAIL)
+        program_ids = await resolve_authorized_program_ids(conn, actor_id)
+    return CurrentActor(
+        actor_id=actor_id, role=actor["role"], tenant_id=tenant_id, authorized_program_ids=program_ids
+    )

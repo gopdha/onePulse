@@ -29,6 +29,7 @@ from verify_migration import (
     check_no_excess_table_privileges,
     check_no_schema_privilege,
     check_object_owner,
+    check_policy_definition_contains,
     check_policy_exists,
     check_privilege_revoked,
     check_rls_enabled,
@@ -111,6 +112,23 @@ async def test_forced_failure_force_rls_not_enabled_on_unprotected_table_detecte
     # tenants has no RLS/FORCE at all — proves this isn't hardcoded to
     # always return True for any table name.
     assert await check_force_rls_enabled(conn, "tenants") is False
+
+
+async def test_real_tenant_isolation_policy_has_the_0008_nullif_fix(conn) -> None:
+    # Migration 0008: check_policy_exists alone can't distinguish the
+    # real, live-broken 0005 shape (IS NULL only) from the fixed 0008
+    # one (NULLIF(..., '') IS NULL) — both satisfy "a policy named
+    # tenant_isolation exists". This reads the real qual text.
+    assert await check_policy_definition_contains(conn, "reports", "tenant_isolation", "NULLIF") is True
+
+
+async def test_forced_failure_policy_definition_missing_substring_detected(conn) -> None:
+    assert (
+        await check_policy_definition_contains(
+            conn, "reports", "tenant_isolation", "this substring is not in the real policy text"
+        )
+        is False
+    )
 
 
 async def test_forced_failure_revoke_check_detects_a_real_grant(conn) -> None:

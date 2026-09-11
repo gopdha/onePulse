@@ -307,6 +307,26 @@ async def check_policy_exists(conn: asyncpg.Connection, table_name: str, policy_
     return result is not None
 
 
+async def check_policy_definition_contains(
+    conn: asyncpg.Connection, table_name: str, policy_name: str, expected_substring: str
+) -> bool:
+    """Migration 0008: `check_policy_exists` alone only proves a policy
+    with this NAME exists — it would pass identically for the real,
+    live-discovered-broken 0005 version of `tenant_isolation` (`IS NULL`
+    only, not `NULLIF(...) IS NULL`) and the fixed 0008 one. This checks
+    the real `qual` (USING expression) text itself for the fix's own
+    marker, so a future regression back to the 0005 shape is caught here
+    rather than only by re-discovering the empty-string GUC bug live
+    again.
+    """
+    qual = await conn.fetchval(
+        "SELECT qual FROM pg_policies WHERE schemaname = 'public' AND tablename = $1 AND policyname = $2",
+        table_name,
+        policy_name,
+    )
+    return qual is not None and expected_substring in qual
+
+
 async def check_schema_exists(conn: asyncpg.Connection, schema_name: str) -> bool:
     """Real, live-discovered subtlety (Phase 4): information_schema.schemata
     is itself subject to the connecting role's own USAGE visibility —
@@ -557,7 +577,8 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
     results.append(
         ("CHECK constraint: actors.role",
          await check_check_constraint_values(
-             conn, "actors", "role", ["portfolio_lead", "program_lead", "platform_admin"]
+             conn, "actors", "role",
+             ["portfolio_lead", "program_lead", "platform_admin", "owner", "visitor"],
          ))
     )
 
@@ -572,6 +593,10 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
 
     results.append(("RLS enabled: reports", await check_rls_enabled(conn, "reports")))
     results.append(("RLS policy exists: reports.tenant_isolation", await check_policy_exists(conn, "reports", "tenant_isolation")))
+    results.append(
+        ("RLS policy (0008): tenant_isolation treats both NULL and '' as unset (NULLIF fix)",
+         await check_policy_definition_contains(conn, "reports", "tenant_isolation", "NULLIF"))
+    )
     results.append(
         ("FORCE ROW LEVEL SECURITY: reports (app_role, its owner, is not exempt from tenant_isolation)",
          await check_force_rls_enabled(conn, "reports"))

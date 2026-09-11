@@ -1166,3 +1166,177 @@ affecting both queue-scaled services equally — but that conclusion is delibera
 open follow-up in CLAUDE.md's Task 48 entry, with a concrete next check named, rather than closed out
 by the strength of this investigation alone. The revised cost figure above is a projection contingent
 on this actually being observed, not an already-realized result.
+
+---
+
+## ADR-027: Real reviewer identity, the Owner/Visitor role model, and RLS finally enforcing (Migration Plan Phase 8)
+
+**Context**: this is the phase the whole migration has been building toward, and everything else was
+gated behind it (ADR-018's own stated dependency, Governance & Security Reference §5). Every piece
+this decision touches was already designed and installed, and none of it had ever been exercised:
+`reports`' `tenant_isolation` RLS policy (Phase 2, `FORCE`d pre-Phase-6) had never had
+`app.current_tenant_id` set by any real request in this project's history; `actors`/`actor_scope`
+existed with exactly one real tenant and zero real scope rows; `core_api`'s trigger/approve/reject
+routes resolved a real actor but never checked what that actor was actually allowed to do; `bff`
+forwarded a stubbed identity regardless of who was really signed in. This is this project's own fifth
+instance of "designed correctly, documented confidently, never exercised" (Governance & Security
+Reference §6) — verifying tenant isolation against a single tenant, with no genuine second tenant's
+data behind it, would have been a sixth.
+
+**Decision, four real, separate pieces**:
+
+1. **Seed a genuine second tenant first, with real data, before touching any code** (per the Migration
+   Plan's own Phase 0 prerequisite). `scripts/seed_phase8_test_data.py`: a real fictional tenant
+   ("Meridian Health"), its own portfolio and program, two real seeded reports with real findings, a
+   real Tenant-B Owner actor scoped to it — plus a real Tenant-A Visitor actor and, filling a real gap
+   found while writing this (the existing Tenant-A stand-in reviewer had *no* `actor_scope` row at
+   all, predating this phase), a backfilled scope for it too. With one tenant, a policy that filters
+   correctly and one that silently matches everything produce identical results; the interesting
+   failures are in retrieval — the report list, the chat assistant's filter, a SAS request — not in
+   the table, which is why seeded *reports*, not just structure, were the real requirement.
+
+2. **`get_current_actor()`, one real FastAPI dependency, on every route in `core_api`.** Resolves the
+   platform-verified Entra object ID (never an internal `actor_id` — unchanged since ADR-017) against
+   `actors.entra_object_id`, then resolves the real tenant this actor's own `actor_scope` maps to
+   (`actor_scope` -> `portfolio_id`/`program_id` -> `portfolios.tenant_id` — the IDENTICAL join
+   `tenant_isolation`'s own policy performs, deliberately not `actors.tenant_id` directly, so the
+   value this sets and the value the policy checks can never structurally disagree), and the real set
+   of `program_id`s the actor may see (direct `program_id` scope rows, plus every program under a
+   `portfolio_id` scope row — the program-granular half of "scope" that tenant-only RLS cannot
+   express on its own). **Resolved fresh on every single request, with no session-lifetime cache of
+   any kind** — revoking access by deleting an `actor_scope` row takes effect on the very next
+   request, which is the real advantage a server-side session model has over a browser-held token
+   that can't be invalidated server-side; caching this resolution for any period would give that
+   advantage back, which is exactly why it wasn't cached.
+
+3. **RLS finally enforces**, exactly where the Migration Plan's own strengthened Phase 8 DoD said it
+   would: `SET LOCAL app.current_tenant_id` (in practice, `SELECT set_config(..., true)` — see the
+   real, live-discovered fix below) inside a real transaction, in `core_api` and `reporting` only
+   (`bff` has no data-store access by design; `investigation` has no access to `public` by design).
+   Three functions already wrapped in a transaction (`approve_report`, `reject_report`,
+   `persist_report`) just needed the `set_config` call added; three were bare reads that needed an
+   explicit transaction wrap first (`get_report_detail`, `list_pending_reviews`, `list_recent_reports`).
+   `persist_report` resolves its own tenant directly from `program_id` (via the identical portfolio
+   join) rather than taking it from a caller — `reporting` is a queue consumer with no authenticated
+   actor of its own; "which tenant owns this program" is a fact about the program, not about who
+   asked.
+
+4. **Owner/Visitor, the real role model, enforced entirely in `core_api`.** Owner: generate, approve,
+   see everything in scope. Visitor: view and chat, within scope, never generate or approve. Real,
+   deliberate schema choice, not a new column: `actors.role` keeps its three original
+   organizational-title values (`portfolio_lead`/`program_lead`/`platform_admin`) and gains two new
+   literal ones (`owner`/`visitor`) — every legacy value is treated as Owner-tier
+   (`onepulse_common.roles.is_owner_role`, an exclusion check: `role != 'visitor'`), since every actor
+   seeded before this phase was, in practice, a full-capability reviewer/admin; no backfill needed, no
+   second role-shaped column with an unclear precedence rule against the first. Enforced with
+   `_require_owner` at exactly two real points — the trigger endpoint and approve/reject — and
+   deliberately nowhere else: view/chat/download routes are open to both roles within scope. **No
+   Streamlit UI change of any kind** — a hidden button is usability, not security, and React
+   (Phase 9) is where a real Visitor-mode UI belongs; the API refusing the request is the actual
+   enforcement, proven with real requests below, not a UI affordance.
+
+**Two real bugs found live while implementing this, neither hypothetical**:
+
+- **`SET LOCAL app.current_tenant_id = $1` is not valid syntax over a bind parameter** — Postgres's
+  `SET`/`SET LOCAL` statement does not accept a query parameter as its value at all (`asyncpg`
+  raises a plain `PostgresSyntaxError`, live, on the very first real call). Fixed everywhere via
+  `SELECT set_config('app.current_tenant_id', $1, true)` — a real function call, not a `SET`
+  statement, fully parameterizable, and `true` as the third argument gives it the identical
+  transaction-local (`SET LOCAL`) scope.
+- **A second, more consequential real bug, found only because Phase 8's own seed script was the
+  first real workload to call `set_config` on this GUC more than once on the same pooled
+  connection**: `current_setting('app.current_tenant_id', true)` returns real SQL `NULL` only the
+  *first* time it is ever referenced in a session that has never touched this custom GUC. Once any
+  `set_config(..., true)` call has ever set it — even transactionally, even after that transaction
+  committed and the LOCAL value reverted — Postgres has created a real placeholder variable for this
+  GUC in the backend, and the "reverted" value is the empty string `''`, not `NULL`. Confirmed live,
+  directly, on the same connection: `NULL` before any `set_config` call, `''` after one committed
+  transaction touched it. Migration 0005's own fix (`current_setting(..., true) IS NULL`) is
+  therefore correct only for a connection's *very first* tenant-scoped query — every subsequent
+  *unscoped* query on the same pooled connection (exactly what a real connection pool with
+  `min_size`/`max_size` > 1, i.e. every one of `core_api`'s and `reporting`'s real deployed
+  processes, does routinely) would hit the second branch and error on `''::uuid`, rather than the
+  intended permissive fallback. **Fixed in migration 0008**: `NULLIF(current_setting(...), '') IS
+  NULL`, treating both real "unset" representations identically, in both places the check appears
+  (the `OR`'s own non-short-circuit evaluation, the same real subtlety migration 0005 already
+  documented once). Not a hypothetical edge case — this project's own real connection pools would
+  have hit it in production the first time any two tenant-scoped requests landed on the same pooled
+  connection in sequence, which for a `min_size=1` pool under real, sequential traffic is not a rare
+  event at all.
+
+**The real SAS/Blob-Storage mechanism, built now because this phase's own bar required it, not a
+speculative pre-build**: ADR-021 designed `rendered_artifact_uri` holding a real blob path and
+download by real user-delegation SAS back in the Phase 3/4 planning, but neither Phase 4 nor Phase 7
+ever built it — every real report still renders to local/`file://` disk. Phase 8's own bar-for-done
+("a visitor role... cannot retrieve a SAS for a report outside its scope") is what finally required a
+real, working mechanism to test that claim against. **Deliberately scoped, not a full pipeline
+migration**: `onepulse_common/blob_storage.py` (`upload_report_blob`/`issue_download_sas`, a new real
+`reports` blob container on the existing `onepulsequeuesdev` storage account, `Storage Blob Data
+Contributor` + `Storage Blob Delegator` RBAC granted to `id-onepulse-app-dev`) and a new
+`GET /api/v1/reports/{reportId}/download` route — authorization (RLS tenant scope + program
+membership) happens fully before issuance, per ADR-021's own stated constraint, and the route itself
+never touches a rendering pipeline. Every report rendered before this phase, and any rendered since
+without a real blob upload, correctly has no SAS-downloadable artifact (`rendered_artifact_uri` isn't
+a real `blob://` URI) — a real, honest `404`, not a broken link. Migrating the rendering pipeline
+itself onto Blob Storage end to end is real, disclosed, not-yet-done follow-up work, same as it was
+before this phase.
+
+**The real, mandatory Chat Assistant retrieval filter LLD Section 2.3/ADR-022 always required, finally
+built**: `hybrid_search` gained a real `authorized_program_ids` filter (`search.in(program_id, ...)`
+OData), passed through unconditionally from `core_api`'s chat route's own `get_current_actor`
+resolution — the model is never even shown a chunk from a program outside the caller's scope, since
+filtering an already-generated answer would be too late (a chunk the model has already read cannot be
+un-read from its own reasoning). Proven live, not merely by code inspection: the identical question
+("Is the Meridian patient records migration blocked?"), asked as the real Tenant-A Visitor, got "I
+could not find any mention of a Meridian patient-records migration... The search returned unrelated
+singleSlide items only" (zero citations) — asked as the real Tenant-B Owner, got a fully grounded,
+correctly cited answer from the real seeded Meridian findings. The positive control matters as much as
+the negative one: an always-empty answer would trivially, uselessly "pass" the isolation test even if
+the filter were completely broken.
+
+**FR-11's rate limit, built; NFR-6's usage ledger, deliberately not** — a plain, real count against
+`cycles.requested_by_actor_id`/`created_at` (already threaded through the queue envelope since Phase
+4/ADR-019, specifically so this wouldn't need a retrofit), a rolling 24-hour window, 2 triggers per
+actor. Applied to every Owner-tier actor able to trigger at all, not narrowed to the literal legacy
+role value `portfolio_lead` — a `platform_admin` or a new `owner` actor triggering unlimited runs
+while a `portfolio_lead` alone was capped would be a real, silent gap in the exact protection FR-11
+exists for. `usage_ledger` (Phase 2's own cost-based governance table) stays real, installed, and
+unused — real cost tracking is a separate, materially larger concern (tying into Foundry's own
+per-run token cost, not a request count) that this phase's own rate limit does not need and was not
+asked to build.
+
+**Real requests, real errors, proven live — the actual bar, not asserted**:
+
+- An authenticated identity with no `actors` row: real `403 {"error": "no_access", ...}` — the
+  literal common-case path, not a crash, not a 401 (this project's own prior code used 401 here;
+  corrected to 403 this phase, since the caller *is* authenticated, just not authorized).
+- Forging a different `actor_id`: attempted via an extra `actorId` field in the real `reject` request
+  body — real `422 {"detail":[{"type":"extra_forbidden", "loc":["body","actorId"], ...}]}` (a new
+  `model_config = ConfigDict(extra="forbid")` on `RejectRequest`, so this is a real, visible
+  rejection, not Pydantic's default silent drop). No endpoint anywhere accepts an `actor_id` from the
+  caller at all, by the original ADR-017 design — this test proves the boundary is real, not merely
+  undocumented.
+- A Visitor attempting to trigger a run: real `403 {"error": "visitor_cannot_generate_or_approve"}`.
+- Cross-tenant isolation, three separate real proofs, each with a real positive control alongside the
+  real negative one (an always-empty result would trivially pass a negative-only test): the report
+  list (Tenant-A Visitor's own listing never contains a Meridian row; requesting Meridian's
+  `programId` explicitly is a real `404`; Tenant-B Owner correctly sees both real Meridian reports),
+  the chat retrieval filter (above), and the SAS download (`404` for Tenant-A Visitor against
+  Tenant-B's report 997; a real, working SAS URL for Tenant-B Owner against the same report,
+  independently confirmed by fetching the real blob content through it directly, no `core_api`
+  involved).
+- FR-11's rate limit: two real triggers succeed (`202`), a third within the same 24-hour window is a
+  real `429 {"error": "rate_limit_exceeded", ...}`.
+- The provisioning path, written down and exercised for real, not just asserted: inserting a real
+  `actors` row (this session's own real signed-in Entra object ID, previously provisioned nowhere)
+  mapped to a role and a real `actor_scope` entry, then that identity's own first authenticated
+  request shown succeeding where it previously got the real `403` above.
+
+**Not chosen**: a separate `access_level` column alongside `actors.role` (rejected — two role-shaped
+columns with no clear precedence rule, for no real benefit Now-scope needs); scoping the rate limit to
+the literal `portfolio_lead` role value only (rejected — a real, silent gap for every other Owner-tier
+role, see above); building `usage_ledger`'s real cost tracking in this phase (rejected — materially
+larger, separate scope, not required for the rate limit to work correctly); migrating the full
+rendering pipeline onto Blob Storage (rejected — the bar needed a real, working SAS mechanism to test
+isolation against, not a full storage migration; every existing `file://` report is unaffected and
+stays exactly as it was).

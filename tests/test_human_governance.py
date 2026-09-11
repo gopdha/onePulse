@@ -126,6 +126,23 @@ async def actor_id(conn) -> str:
     return str(value)
 
 
+@pytest_asyncio.fixture
+async def tenant_id(conn, program_id) -> str:
+    """Migration Plan Phase 8: the real tenant `program_id` belongs to —
+    every `human_governance` function under test now needs this for its
+    own `SET LOCAL`-equivalent `app.current_tenant_id`, so RLS actually
+    lets these real test writes/reads through rather than falling back
+    to the (also real, but less interesting) unset-permissive case.
+    """
+    value = await conn.fetchval(
+        "SELECT pf.tenant_id FROM portfolios pf JOIN programs p ON p.portfolio_id = pf.portfolio_id "
+        "WHERE p.program_id = $1",
+        program_id,
+    )
+    assert value is not None
+    return str(value)
+
+
 async def _insert_test_report(conn, program_id: str) -> int:
     return await conn.fetchval(
         """
@@ -139,10 +156,10 @@ async def _insert_test_report(conn, program_id: str) -> int:
     )
 
 
-async def test_approve_report_end_to_end(conn, program_id, actor_id) -> None:
+async def test_approve_report_end_to_end(conn, program_id, actor_id, tenant_id) -> None:
     report_id = await _insert_test_report(conn, program_id)
 
-    result = await approve_report(conn, report_id, actor_id, notes="looks good")
+    result = await approve_report(conn, report_id, actor_id, tenant_id, notes="looks good")
 
     assert result["reportId"] == report_id
     assert result["decision"] == "approved"
@@ -159,10 +176,10 @@ async def test_approve_report_end_to_end(conn, program_id, actor_id) -> None:
     assert reviewed is True
 
 
-async def test_reject_report_end_to_end(conn, program_id, actor_id) -> None:
+async def test_reject_report_end_to_end(conn, program_id, actor_id, tenant_id) -> None:
     report_id = await _insert_test_report(conn, program_id)
 
-    result = await reject_report(conn, report_id, actor_id, notes="evidence for item 8 is stale")
+    result = await reject_report(conn, report_id, actor_id, tenant_id, notes="evidence for item 8 is stale")
 
     assert result["reportId"] == report_id
     assert result["decision"] == "rejected"
@@ -178,11 +195,11 @@ async def test_reject_report_end_to_end(conn, program_id, actor_id) -> None:
     assert reviewed is True
 
 
-async def test_reject_report_requires_notes(conn, program_id, actor_id) -> None:
+async def test_reject_report_requires_notes(conn, program_id, actor_id, tenant_id) -> None:
     report_id = await _insert_test_report(conn, program_id)
 
     with pytest.raises(NotesRequiredError):
-        await reject_report(conn, report_id, actor_id, notes="")
+        await reject_report(conn, report_id, actor_id, tenant_id, notes="")
 
     # Confirm the real row-level consequence, not just the exception type:
     # no approval_records row was written, and the report is still unreviewed.
@@ -222,11 +239,11 @@ async def test_reject_report_with_empty_notes_is_also_refused_by_the_database(
     assert count == 0
 
 
-async def test_approve_report_requires_actor_id(conn, program_id) -> None:
+async def test_approve_report_requires_actor_id(conn, program_id, tenant_id) -> None:
     report_id = await _insert_test_report(conn, program_id)
 
     with pytest.raises(ActorIdRequiredError):
-        await approve_report(conn, report_id, actor_id="")
+        await approve_report(conn, report_id, actor_id="", tenant_id=tenant_id)
 
     count = await conn.fetchval(
         "SELECT count(*) FROM approval_records WHERE report_id = $1", report_id
@@ -234,12 +251,12 @@ async def test_approve_report_requires_actor_id(conn, program_id) -> None:
     assert count == 0
 
 
-async def test_list_pending_reviews_excludes_reviewed_reports(conn, program_id, actor_id) -> None:
+async def test_list_pending_reviews_excludes_reviewed_reports(conn, program_id, actor_id, tenant_id) -> None:
     pending_report_id = await _insert_test_report(conn, program_id)
     reviewed_report_id = await _insert_test_report(conn, program_id)
-    await approve_report(conn, reviewed_report_id, actor_id)
+    await approve_report(conn, reviewed_report_id, actor_id, tenant_id)
 
-    result = await list_pending_reviews(conn, program_id)
+    result = await list_pending_reviews(conn, program_id, tenant_id)
     ids = {r["reportId"] for r in result["reports"]}
 
     assert pending_report_id in ids
@@ -249,7 +266,7 @@ async def test_list_pending_reviews_excludes_reviewed_reports(conn, program_id, 
     assert pending_entry["qualityGateOutcome"] == "route_to_human_review"
 
 
-async def test_approval_records_update_is_rejected_by_the_database(conn, program_id, actor_id) -> None:
+async def test_approval_records_update_is_rejected_by_the_database(conn, program_id, actor_id, tenant_id) -> None:
     """The real, load-bearing test: the REVOKE from Phase 2 must hold at
     the database level, over the exact role this project authenticates
     as locally.
@@ -274,7 +291,7 @@ async def test_approval_records_update_is_rejected_by_the_database(conn, program
     `InFailedSQLTransactionError` instead of actually exercising anything.
     """
     report_id = await _insert_test_report(conn, program_id)
-    await approve_report(conn, report_id, actor_id)
+    await approve_report(conn, report_id, actor_id, tenant_id)
 
     with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
         async with conn.transaction():

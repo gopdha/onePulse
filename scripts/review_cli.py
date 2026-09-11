@@ -52,16 +52,46 @@ def build_settings() -> PostgresSettings:
     )
 
 
+async def _tenant_id_for_actor(conn, actor_id: str) -> str:
+    """Migration Plan Phase 8: this CLI already trusts `--actor-id` as
+    given (see the module docstring's own stated shortcut) — resolving
+    the real tenant directly from `actors.tenant_id` is the honest,
+    minimal fix for a tool with no real identity resolution of its own,
+    not a second, independent scope-resolution mechanism to keep in
+    sync with `core_api.security.get_current_actor`'s own (which
+    deliberately resolves via `actor_scope`, since it can't trust a
+    caller-supplied actor_id the way this CLI already does).
+    """
+    tenant_id = await conn.fetchval("SELECT tenant_id FROM actors WHERE actor_id = $1", actor_id)
+    if tenant_id is None:
+        raise SystemExit(f"No actors row for actor_id={actor_id!r}")
+    return str(tenant_id)
+
+
+async def _tenant_id_for_program(conn, program_id: str) -> str:
+    tenant_id = await conn.fetchval(
+        "SELECT pf.tenant_id FROM portfolios pf JOIN programs p ON p.portfolio_id = pf.portfolio_id "
+        "WHERE p.program_id = $1",
+        program_id,
+    )
+    if tenant_id is None:
+        raise SystemExit(f"No program_id={program_id!r} found")
+    return str(tenant_id)
+
+
 async def run(args: argparse.Namespace) -> dict:
     client = await PostgresClient.connect(build_settings(), min_size=1, max_size=1)
     try:
         async with client.pool.acquire() as conn:
             if args.command == "pending":
-                return await list_pending_reviews(conn, args.program_id)
+                tenant_id = await _tenant_id_for_program(conn, args.program_id)
+                return await list_pending_reviews(conn, args.program_id, tenant_id)
             if args.command == "approve":
-                return await approve_report(conn, args.report_id, args.actor_id, args.notes or "")
+                tenant_id = await _tenant_id_for_actor(conn, args.actor_id)
+                return await approve_report(conn, args.report_id, args.actor_id, tenant_id, args.notes or "")
             if args.command == "reject":
-                return await reject_report(conn, args.report_id, args.actor_id, args.notes)
+                tenant_id = await _tenant_id_for_actor(conn, args.actor_id)
+                return await reject_report(conn, args.report_id, args.actor_id, tenant_id, args.notes)
             raise ValueError(f"unknown command: {args.command}")
     finally:
         await client.close()
