@@ -397,10 +397,26 @@ async def persist_report(
                     "run `python scripts/seed_dev_data.py --target dev` first."
                 )
 
+            # Migration Plan Phase 8 (ADR-027): `reporting` has no
+            # authenticated caller/actor of its own to resolve a tenant
+            # from — it's a queue consumer, not a request handler. The
+            # relevant tenant for this INSERT is simply "whichever
+            # tenant owns this program," derivable purely from
+            # program_id via the identical join `tenant_isolation`'s own
+            # policy performs. Resolved here, not threaded in from a
+            # caller, since no caller in this pipeline has anything more
+            # authoritative to offer.
+            tenant_id = await conn.fetchval(
+                "SELECT pf.tenant_id FROM portfolios pf JOIN programs p ON p.portfolio_id = pf.portfolio_id "
+                "WHERE p.program_id = $1",
+                program_id,
+            )
+
             rendered_uri = Path(rendered_path).resolve().as_uri()
 
             try:
                 async with conn.transaction():
+                    await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
                     report_id = await conn.fetchval(
                         """
                         INSERT INTO reports (program_id, week_of, rag_status, quality_gate_outcome,
@@ -469,7 +485,13 @@ async def persist_report(
         await client.close()
 
 
-async def list_recent_reports(limit: int = 20, program_id: str | None = None) -> list[dict]:
+async def list_recent_reports(
+    conn: asyncpg.Connection,
+    tenant_id: str,
+    authorized_program_ids: frozenset[str],
+    limit: int = 20,
+    program_id: str | None = None,
+) -> list[dict]:
     """Real recent-runs listing for the UI Home page — most recent first,
     optionally scoped to one real program (Task 23: the real design
     reference's "Previous Status Reports" list and "Last run" indicator
@@ -490,53 +512,63 @@ async def list_recent_reports(limit: int = 20, program_id: str | None = None) ->
     today's UI never re-reviews one), and a real subquery counts each
     report's actual `findings` rows. Existing callers that only read the
     previously-existing keys are unaffected.
+
+    Migration Plan Phase 8 (ADR-027): now takes a real `conn` +
+    `tenant_id` instead of opening its own connection — the caller (only
+    `core_api`'s own `GET /api/v1/reports` route today) already resolved
+    a real `CurrentActor` with a real tenant to scope this to, and a
+    `SET LOCAL app.current_tenant_id` needs a specific connection/
+    transaction to attach to. Also now takes `authorized_program_ids` —
+    RLS alone only enforces tenant-level isolation; an actor scoped to
+    one specific program within a multi-program tenant must not see that
+    tenant's *other* programs in the unfiltered (`program_id=None`)
+    listing either, which RLS's own tenant-only policy cannot express.
     """
-    client = await PostgresClient.connect(PG_SETTINGS, min_size=1, max_size=1)
-    try:
-        async with client.pool.acquire() as conn:
-            if program_id is None:
-                rows = await conn.fetch(
-                    """
-                    SELECT r.report_id, p.name AS program_name, r.week_of, r.rag_status,
-                           r.quality_gate_outcome, r.reviewed, r.rendered_artifact_uri, r.created_at,
-                           ar.decision,
-                           (SELECT count(*) FROM findings f WHERE f.report_id = r.report_id) AS finding_count
-                    FROM reports r
-                    JOIN programs p ON p.program_id = r.program_id
-                    LEFT JOIN LATERAL (
-                        SELECT decision FROM approval_records
-                        WHERE report_id = r.report_id
-                        ORDER BY decided_at DESC LIMIT 1
-                    ) ar ON true
-                    ORDER BY r.created_at DESC
-                    LIMIT $1
-                    """,
-                    limit,
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT r.report_id, p.name AS program_name, r.week_of, r.rag_status,
-                           r.quality_gate_outcome, r.reviewed, r.rendered_artifact_uri, r.created_at,
-                           ar.decision,
-                           (SELECT count(*) FROM findings f WHERE f.report_id = r.report_id) AS finding_count
-                    FROM reports r
-                    JOIN programs p ON p.program_id = r.program_id
-                    LEFT JOIN LATERAL (
-                        SELECT decision FROM approval_records
-                        WHERE report_id = r.report_id
-                        ORDER BY decided_at DESC LIMIT 1
-                    ) ar ON true
-                    WHERE r.program_id = $2
-                    ORDER BY r.created_at DESC
-                    LIMIT $1
-                    """,
-                    limit,
-                    program_id,
-                )
-            return [dict(row) for row in rows]
-    finally:
-        await client.close()
+    async with conn.transaction():
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        if program_id is None:
+            rows = await conn.fetch(
+                """
+                SELECT r.report_id, p.name AS program_name, r.week_of, r.rag_status,
+                       r.quality_gate_outcome, r.reviewed, r.rendered_artifact_uri, r.created_at,
+                       ar.decision,
+                       (SELECT count(*) FROM findings f WHERE f.report_id = r.report_id) AS finding_count
+                FROM reports r
+                JOIN programs p ON p.program_id = r.program_id
+                LEFT JOIN LATERAL (
+                    SELECT decision FROM approval_records
+                    WHERE report_id = r.report_id
+                    ORDER BY decided_at DESC LIMIT 1
+                ) ar ON true
+                WHERE r.program_id = ANY($2::uuid[]) AND NOT r.is_test_fixture
+                ORDER BY r.created_at DESC
+                LIMIT $1
+                """,
+                limit,
+                list(authorized_program_ids),
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT r.report_id, p.name AS program_name, r.week_of, r.rag_status,
+                       r.quality_gate_outcome, r.reviewed, r.rendered_artifact_uri, r.created_at,
+                       ar.decision,
+                       (SELECT count(*) FROM findings f WHERE f.report_id = r.report_id) AS finding_count
+                FROM reports r
+                JOIN programs p ON p.program_id = r.program_id
+                LEFT JOIN LATERAL (
+                    SELECT decision FROM approval_records
+                    WHERE report_id = r.report_id
+                    ORDER BY decided_at DESC LIMIT 1
+                ) ar ON true
+                WHERE r.program_id = $2 AND NOT r.is_test_fixture
+                ORDER BY r.created_at DESC
+                LIMIT $1
+                """,
+                limit,
+                program_id,
+            )
+    return [dict(row) for row in rows]
 
 
 def build_output_path(ado_project_name: str, as_of: dt.date, output_dir: str = "output") -> str:

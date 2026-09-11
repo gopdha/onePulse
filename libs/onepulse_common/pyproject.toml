@@ -50,6 +50,11 @@ dependencies = [
     # auth only (allowSharedKeyAccess=false on the storage account) —
     # no account key, ever.
     "azure-storage-queue>=12.17.0",
+    # Migration Plan Phase 8 (ADR-021/027): rendered-report download by
+    # real user-delegation SAS. Was already installed transitively
+    # (confirmed via `pip show`, 12.30.1) but never declared as a direct
+    # dependency here — same real gap class as the two entries above.
+    "azure-storage-blob>=12.19.0",
     # Migration Plan Phase 1/2 (core_api, bff) — real, load-bearing gap
     # found only at Phase 5 (containerization): these were pip-installed
     # ad hoc into the local .venv across Tasks 40-41 and never actually

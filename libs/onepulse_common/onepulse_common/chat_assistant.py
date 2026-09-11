@@ -20,17 +20,19 @@ the model's own general knowledge or a live Azure DevOps lookup. This
 assistant answers questions about the archive of what's already been
 reported, nothing else.
 
-Real, stated shortcut, not hidden: LLD Section 2.3 requires resolving
-`actorId`'s authorized scope server-side as a mandatory retrieval
-filter, via `actor_scope` (Phase 2's schema). No code anywhere in this
-project yet resolves `actor_scope` — Now-scope has never needed
-authorization logic before this. `program_id` is accepted here directly
-as a filter argument instead, the same class of shortcut as Phase 7's
-CLI-supplied `actor_id` (`onepulse_common/human_governance.py`). A real
-auth integration must replace this by looking up the caller's real
-`actor_scope` rows and deriving the allowed `program_id`/`portfolio_id`
-set from them — never trust a caller-supplied `program_id` as
-authorization.
+Real as of Migration Plan Phase 8 (ADR-027): LLD Section 2.3's own
+requirement — the asker's authorized scope resolved server-side as a
+*mandatory* retrieval filter, via `actor_scope` — is now real.
+`core_api`'s chat route resolves the caller's real `authorized_program_
+ids` (`core_api.security.get_current_actor`) and passes it through here
+as `authorized_program_ids`; `hybrid_search`'s own real `search.in(...)`
+OData filter (`onepulse_common.search_index`) is what actually stands
+between a visitor and content outside their scope, applied BEFORE the
+model ever sees a chunk — filtering the model's answer after the fact
+would be too late, since a chunk the model has already read cannot be
+un-read from its reasoning. `program_id` (singular) is still accepted
+separately as a caller-chosen narrowing within that already-authorized
+set, never as authorization on its own.
 """
 
 from __future__ import annotations
@@ -93,7 +95,12 @@ For every question:
 Respond only with JSON matching the required schema."""
 
 
-def build_search_tool(search_client: SearchClient, embedding_client: AsyncAzureOpenAI, program_id: str | None) -> FunctionTool:
+def build_search_tool(
+    search_client: SearchClient,
+    embedding_client: AsyncAzureOpenAI,
+    program_id: str | None,
+    authorized_program_ids: frozenset[str],
+) -> FunctionTool:
     async def search_reports(query: str, top: int = 5) -> str:
         vectors = await embed_texts(embedding_client, [query])
         chunks = await hybrid_search(
@@ -101,6 +108,7 @@ def build_search_tool(search_client: SearchClient, embedding_client: AsyncAzureO
             query_text=query,
             query_vector=vectors[0],
             program_id=program_id,
+            authorized_program_ids=authorized_program_ids,
             top=top,
         )
         return json.dumps(chunks, default=str)
@@ -122,9 +130,10 @@ async def ask_question(
     search_client: SearchClient,
     embedding_client: AsyncAzureOpenAI,
     question: str,
+    authorized_program_ids: frozenset[str],
     program_id: str | None = None,
 ) -> dict:
-    tool = build_search_tool(search_client, embedding_client, program_id)
+    tool = build_search_tool(search_client, embedding_client, program_id, authorized_program_ids)
 
     async with Agent(
         client=chat_client,

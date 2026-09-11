@@ -17,11 +17,20 @@ not `onepulse_common.observability` — see its own docstring for why
 
 ADR-017's open question, now answered: the core API resolves identity,
 never accepts an internal `actor_id`. This service's real job is
-narrower — determine *who is asking* (today, always a stubbed Entra
-object ID; a real session is Phase 8) and forward that, plus a real
+narrower — determine *who is asking* and forward that, plus a real
 service-to-service token, to the core API on every request. It never
 decides *what that identity may do* — that's the core API's job,
 because it's the component that owns the data the answer depends on.
+
+Migration Plan Phase 8: *who is asking* is now real. Container Apps'
+built-in Entra auth (Easy Auth, Phase 7) injects the platform-verified
+signed-in user's claims into every request that reaches this service via
+the real `X-MS-CLIENT-PRINCIPAL` header (base64-encoded JSON, the same
+real mechanism App Service Easy Auth uses) — `_resolve_entra_object_id`
+decodes it and extracts the real `objectidentifier` claim. Only for
+local dev, where no Easy Auth sits in front of this service at all, does
+the stub (`ONEPULSE_STUB_ENTRA_OBJECT_ID`) still apply — a real,
+deliberate fallback for exactly that one case, not a live shortcut.
 
 Response shaping: every route below proxies the identical real
 camelCase JSON shape `core_api/main.py` already returns — the frontend
@@ -37,6 +46,9 @@ the Runbook.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import os
 from contextlib import asynccontextmanager
 
@@ -82,19 +94,50 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="OnePulse BFF", version="0.1.0", lifespan=lifespan)
 
 
+_OID_CLAIM_TYPES = frozenset(
+    {"http://schemas.microsoft.com/identity/claims/objectidentifier", "oid"}
+)
+
+
+def _resolve_entra_object_id(request: Request) -> str:
+    """Migration Plan Phase 8: the real, platform-verified signed-in
+    identity, from Easy Auth's own `X-MS-CLIENT-PRINCIPAL` header when
+    present (a real request that passed through Container Apps' Entra
+    auth layer) — decoded here, not trusted as an opaque string, since
+    only the real `objectidentifier` claim inside it is what `core_api`
+    needs. Falls back to the local-dev stub only when this header is
+    genuinely absent (no Easy Auth in front of this process at all,
+    e.g. `docker compose`/bare `uvicorn`) — never when it's present but
+    malformed, which is a real, distinct failure worth its own error
+    rather than a silent, wrong fallback to another identity.
+    """
+    raw = request.headers.get("X-MS-CLIENT-PRINCIPAL")
+    if raw is None:
+        return STUB_ENTRA_OBJECT_ID
+    try:
+        principal = json.loads(base64.b64decode(raw))
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"X-MS-CLIENT-PRINCIPAL present but not valid base64 JSON: {exc}") from exc
+    for claim in principal.get("claims", []):
+        if claim.get("typ") in _OID_CLAIM_TYPES:
+            return claim["val"]
+    raise ValueError("X-MS-CLIENT-PRINCIPAL present but carries no objectidentifier claim")
+
+
 async def _core_headers(request: Request) -> dict:
     """Every real header this service asserts on the caller's behalf:
     a real Entra token for the core API's own app registration (service
     auth — proves this really is the BFF, not a shared secret and not a
-    trusted-by-convention header), the real (stubbed, pending Phase 8)
-    identity, and a real injected W3C `traceparent` derived from the
-    *current* active span (set by `tracing_middleware` below, already
-    running by the time any route handler calls this).
+    trusted-by-convention header), the real signed-in identity (Migration
+    Plan Phase 8 — see `_resolve_entra_object_id`), and a real injected
+    W3C `traceparent` derived from the *current* active span (set by
+    `tracing_middleware` below, already running by the time any route
+    handler calls this).
     """
     token = await request.app.state.credential.get_token(f"{CORE_API_IDENTIFIER_URI}/.default")
     headers = {
         "Authorization": f"Bearer {token.token}",
-        "X-Onepulse-Entra-Object-Id": STUB_ENTRA_OBJECT_ID,
+        "X-Onepulse-Entra-Object-Id": _resolve_entra_object_id(request),
     }
     inject(headers)  # adds traceparent (+ tracestate) for the current span
     return headers

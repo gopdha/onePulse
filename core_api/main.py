@@ -9,14 +9,14 @@ and the real Entra App Registration this validates against
 (`onepulse-core-api`), and CLAUDE.md Task 41 for the real setup process,
 including a real consent-propagation delay found live.
 
-Two of the three original Phase 1 decisions still hold, unchanged,
-restated so they aren't lost in the split (see the superseded
+One of the three original Phase 1 decisions still holds, unchanged,
+restated so it isn't lost in the split (see the superseded
 `api/main.py`'s own docstring, Task 40, for the full original
-reasoning): still no *reviewer* authentication (Phase 8) — what Phase 2
-added is *service* authentication (proving the caller is really the
-BFF) and real identity *resolution* (turning a forwarded object ID into
-a real actor), neither of which is reviewer auth; `onepulse_common` is
-not modified by this file's own routes. The third — no report-trigger
+reasoning): `onepulse_common` is not modified by this file's own routes.
+Reviewer authentication (the second) is real now, Migration Plan Phase 8
+(ADR-027) — `get_current_actor` resolves a real role and a real,
+RLS-enforced tenant/program scope for every route; see `security.py`'s
+own module docstring for the full design. The third — no report-trigger
 endpoint — is real now (Migration Plan Phase 3, ADR-021, made
 queue-driven in a Phase 7 follow-up, ADR-026): `POST
 /api/v1/programs/{programId}/reports` inserts a real `queued` row into
@@ -63,9 +63,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from opentelemetry import trace
 from opentelemetry.propagate import extract, inject
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
-from core_api.security import ActorNotFoundError, get_entra_object_id, resolve_actor, verify_service_token
+from core_api.security import CurrentActor, get_current_actor, verify_service_token
+from onepulse_common.blob_storage import issue_download_sas, parse_blob_uri
 from onepulse_common.chat_assistant import ask_question
 from onepulse_common.config import PostgresSettings
 from onepulse_common.cycles import create_cycle, get_cycle
@@ -74,8 +75,11 @@ from onepulse_common.embeddings import build_embedding_client
 from onepulse_common.queues import REPORT_CYCLES_QUEUE, get_queue_client, send_json_message
 from onepulse_common.human_governance import (
     NotesRequiredError,
+    ReportNotFoundError,
     approve_report,
     get_report_detail,
+    get_report_download_info,
+    get_report_program_id,
     list_pending_reviews,
     reject_report,
 )
@@ -97,7 +101,47 @@ PROJECT_ENDPOINT = os.environ.get(
 )
 DEPLOYMENT_NAME = os.environ.get("ONEPULSE_FOUNDRY_DEPLOYMENT_NAME", "onePulse-gpt-5-mini")
 
+# FR-11 (Migration Plan Phase 8): 2 on-demand triggers per actor per
+# day. Buildable without a separate retrofit because Phase 4 (ADR-019)
+# already threads `requested_by_actor_id` through `cycles`/the queue
+# envelope specifically for this — counting real, already-recorded
+# trigger requests against that column, grouped by actor and a rolling
+# 24-hour window. Applies to every Owner-tier actor who can trigger at
+# all, not narrowed to the literal legacy role value 'portfolio_lead' —
+# a platform_admin or a new 'owner' actor triggering unlimited runs
+# while a portfolio_lead alone was capped would be a real, silent gap
+# in the same protection FR-11 exists for. NFR-6's own usage_ledger
+# (cost-based governance) is a separate, real, NOT-built concern —
+# this rate limit stands alone, keyed on a plain count of `cycles` rows,
+# not on any real cost figure `usage_ledger` would need to carry.
+RATE_LIMIT_TRIGGERS_PER_DAY = 2
+
 _tracer = trace.get_tracer(__name__)
+
+
+async def _check_rate_limit(conn: asyncpg.Connection, actor_id: str) -> None:
+    count = await conn.fetchval(
+        "SELECT count(*) FROM cycles WHERE requested_by_actor_id = $1 AND created_at >= now() - interval '24 hours'",
+        actor_id,
+    )
+    if count >= RATE_LIMIT_TRIGGERS_PER_DAY:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "rate_limit_exceeded",
+                "message": f"Limit of {RATE_LIMIT_TRIGGERS_PER_DAY} report triggers per 24 hours reached.",
+            },
+        )
+
+
+def _require_owner(current_actor: CurrentActor) -> None:
+    if not current_actor.is_owner:
+        raise HTTPException(status_code=403, detail={"error": "visitor_cannot_generate_or_approve"})
+
+
+def _require_program_in_scope(current_actor: CurrentActor, program_id: str) -> None:
+    if program_id not in current_actor.authorized_program_ids:
+        raise HTTPException(status_code=404, detail={"error": "program_not_found"})
 
 
 @asynccontextmanager
@@ -129,6 +173,12 @@ async def lifespan(app: FastAPI):
     app.state.chat_client = chat_client
     app.state.arize_space_id = arize_space_id
     app.state.report_cycles_client = report_cycles_client
+    # Migration Plan Phase 8: the real user-delegation SAS mechanism
+    # (onepulse_common.blob_storage) needs an async credential of its
+    # own — stored here rather than constructed per-request, the same
+    # real pattern as every other client this lifespan already builds
+    # once per process.
+    app.state.async_credential = async_credential
 
     try:
         yield
@@ -221,6 +271,15 @@ Decision = Literal["approved", "rejected"]
 
 
 class RejectRequest(BaseModel):
+    # Migration Plan Phase 8: `extra="forbid"` is a deliberate, real
+    # enforcement of ADR-017's own rule, not incidental strictness — an
+    # attempt to smuggle an `actorId` (or anything else) into this body
+    # gets a real, visible 422 rather than being silently dropped by
+    # Pydantic's default behavior. `actor_id` is derived server-side,
+    # always, from the platform-verified identity header alone; this is
+    # what makes that structurally true rather than merely undocumented.
+    model_config = ConfigDict(extra="forbid")
+
     notes: str
 
     @field_validator("notes")
@@ -307,6 +366,11 @@ class TriggerResponse(BaseModel):
     status: str
 
 
+class DownloadResponse(BaseModel):
+    downloadUrl: str
+    expiresInMinutes: int
+
+
 CycleStatus = Literal[
     "queued", "running",
     "persisted", "persisted_route_to_human_review",
@@ -360,9 +424,25 @@ class ChatQueryResponse(BaseModel):
 
 
 @app.get("/api/v1/programs")
-async def list_programs(request: Request, _token=Depends(verify_service_token)) -> list[ProgramItem]:
+async def list_programs(
+    request: Request,
+    _token=Depends(verify_service_token),
+    current_actor: CurrentActor = Depends(get_current_actor),
+) -> list[ProgramItem]:
+    """Migration Plan Phase 8: scoped to the caller's own resolved
+    `authorized_program_ids` — previously every program name in the
+    database, tenant boundary or not, was visible to any authenticated
+    caller. An actor with no scope never reaches this line at all
+    (`get_current_actor` already 403s), so an empty scope here would
+    only ever mean a real, if unusual, zero-program grant.
+    """
+    if not current_actor.authorized_program_ids:
+        return []
     async with request.app.state.pg_client.pool.acquire() as conn:
-        rows = await conn.fetch("SELECT program_id, name FROM programs ORDER BY name")
+        rows = await conn.fetch(
+            "SELECT program_id, name FROM programs WHERE program_id = ANY($1::uuid[]) ORDER BY name",
+            list(current_actor.authorized_program_ids),
+        )
     return [ProgramItem(programId=str(r["program_id"]), name=r["name"]) for r in rows]
 
 
@@ -371,7 +451,7 @@ async def trigger_report(
     request: Request,
     program_id: str,
     _token=Depends(verify_service_token),
-    entra_object_id: str = Depends(get_entra_object_id),
+    current_actor: CurrentActor = Depends(get_current_actor),
 ) -> TriggerResponse:
     """LLD 2.1's real trigger contract, real now (Migration Plan Phase
     3): inserts a real `queued` row and returns immediately — execution
@@ -379,6 +459,15 @@ async def trigger_report(
     resolved the same real ADR-017 way as approve/reject/chat; see the
     module docstring for why this deviates from the LLD's literal
     body-supplied `requestedBy` field.
+
+    Migration Plan Phase 8: three real, distinct new checks, in order —
+    (1) Owner-tier only (`_require_owner`, real 403 for a visitor — this
+    IS the actual enforcement of "a visitor role cannot trigger a run",
+    not a hidden button); (2) the requested `program_id` must be in this
+    actor's own resolved scope (real 404, indistinguishable from a
+    program that doesn't exist, per the same no-existence-leak
+    discipline as `ReportNotFoundError`); (3) FR-11's real rate limit
+    (real 429 once exceeded).
 
     Real API-to-Reporting tracing (Phase 3's own bar, unaffected by the
     ADR-026 queue-driven trigger): captures the current active span's
@@ -401,17 +490,17 @@ async def trigger_report(
     sweep/retry mechanism was built for it here, since it wasn't asked
     for and the failure window is real but narrow.
     """
+    _require_owner(current_actor)
+    _require_program_in_scope(current_actor, program_id)
+
     carrier: dict[str, str] = {}
     inject(carrier)
     trace_context = carrier.get("traceparent")
 
     async with request.app.state.pg_client.pool.acquire() as conn:
+        await _check_rate_limit(conn, current_actor.actor_id)
         try:
-            actor = await resolve_actor(conn, entra_object_id)
-        except ActorNotFoundError:
-            raise HTTPException(status_code=401, detail={"error": "actor_not_found"})
-        try:
-            result = await create_cycle(conn, program_id, str(actor["actor_id"]), trace_context)
+            result = await create_cycle(conn, program_id, current_actor.actor_id, trace_context)
         except asyncpg.exceptions.ForeignKeyViolationError:
             raise HTTPException(status_code=404, detail={"error": "program_not_found"})
 
@@ -421,17 +510,25 @@ async def trigger_report(
 
 @app.get("/api/v1/cycles/{cycle_id}")
 async def get_cycle_status(
-    request: Request, cycle_id: str, _token=Depends(verify_service_token)
+    request: Request,
+    cycle_id: str,
+    _token=Depends(verify_service_token),
+    current_actor: CurrentActor = Depends(get_current_actor),
 ) -> CycleStatusResponse:
     """ADR-021: the real polling read — answers from the database alone,
     regardless of which process (if any) is currently executing the
-    cycle. No reviewer-identity check here, matching the existing
-    GET /api/v1/reports pattern — a cycle's own status carries no
-    reviewer decision to protect.
+    cycle.
+
+    Migration Plan Phase 8: now requires a real, resolved identity and
+    program-scope check — a cycle's `stages` JSON can carry real report
+    content (finding titles, counts) mid-run, so this is no longer
+    treated as carrying nothing worth protecting. A cycle for a program
+    outside the caller's scope reads as `404`, identical to a genuinely
+    nonexistent `cycle_id` — no existence leak.
     """
     async with request.app.state.pg_client.pool.acquire() as conn:
         result = await get_cycle(conn, cycle_id)
-    if result is None:
+    if result is None or str(result["program_id"]) not in current_actor.authorized_program_ids:
         raise HTTPException(status_code=404, detail={"error": "cycle_not_found"})
     return CycleStatusResponse(
         cycleId=str(result["cycle_id"]),
@@ -447,10 +544,20 @@ async def get_cycle_status(
 
 @app.get("/api/v1/reviews/pending")
 async def get_pending_reviews(
-    request: Request, programId: str, _token=Depends(verify_service_token)
+    request: Request,
+    programId: str,
+    _token=Depends(verify_service_token),
+    current_actor: CurrentActor = Depends(get_current_actor),
 ) -> PendingReviewsResponse:
+    """Migration Plan Phase 8: viewing pending reviews is allowed for
+    both roles (a "view" action, not generate/approve) but still
+    requires `programId` to be in the caller's own resolved scope —
+    real 404 for a program outside it, same no-existence-leak framing
+    as every other scope check in this file.
+    """
+    _require_program_in_scope(current_actor, programId)
     async with request.app.state.pg_client.pool.acquire() as conn:
-        result = await list_pending_reviews(conn, programId)
+        result = await list_pending_reviews(conn, programId, current_actor.tenant_id)
     return PendingReviewsResponse(**result)
 
 
@@ -459,20 +566,28 @@ async def approve(
     request: Request,
     report_id: int,
     _token=Depends(verify_service_token),
-    entra_object_id: str = Depends(get_entra_object_id),
+    current_actor: CurrentActor = Depends(get_current_actor),
 ) -> ReviewDecisionResponse:
-    """Real ADR-017 resolution: the caller (BFF) supplies only an Entra
-    object ID; the real internal actor_id used for the approval is
-    always looked up here, never accepted from the request.
+    """Real ADR-017 resolution: the real internal actor_id used for the
+    approval is always looked up server-side, never accepted from the
+    request.
+
+    Migration Plan Phase 8: Owner-tier only (`_require_owner`); the
+    report's own program must be in the caller's resolved scope, checked
+    via the real, RLS-respecting `get_report_program_id` (a report
+    outside the caller's tenant is already invisible to that query —
+    this adds the finer program-level check RLS's tenant-only policy
+    can't express, and gives a uniform, no-existence-leak 404 for both
+    real "gone"/never-existed and real "not yours" cases).
     """
+    _require_owner(current_actor)
     async with request.app.state.pg_client.pool.acquire() as conn:
+        program_id = await get_report_program_id(conn, report_id, current_actor.tenant_id)
+        if program_id is None or program_id not in current_actor.authorized_program_ids:
+            raise HTTPException(status_code=404, detail={"error": "report_not_found"})
         try:
-            actor = await resolve_actor(conn, entra_object_id)
-        except ActorNotFoundError:
-            raise HTTPException(status_code=401, detail={"error": "actor_not_found"})
-        try:
-            result = await approve_report(conn, report_id, str(actor["actor_id"]))
-        except asyncpg.exceptions.ForeignKeyViolationError:
+            result = await approve_report(conn, report_id, current_actor.actor_id, current_actor.tenant_id)
+        except ReportNotFoundError:
             raise HTTPException(status_code=404, detail={"error": "report_not_found"})
     return ReviewDecisionResponse(**result)
 
@@ -483,27 +598,48 @@ async def reject(
     report_id: int,
     body: RejectRequest,
     _token=Depends(verify_service_token),
-    entra_object_id: str = Depends(get_entra_object_id),
+    current_actor: CurrentActor = Depends(get_current_actor),
 ) -> ReviewDecisionResponse:
+    """Migration Plan Phase 8: same real Owner-tier + scope checks as
+    `approve` — see its own docstring.
+    """
+    _require_owner(current_actor)
     async with request.app.state.pg_client.pool.acquire() as conn:
+        program_id = await get_report_program_id(conn, report_id, current_actor.tenant_id)
+        if program_id is None or program_id not in current_actor.authorized_program_ids:
+            raise HTTPException(status_code=404, detail={"error": "report_not_found"})
         try:
-            actor = await resolve_actor(conn, entra_object_id)
-        except ActorNotFoundError:
-            raise HTTPException(status_code=401, detail={"error": "actor_not_found"})
-        try:
-            result = await reject_report(conn, report_id, str(actor["actor_id"]), body.notes)
+            result = await reject_report(
+                conn, report_id, current_actor.actor_id, current_actor.tenant_id, body.notes
+            )
         except NotesRequiredError:
             raise HTTPException(status_code=400, detail={"error": "notes_required"})
-        except asyncpg.exceptions.ForeignKeyViolationError:
+        except ReportNotFoundError:
             raise HTTPException(status_code=404, detail={"error": "report_not_found"})
     return ReviewDecisionResponse(**result)
 
 
 @app.get("/api/v1/reports")
 async def get_reports(
-    programId: str | None = None, limit: int = 20, _token=Depends(verify_service_token)
+    request: Request,
+    programId: str | None = None,
+    limit: int = 20,
+    _token=Depends(verify_service_token),
+    current_actor: CurrentActor = Depends(get_current_actor),
 ) -> list[ReportSummary]:
-    rows = await list_recent_reports(limit=limit, program_id=programId)
+    """Migration Plan Phase 8: real tenant + program scoping. A given
+    `programId` outside scope is a real 404 (no existence leak); with no
+    `programId`, results are still narrowed to the caller's own resolved
+    `authorized_program_ids` (RLS's tenant-only policy alone would show
+    every program in the tenant, not just the ones this specific actor
+    is scoped to).
+    """
+    if programId is not None:
+        _require_program_in_scope(current_actor, programId)
+    async with request.app.state.pg_client.pool.acquire() as conn:
+        rows = await list_recent_reports(
+            conn, current_actor.tenant_id, current_actor.authorized_program_ids, limit=limit, program_id=programId
+        )
     return [
         ReportSummary(
             reportId=r["report_id"],
@@ -523,10 +659,21 @@ async def get_reports(
 
 @app.get("/api/v1/reports/{report_id}")
 async def get_report(
-    request: Request, report_id: int, _token=Depends(verify_service_token)
+    request: Request,
+    report_id: int,
+    _token=Depends(verify_service_token),
+    current_actor: CurrentActor = Depends(get_current_actor),
 ) -> ReportDetailResponse:
+    """Migration Plan Phase 8: real tenant-scoped read (`get_report_
+    detail` now sets `app.current_tenant_id`) plus the same
+    program-level scope check every report_id-based route performs —
+    both roles may view (no `_require_owner` here), within scope.
+    """
     async with request.app.state.pg_client.pool.acquire() as conn:
-        result = await get_report_detail(conn, report_id)
+        program_id = await get_report_program_id(conn, report_id, current_actor.tenant_id)
+        if program_id is None or program_id not in current_actor.authorized_program_ids:
+            raise HTTPException(status_code=404, detail={"error": "report_not_found"})
+        result = await get_report_detail(conn, report_id, current_actor.tenant_id)
     if result["report"] is None:
         raise HTTPException(status_code=404, detail={"error": "report_not_found"})
     r = result["report"]
@@ -564,29 +711,69 @@ async def get_report(
     )
 
 
+@app.get("/api/v1/reports/{report_id}/download")
+async def download_report(
+    request: Request,
+    report_id: int,
+    _token=Depends(verify_service_token),
+    current_actor: CurrentActor = Depends(get_current_actor),
+) -> DownloadResponse:
+    """Migration Plan Phase 8 (ADR-021/027): the real, working SAS
+    mechanism ADR-021 designed but never built until this bar-for-done
+    required it — a visitor role cannot retrieve a SAS for a report
+    outside its scope; this route is what that sentence actually means.
+
+    Authorization happens BEFORE issuance, per ADR-021's own stated
+    constraint (`get_report_download_info` is real, tenant-scoped RLS;
+    the program-membership check is the finer half). Both roles may
+    download within scope (view is a Visitor capability) — no
+    `_require_owner` here. A report whose `rendered_artifact_uri` isn't
+    a real `blob://` URI (every report rendered before this phase, and
+    any rendered since without a real blob upload) has no SAS-
+    downloadable artifact — a real, honest `404`, not a broken link.
+    """
+    async with request.app.state.pg_client.pool.acquire() as conn:
+        info = await get_report_download_info(conn, report_id, current_actor.tenant_id)
+    if info is None or info["program_id"] not in current_actor.authorized_program_ids:
+        raise HTTPException(status_code=404, detail={"error": "report_not_found"})
+
+    parsed = parse_blob_uri(info["rendered_artifact_uri"]) if info["rendered_artifact_uri"] else None
+    if parsed is None:
+        raise HTTPException(status_code=404, detail={"error": "artifact_not_available"})
+    container, blob_name = parsed
+
+    sas_url = await issue_download_sas(request.app.state.async_credential, container, blob_name)
+    return DownloadResponse(downloadUrl=sas_url, expiresInMinutes=5)
+
+
 @app.post("/api/v1/chat/query")
 async def chat_query(
     request: Request,
     body: ChatQueryRequest,
     _token=Depends(verify_service_token),
-    entra_object_id: str = Depends(get_entra_object_id),
+    current_actor: CurrentActor = Depends(get_current_actor),
 ) -> ChatQueryResponse:
-    """`entra_object_id` is resolved for real (proving the identity is
-    real and known) but not yet used to scope retrieval — the same
-    real, already-documented shortcut `ask_question` itself states
-    (`actor_scope` resolution is Phase 8 work). Resolving it here now,
-    even unused for scoping yet, means Phase 8 only has to change what
-    this does with the result, not add the resolution step itself.
+    """Migration Plan Phase 8 (ADR-022/027): the real, mandatory
+    server-side retrieval filter LLD Section 2.3 always required —
+    `current_actor.authorized_program_ids` is passed to `ask_question`
+    unconditionally, so the model is never even shown a chunk from a
+    program outside the caller's scope (filtering an already-generated
+    answer would be too late). A caller-supplied `programId` narrows
+    within that already-authorized set; one outside it is a real 404,
+    the same no-existence-leak framing as every other scope check here.
+    Both roles may chat within scope — no `_require_owner`.
     """
-    async with request.app.state.pg_client.pool.acquire() as conn:
-        try:
-            await resolve_actor(conn, entra_object_id)
-        except ActorNotFoundError:
-            raise HTTPException(status_code=401, detail={"error": "actor_not_found"})
+    if body.programId is not None:
+        _require_program_in_scope(current_actor, body.programId)
 
     state = request.app.state
     result = await ask_question(
-        state.chat_client, state.search_client, state.embedding_client, body.question, body.programId
+        state.chat_client,
+        state.search_client,
+        state.embedding_client,
+        body.question,
+        current_actor.authorized_program_ids,
+        body.programId,
     )
     return ChatQueryResponse(
         answer=result["answer"],

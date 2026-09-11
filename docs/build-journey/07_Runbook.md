@@ -462,6 +462,22 @@ Empty output means it's genuinely never been committed.
   one), several attempts with 10-second polling and a few seconds of reaction lag still lost the race
   to the cycle simply finishing first; polling at 8 seconds and issuing the deactivate command the
   instant the target condition was observed was what finally worked.
+- **`SET LOCAL <custom_guc> = $1` is not valid SQL over a bind parameter — Postgres's `SET`/`SET
+  LOCAL` statement does not accept a query parameter as its value at all** (Migration Plan Phase 8,
+  setting `app.current_tenant_id` for real RLS enforcement for the first time). `asyncpg` raises a
+  plain `PostgresSyntaxError` on the very first real attempt. Use `SELECT set_config('<guc_name>',
+  $1, true)` instead — a real function call, fully parameterizable; the third argument `true` gives
+  it the identical transaction-local (`SET LOCAL`) scope.
+- **A custom GUC's "unset" value is `NULL` only the first time it's ever referenced in a session —
+  after that, it's the empty string `''`, not `NULL`, even after the transaction that set it
+  committed and the LOCAL value reverted.** Confirmed live: `current_setting('app.current_tenant_id',
+  true)` returns real SQL `NULL` before any `set_config` call has ever touched it in the current
+  session/pooled connection, and `''` after even one such call, for the rest of that connection's
+  life. A real, previously-invisible RLS policy bug (migration 0005's own `IS NULL` check, fixed in
+  0008 to `NULLIF(current_setting(...), '') IS NULL`) — every real connection pool with more than one
+  tenant-scoped query per connection (i.e. every one of this project's own deployed services) would
+  hit it. If a permissive-when-unset RLS policy checks `current_setting(x, true) IS NULL`, treat both
+  representations as "unset" from the start rather than discovering this live.
 
 ---
 
@@ -580,3 +596,40 @@ carries the script (`scripts/verify_migration.py`, copied at build time specific
 scripts/verify_migration.py --target dev"` connects as the real `app_role` Managed Identity from
 inside the container and prints the same real 119/119 result the local `.venv` run does, over the
 identical live database.
+
+## 8. Real Reviewer Identity, Roles, and Provisioning (Migration Plan Phase 8)
+
+**How someone gets access, the real, written-down answer**: there is no self-service signup. A
+platform admin inserts one real `actors` row, mapping the person's real Entra object ID (found from
+their own signed-in token's `oid` claim, or from Entra ID directly) to a role, plus one real
+`actor_scope` row (a `portfolio_id` for broad access, or a `program_id` for one specific program):
+
+```sql
+INSERT INTO actors (tenant_id, role, entra_object_id)
+VALUES ('<real tenant_id>', 'owner', '<their real Entra object id>')
+RETURNING actor_id;
+
+INSERT INTO actor_scope (actor_id, portfolio_id) VALUES ('<actor_id above>', '<real portfolio_id>');
+```
+
+`role` is `'owner'` (generate, approve, see everything in scope) or `'visitor'` (view and chat within
+scope, never generate or approve) — see `onepulse_common/roles.py`. Every legacy role value
+(`portfolio_lead`/`program_lead`/`platform_admin`) is still valid and still treated as Owner-tier; no
+existing row needs changing. Until both rows exist, that identity's every real request gets a clean
+`403 {"error": "no_access", ...}` — this is the expected, common state for anyone the URL is shared
+with before being provisioned, not a bug to work around.
+
+**`scripts/seed_phase8_test_data.py --target dev`** seeds a complete, real second-tenant test fixture
+(a fictional "Meridian Health" tenant/portfolio/program with two real reports, a Tenant-A Visitor
+actor, and a Tenant-B Owner actor) — the fastest way to reproduce the real cross-tenant isolation
+proofs (report list, chat retrieval filter, SAS download) documented in ADR-027, without waiting on a
+second real Azure DevOps project (none is needed).
+
+**Testing as a specific identity, without a browser**: `core_api` itself only needs the real
+`X-Onepulse-Entra-Object-Id` header and a real service token (`az account get-access-token --scope
+"$ONEPULSE_CORE_API_IDENTIFIER_URI/.default"`) — set the header to any real, seeded `entra_object_id`
+to test as that actor directly, bypassing `bff`'s own identity resolution entirely. Through `bff`
+itself (real Easy Auth, deployed only), acquire a real token for `onepulse-bff-signin`'s own
+`access_as_user` scope instead (`az account get-access-token --scope
+"api://<bff-signin-app-id>/access_as_user"`) — `bff` decodes the real `X-MS-CLIENT-PRINCIPAL` header
+Easy Auth injects and forwards the real `oid` claim on to `core_api`.

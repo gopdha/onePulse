@@ -307,6 +307,26 @@ async def check_policy_exists(conn: asyncpg.Connection, table_name: str, policy_
     return result is not None
 
 
+async def check_policy_definition_contains(
+    conn: asyncpg.Connection, table_name: str, policy_name: str, expected_substring: str
+) -> bool:
+    """Migration 0008: `check_policy_exists` alone only proves a policy
+    with this NAME exists — it would pass identically for the real,
+    live-discovered-broken 0005 version of `tenant_isolation` (`IS NULL`
+    only, not `NULLIF(...) IS NULL`) and the fixed 0008 one. This checks
+    the real `qual` (USING expression) text itself for the fix's own
+    marker, so a future regression back to the 0005 shape is caught here
+    rather than only by re-discovering the empty-string GUC bug live
+    again.
+    """
+    qual = await conn.fetchval(
+        "SELECT qual FROM pg_policies WHERE schemaname = 'public' AND tablename = $1 AND policyname = $2",
+        table_name,
+        policy_name,
+    )
+    return qual is not None and expected_substring in qual
+
+
 async def check_schema_exists(conn: asyncpg.Connection, schema_name: str) -> bool:
     """Real, live-discovered subtlety (Phase 4): information_schema.schemata
     is itself subject to the connecting role's own USAGE visibility —
@@ -346,6 +366,22 @@ async def check_privilege_revoked(
     table_name — the real proof the LLD's REVOKE actually held, not
     merely that it was never granted in the first place (both produce
     the same absence, which is exactly what matters here).
+
+    Real, load-bearing limitation, found live (Migration Plan Phase 8
+    follow-up): this reads `information_schema.role_table_grants`, which
+    reflects ONLY the explicit ACL layer — a genuine, effective privilege
+    reaching a role via membership in a PostgreSQL *predefined* role
+    (`pg_write_all_data`, granting INSERT/UPDATE/DELETE on every table in
+    every schema to every member, with no per-table ACL entry ever
+    created) is real and enforced by Postgres, but invisible to this
+    query. `azure_pg_admin` is a member of `pg_write_all_data` — this
+    check reports "safe" for it on `approval_records` while `has_table_
+    privilege('azure_pg_admin', 'approval_records', 'DELETE')` correctly
+    reports `True`. Use `check_real_privilege_denied` (below) for any
+    claim that actually needs to hold against every real grant path, not
+    only the ACL one — this function is kept for the checks that
+    specifically are about the ACL layer (e.g. confirming `app_role`'s
+    own explicit grant profile), where it remains correct.
     """
     rows = await conn.fetch(
         "SELECT privilege_type FROM information_schema.role_table_grants "
@@ -355,6 +391,49 @@ async def check_privilege_revoked(
     )
     granted = {r["privilege_type"] for r in rows}
     return not (granted & set(privileges))
+
+
+async def check_real_privilege_denied(
+    conn: asyncpg.Connection, table_name: str, role_name: str, privileges: list[str]
+) -> bool:
+    """True iff `role_name` genuinely cannot exercise any of `privileges`
+    on `table_name` — via `has_table_privilege`, the real Postgres
+    function that accounts for every actual grant path (explicit ACL,
+    ownership, AND predefined-role membership like `pg_write_all_data`),
+    not just the ACL layer `check_privilege_revoked` reads. The real
+    proof the append-only guarantee on `approval_records` holds against
+    a given role, not merely that no `GRANT` statement targets it by
+    name.
+    """
+    for priv in privileges:
+        allowed = await conn.fetchval(
+            "SELECT has_table_privilege($1, $2, $3)", role_name, f"public.{table_name}", priv
+        )
+        if allowed:
+            return False
+    return True
+
+
+async def check_trigger_exists_and_enabled(conn: asyncpg.Connection, table_name: str, trigger_name: str) -> bool:
+    """Migration 0011 (ADR-028): the real, ACL-independent enforcement
+    mechanism for `approval_records`' append-only guarantee against
+    `pg_write_all_data`-derived privilege (which `check_real_privilege_
+    denied` correctly reports as present for `azure_pg_admin` and always
+    will — that check proves the privilege exists, not that it's
+    effective; this one proves the trigger that makes it ineffective
+    actually exists and is armed). `tgenabled != 'D'` — Postgres's own
+    real encoding for "not disabled" (a trigger's enabled state has more
+    than two values — origin/replica/always — `'D'` is the only one that
+    means off).
+    """
+    row = await conn.fetchrow(
+        "SELECT tgenabled FROM pg_trigger WHERE tgrelid = $1::regclass AND tgname = $2 AND NOT tgisinternal",
+        f"public.{table_name}",
+        trigger_name,
+    )
+    # asyncpg returns pg_catalog's "char" type as raw bytes (confirmed
+    # live: b'O' for "origin"/enabled) — comparing against b"D", not "D".
+    return row is not None and row["tgenabled"] != b"D"
 
 
 async def check_has_table_privileges(
@@ -532,6 +611,9 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
     results.append(
         ("column dropped: reports.curated_features", not await check_column_exists(conn, "reports", "curated_features"))
     )
+    results.append(
+        ("column exists: reports.is_test_fixture (0009)", await check_column_exists(conn, "reports", "is_test_fixture"))
+    )
 
     results.append(
         ("generated column: configurations.manifest_complete",
@@ -557,7 +639,8 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
     results.append(
         ("CHECK constraint: actors.role",
          await check_check_constraint_values(
-             conn, "actors", "role", ["portfolio_lead", "program_lead", "platform_admin"]
+             conn, "actors", "role",
+             ["portfolio_lead", "program_lead", "platform_admin", "owner", "visitor"],
          ))
     )
 
@@ -573,6 +656,10 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
     results.append(("RLS enabled: reports", await check_rls_enabled(conn, "reports")))
     results.append(("RLS policy exists: reports.tenant_isolation", await check_policy_exists(conn, "reports", "tenant_isolation")))
     results.append(
+        ("RLS policy (0008): tenant_isolation treats both NULL and '' as unset (NULLIF fix)",
+         await check_policy_definition_contains(conn, "reports", "tenant_isolation", "NULLIF"))
+    )
+    results.append(
         ("FORCE ROW LEVEL SECURITY: reports (app_role, its owner, is not exempt from tenant_isolation)",
          await check_force_rls_enabled(conn, "reports"))
     )
@@ -582,6 +669,35 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
             (f"approval_records append-only for {role}",
              await check_privilege_revoked(conn, "approval_records", role, ["UPDATE", "DELETE"]))
         )
+
+    # Migration Plan Phase 8 follow-up, real live finding, then a real
+    # fix (ADR-028): the two ACL-based checks above prove nothing about
+    # a role that reaches real UPDATE/DELETE via predefined-role
+    # membership (`pg_write_all_data`) rather than an explicit GRANT.
+    # `azure_pg_admin` (this server's real Entra Administrator role, and
+    # every identity that is a member of it) is a member of
+    # `pg_write_all_data`, which grants UPDATE/DELETE/INSERT/TRUNCATE on
+    # every table in every schema unconditionally, with zero
+    # corresponding row in information_schema.role_table_grants —
+    # confirmed live: `has_table_privilege('azure_pg_admin', ...)`
+    # reports `true`, and a direct `REVOKE` runs with no error and
+    # changes nothing. `check_real_privilege_denied` (below, kept as a
+    # reusable, correct function) will therefore always, permanently,
+    # correctly report `False` for azure_pg_admin here — that is not a
+    # bug to chase, it is the real, structural fact a REVOKE cannot
+    # reach. The actual guarantee now rests on a trigger (migration
+    # 0011), which fires regardless of which privilege path let the
+    # statement reach the table — confirmed live, adversarially, as the
+    # raw admin identity: a real DELETE and a real UPDATE against a real
+    # existing row both raise `approval_records is append-only`, and the
+    # row is confirmed unchanged afterward (CLAUDE.md Task 49 follow-up;
+    # ADR-028 has the full account). The check that matters now is
+    # whether that trigger genuinely exists and is armed, not whether
+    # the underlying privilege is absent — it never can be.
+    results.append(
+        ("approval_records append-only enforcement: real trigger exists and is armed (ADR-028, migration 0011)",
+         await check_trigger_exists_and_enabled(conn, "approval_records", "approval_records_append_only"))
+    )
 
     results.append(
         ("CHECK constraint: cycles.status covers all 4 ADR-021 terminal outcomes + queued/running/failed (0003)",

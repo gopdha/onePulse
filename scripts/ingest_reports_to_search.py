@@ -52,15 +52,25 @@ def _to_datetimeoffset(value: dt.date) -> str:
     return dt.datetime.combine(value, dt.time.min, tzinfo=dt.timezone.utc).isoformat()
 
 
-async def fetch_report_chunks(conn) -> list[dict]:
+async def fetch_report_chunks(conn, report_ids: list[int] | None = None) -> list[dict]:
+    # `report_ids`, when given, is a real, minimal scoping addition
+    # (Migration Plan Phase 8) — indexing exactly one deliberate,
+    # attributable set of report_ids. The separate, already-documented
+    # "no filter at all" gap (Task 39/40) for the default, unfiltered
+    # case is now half-closed: `is_test_fixture` (Task 49 follow-up)
+    # excludes the real ~440-row test_human_governance.py debris from
+    # ever being indexed, unconditionally, whether or not report_ids is
+    # given.
     rows = await conn.fetch(
         """
         SELECT r.report_id, r.program_id, p.name AS program_name, r.week_of,
                r.rag_status, r.executive_summary
         FROM reports r
         JOIN programs p ON p.program_id = r.program_id
+        WHERE ($1::bigint[] IS NULL OR r.report_id = ANY($1::bigint[])) AND NOT r.is_test_fixture
         ORDER BY r.report_id
-        """
+        """,
+        report_ids,
     )
     return [
         {
@@ -80,7 +90,7 @@ async def fetch_report_chunks(conn) -> list[dict]:
     ]
 
 
-async def fetch_finding_chunks(conn) -> list[dict]:
+async def fetch_finding_chunks(conn, report_ids: list[int] | None = None) -> list[dict]:
     rows = await conn.fetch(
         """
         SELECT f.finding_id, f.report_id, f.source_item_ref, f.title, f.status_label, f.evidence,
@@ -88,8 +98,10 @@ async def fetch_finding_chunks(conn) -> list[dict]:
         FROM findings f
         JOIN reports r ON r.report_id = f.report_id
         JOIN programs p ON p.program_id = r.program_id
+        WHERE ($1::bigint[] IS NULL OR f.report_id = ANY($1::bigint[])) AND NOT r.is_test_fixture
         ORDER BY f.finding_id
-        """
+        """,
+        report_ids,
     )
     return [
         {
@@ -109,13 +121,13 @@ async def fetch_finding_chunks(conn) -> list[dict]:
     ]
 
 
-async def ingest(settings: PostgresSettings) -> None:
+async def ingest(settings: PostgresSettings, report_ids: list[int] | None = None) -> None:
     pg_client = await PostgresClient.connect(settings, min_size=1, max_size=1)
     search_credential = DefaultAzureCredential()
     try:
         async with pg_client.pool.acquire() as conn:
-            report_chunks = await fetch_report_chunks(conn)
-            finding_chunks = await fetch_finding_chunks(conn)
+            report_chunks = await fetch_report_chunks(conn, report_ids)
+            finding_chunks = await fetch_finding_chunks(conn, report_ids)
 
         chunks = report_chunks + finding_chunks
         print(f"Fetched {len(report_chunks)} report chunk(s), {len(finding_chunks)} finding chunk(s) from Postgres.")
@@ -162,8 +174,16 @@ async def ingest(settings: PostgresSettings) -> None:
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", required=True, choices=list(TARGETS))
+    parser.add_argument(
+        "--report-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Real, deliberate scoping (Migration Plan Phase 8): index only these report_ids. "
+        "Omit for the existing, unfiltered, whole-table behavior.",
+    )
     args = parser.parse_args()
-    await ingest(TARGETS[args.target])
+    await ingest(TARGETS[args.target], args.report_ids)
 
 
 if __name__ == "__main__":

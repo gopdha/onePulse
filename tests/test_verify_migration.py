@@ -29,9 +29,12 @@ from verify_migration import (
     check_no_excess_table_privileges,
     check_no_schema_privilege,
     check_object_owner,
+    check_policy_definition_contains,
     check_policy_exists,
     check_privilege_revoked,
+    check_real_privilege_denied,
     check_rls_enabled,
+    check_trigger_exists_and_enabled,
     check_schema_exists,
     check_schema_owner,
     check_table_exists,
@@ -113,6 +116,23 @@ async def test_forced_failure_force_rls_not_enabled_on_unprotected_table_detecte
     assert await check_force_rls_enabled(conn, "tenants") is False
 
 
+async def test_real_tenant_isolation_policy_has_the_0008_nullif_fix(conn) -> None:
+    # Migration 0008: check_policy_exists alone can't distinguish the
+    # real, live-broken 0005 shape (IS NULL only) from the fixed 0008
+    # one (NULLIF(..., '') IS NULL) — both satisfy "a policy named
+    # tenant_isolation exists". This reads the real qual text.
+    assert await check_policy_definition_contains(conn, "reports", "tenant_isolation", "NULLIF") is True
+
+
+async def test_forced_failure_policy_definition_missing_substring_detected(conn) -> None:
+    assert (
+        await check_policy_definition_contains(
+            conn, "reports", "tenant_isolation", "this substring is not in the real policy text"
+        )
+        is False
+    )
+
+
 async def test_forced_failure_revoke_check_detects_a_real_grant(conn) -> None:
     # findings genuinely grants INSERT to app_role_local_dev (Task 2's
     # own migration) — using it here as the real "still granted" case
@@ -121,6 +141,51 @@ async def test_forced_failure_revoke_check_detects_a_real_grant(conn) -> None:
     assert (
         await check_privilege_revoked(conn, "findings", "app_role_local_dev", ["INSERT"])
         is False
+    )
+
+
+async def test_real_privilege_denied_check_passes_for_app_role_local_dev(conn) -> None:
+    # The real, still-correct case: app_role_local_dev's own ACL grant
+    # on approval_records is genuinely SELECT+INSERT only.
+    assert (
+        await check_real_privilege_denied(conn, "approval_records", "app_role_local_dev", ["UPDATE", "DELETE"])
+        is True
+    )
+
+
+async def test_real_privilege_denied_check_detects_the_real_azure_pg_admin_gap(conn) -> None:
+    # The real, live gap this task found (ADR-028): azure_pg_admin
+    # reaches real DELETE/UPDATE via predefined-role membership
+    # (pg_write_all_data), invisible to check_privilege_revoked's own
+    # information_schema-based query. This must FAIL today, honestly —
+    # it is the exact assertion the fix (once decided) needs to flip.
+    assert (
+        await check_real_privilege_denied(conn, "approval_records", "azure_pg_admin", ["UPDATE", "DELETE"])
+        is False
+    )
+
+
+async def test_real_trigger_exists_and_enabled_for_approval_records(conn) -> None:
+    # Migration 0011 (ADR-028): the real, ACL-independent enforcement
+    # mechanism for the append-only guarantee.
+    assert await check_trigger_exists_and_enabled(conn, "approval_records", "approval_records_append_only") is True
+
+
+async def test_forced_failure_trigger_check_detects_a_missing_trigger(conn) -> None:
+    assert await check_trigger_exists_and_enabled(conn, "approval_records", "this_trigger_does_not_exist") is False
+
+
+async def test_real_privilege_denied_check_can_report_a_genuine_pass(conn) -> None:
+    # Proves this isn't hardcoded to always return False for
+    # azure_pg_admin-like inputs: a privilege it genuinely lacks
+    # (a role with no real access to a completely unrelated,
+    # nonexistent-for-it privilege combination) still reports True.
+    # tenants has no CHECK/RLS/anything special — app_role_local_dev's
+    # own real grant there is SELECT+INSERT, same shape as
+    # approval_records, confirming the function isn't just special-cased.
+    assert (
+        await check_real_privilege_denied(conn, "tenants", "app_role_local_dev", ["UPDATE", "DELETE"])
+        is True
     )
 
 

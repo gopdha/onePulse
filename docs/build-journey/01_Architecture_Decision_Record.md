@@ -1166,3 +1166,350 @@ affecting both queue-scaled services equally — but that conclusion is delibera
 open follow-up in CLAUDE.md's Task 48 entry, with a concrete next check named, rather than closed out
 by the strength of this investigation alone. The revised cost figure above is a projection contingent
 on this actually being observed, not an already-realized result.
+
+---
+
+## ADR-027: Real reviewer identity, the Owner/Visitor role model, and RLS finally enforcing (Migration Plan Phase 8)
+
+**Context**: this is the phase the whole migration has been building toward, and everything else was
+gated behind it (ADR-018's own stated dependency, Governance & Security Reference §5). Every piece
+this decision touches was already designed and installed, and none of it had ever been exercised:
+`reports`' `tenant_isolation` RLS policy (Phase 2, `FORCE`d pre-Phase-6) had never had
+`app.current_tenant_id` set by any real request in this project's history; `actors`/`actor_scope`
+existed with exactly one real tenant and zero real scope rows; `core_api`'s trigger/approve/reject
+routes resolved a real actor but never checked what that actor was actually allowed to do; `bff`
+forwarded a stubbed identity regardless of who was really signed in. This is this project's own fifth
+instance of "designed correctly, documented confidently, never exercised" (Governance & Security
+Reference §6) — verifying tenant isolation against a single tenant, with no genuine second tenant's
+data behind it, would have been a sixth.
+
+**Decision, four real, separate pieces**:
+
+1. **Seed a genuine second tenant first, with real data, before touching any code** (per the Migration
+   Plan's own Phase 0 prerequisite). `scripts/seed_phase8_test_data.py`: a real fictional tenant
+   ("Meridian Health"), its own portfolio and program, two real seeded reports with real findings, a
+   real Tenant-B Owner actor scoped to it — plus a real Tenant-A Visitor actor and, filling a real gap
+   found while writing this (the existing Tenant-A stand-in reviewer had *no* `actor_scope` row at
+   all, predating this phase), a backfilled scope for it too. With one tenant, a policy that filters
+   correctly and one that silently matches everything produce identical results; the interesting
+   failures are in retrieval — the report list, the chat assistant's filter, a SAS request — not in
+   the table, which is why seeded *reports*, not just structure, were the real requirement.
+
+2. **`get_current_actor()`, one real FastAPI dependency, on every route in `core_api`.** Resolves the
+   platform-verified Entra object ID (never an internal `actor_id` — unchanged since ADR-017) against
+   `actors.entra_object_id`, then resolves the real tenant this actor's own `actor_scope` maps to
+   (`actor_scope` -> `portfolio_id`/`program_id` -> `portfolios.tenant_id` — the IDENTICAL join
+   `tenant_isolation`'s own policy performs, deliberately not `actors.tenant_id` directly, so the
+   value this sets and the value the policy checks can never structurally disagree), and the real set
+   of `program_id`s the actor may see (direct `program_id` scope rows, plus every program under a
+   `portfolio_id` scope row — the program-granular half of "scope" that tenant-only RLS cannot
+   express on its own). **Resolved fresh on every single request, with no session-lifetime cache of
+   any kind** — revoking access by deleting an `actor_scope` row takes effect on the very next
+   request, which is the real advantage a server-side session model has over a browser-held token
+   that can't be invalidated server-side; caching this resolution for any period would give that
+   advantage back, which is exactly why it wasn't cached.
+
+3. **RLS finally enforces**, exactly where the Migration Plan's own strengthened Phase 8 DoD said it
+   would: `SET LOCAL app.current_tenant_id` (in practice, `SELECT set_config(..., true)` — see the
+   real, live-discovered fix below) inside a real transaction, in `core_api` and `reporting` only
+   (`bff` has no data-store access by design; `investigation` has no access to `public` by design).
+   Three functions already wrapped in a transaction (`approve_report`, `reject_report`,
+   `persist_report`) just needed the `set_config` call added; three were bare reads that needed an
+   explicit transaction wrap first (`get_report_detail`, `list_pending_reviews`, `list_recent_reports`).
+   `persist_report` resolves its own tenant directly from `program_id` (via the identical portfolio
+   join) rather than taking it from a caller — `reporting` is a queue consumer with no authenticated
+   actor of its own; "which tenant owns this program" is a fact about the program, not about who
+   asked.
+
+4. **Owner/Visitor, the real role model, enforced entirely in `core_api`.** Owner: generate, approve,
+   see everything in scope. Visitor: view and chat, within scope, never generate or approve. Real,
+   deliberate schema choice, not a new column: `actors.role` keeps its three original
+   organizational-title values (`portfolio_lead`/`program_lead`/`platform_admin`) and gains two new
+   literal ones (`owner`/`visitor`) — every legacy value is treated as Owner-tier
+   (`onepulse_common.roles.is_owner_role`, an exclusion check: `role != 'visitor'`), since every actor
+   seeded before this phase was, in practice, a full-capability reviewer/admin; no backfill needed, no
+   second role-shaped column with an unclear precedence rule against the first. Enforced with
+   `_require_owner` at exactly two real points — the trigger endpoint and approve/reject — and
+   deliberately nowhere else: view/chat/download routes are open to both roles within scope. **No
+   Streamlit UI change of any kind** — a hidden button is usability, not security, and React
+   (Phase 9) is where a real Visitor-mode UI belongs; the API refusing the request is the actual
+   enforcement, proven with real requests below, not a UI affordance.
+
+**Two real bugs found live while implementing this, neither hypothetical**:
+
+- **`SET LOCAL app.current_tenant_id = $1` is not valid syntax over a bind parameter** — Postgres's
+  `SET`/`SET LOCAL` statement does not accept a query parameter as its value at all (`asyncpg`
+  raises a plain `PostgresSyntaxError`, live, on the very first real call). Fixed everywhere via
+  `SELECT set_config('app.current_tenant_id', $1, true)` — a real function call, not a `SET`
+  statement, fully parameterizable, and `true` as the third argument gives it the identical
+  transaction-local (`SET LOCAL`) scope.
+- **A second, more consequential real bug, found only because Phase 8's own seed script was the
+  first real workload to call `set_config` on this GUC more than once on the same pooled
+  connection**: `current_setting('app.current_tenant_id', true)` returns real SQL `NULL` only the
+  *first* time it is ever referenced in a session that has never touched this custom GUC. Once any
+  `set_config(..., true)` call has ever set it — even transactionally, even after that transaction
+  committed and the LOCAL value reverted — Postgres has created a real placeholder variable for this
+  GUC in the backend, and the "reverted" value is the empty string `''`, not `NULL`. Confirmed live,
+  directly, on the same connection: `NULL` before any `set_config` call, `''` after one committed
+  transaction touched it. Migration 0005's own fix (`current_setting(..., true) IS NULL`) is
+  therefore correct only for a connection's *very first* tenant-scoped query — every subsequent
+  *unscoped* query on the same pooled connection (exactly what a real connection pool with
+  `min_size`/`max_size` > 1, i.e. every one of `core_api`'s and `reporting`'s real deployed
+  processes, does routinely) would hit the second branch and error on `''::uuid`, rather than the
+  intended permissive fallback. **Fixed in migration 0008**: `NULLIF(current_setting(...), '') IS
+  NULL`, treating both real "unset" representations identically, in both places the check appears
+  (the `OR`'s own non-short-circuit evaluation, the same real subtlety migration 0005 already
+  documented once). Not a hypothetical edge case — this project's own real connection pools would
+  have hit it in production the first time any two tenant-scoped requests landed on the same pooled
+  connection in sequence, which for a `min_size=1` pool under real, sequential traffic is not a rare
+  event at all.
+
+**The real SAS/Blob-Storage mechanism, built now because this phase's own bar required it, not a
+speculative pre-build**: ADR-021 designed `rendered_artifact_uri` holding a real blob path and
+download by real user-delegation SAS back in the Phase 3/4 planning, but neither Phase 4 nor Phase 7
+ever built it — every real report still renders to local/`file://` disk. Phase 8's own bar-for-done
+("a visitor role... cannot retrieve a SAS for a report outside its scope") is what finally required a
+real, working mechanism to test that claim against. **Deliberately scoped, not a full pipeline
+migration**: `onepulse_common/blob_storage.py` (`upload_report_blob`/`issue_download_sas`, a new real
+`reports` blob container on the existing `onepulsequeuesdev` storage account, `Storage Blob Data
+Contributor` + `Storage Blob Delegator` RBAC granted to `id-onepulse-app-dev`) and a new
+`GET /api/v1/reports/{reportId}/download` route — authorization (RLS tenant scope + program
+membership) happens fully before issuance, per ADR-021's own stated constraint, and the route itself
+never touches a rendering pipeline. Every report rendered before this phase, and any rendered since
+without a real blob upload, correctly has no SAS-downloadable artifact (`rendered_artifact_uri` isn't
+a real `blob://` URI) — a real, honest `404`, not a broken link. Migrating the rendering pipeline
+itself onto Blob Storage end to end is real, disclosed, not-yet-done follow-up work, same as it was
+before this phase.
+
+**The real, mandatory Chat Assistant retrieval filter LLD Section 2.3/ADR-022 always required, finally
+built**: `hybrid_search` gained a real `authorized_program_ids` filter (`search.in(program_id, ...)`
+OData), passed through unconditionally from `core_api`'s chat route's own `get_current_actor`
+resolution — the model is never even shown a chunk from a program outside the caller's scope, since
+filtering an already-generated answer would be too late (a chunk the model has already read cannot be
+un-read from its own reasoning). Proven live, not merely by code inspection: the identical question
+("Is the Meridian patient records migration blocked?"), asked as the real Tenant-A Visitor, got "I
+could not find any mention of a Meridian patient-records migration... The search returned unrelated
+singleSlide items only" (zero citations) — asked as the real Tenant-B Owner, got a fully grounded,
+correctly cited answer from the real seeded Meridian findings. The positive control matters as much as
+the negative one: an always-empty answer would trivially, uselessly "pass" the isolation test even if
+the filter were completely broken.
+
+**FR-11's rate limit, built; NFR-6's usage ledger, deliberately not** — a plain, real count against
+`cycles.requested_by_actor_id`/`created_at` (already threaded through the queue envelope since Phase
+4/ADR-019, specifically so this wouldn't need a retrofit), a rolling 24-hour window, 2 triggers per
+actor. Applied to every Owner-tier actor able to trigger at all, not narrowed to the literal legacy
+role value `portfolio_lead` — a `platform_admin` or a new `owner` actor triggering unlimited runs
+while a `portfolio_lead` alone was capped would be a real, silent gap in the exact protection FR-11
+exists for. `usage_ledger` (Phase 2's own cost-based governance table) stays real, installed, and
+unused — real cost tracking is a separate, materially larger concern (tying into Foundry's own
+per-run token cost, not a request count) that this phase's own rate limit does not need and was not
+asked to build.
+
+**Real requests, real errors, proven live — the actual bar, not asserted**:
+
+- An authenticated identity with no `actors` row: real `403 {"error": "no_access", ...}` — the
+  literal common-case path, not a crash, not a 401 (this project's own prior code used 401 here;
+  corrected to 403 this phase, since the caller *is* authenticated, just not authorized).
+- Forging a different `actor_id`: attempted via an extra `actorId` field in the real `reject` request
+  body — real `422 {"detail":[{"type":"extra_forbidden", "loc":["body","actorId"], ...}]}` (a new
+  `model_config = ConfigDict(extra="forbid")` on `RejectRequest`, so this is a real, visible
+  rejection, not Pydantic's default silent drop). No endpoint anywhere accepts an `actor_id` from the
+  caller at all, by the original ADR-017 design — this test proves the boundary is real, not merely
+  undocumented.
+- A Visitor attempting to trigger a run: real `403 {"error": "visitor_cannot_generate_or_approve"}`.
+- Cross-tenant isolation, three separate real proofs, each with a real positive control alongside the
+  real negative one (an always-empty result would trivially pass a negative-only test): the report
+  list (Tenant-A Visitor's own listing never contains a Meridian row; requesting Meridian's
+  `programId` explicitly is a real `404`; Tenant-B Owner correctly sees both real Meridian reports),
+  the chat retrieval filter (above), and the SAS download (`404` for Tenant-A Visitor against
+  Tenant-B's report 997; a real, working SAS URL for Tenant-B Owner against the same report,
+  independently confirmed by fetching the real blob content through it directly, no `core_api`
+  involved).
+- FR-11's rate limit: two real triggers succeed (`202`), a third within the same 24-hour window is a
+  real `429 {"error": "rate_limit_exceeded", ...}`.
+- The provisioning path, written down and exercised for real, not just asserted: inserting a real
+  `actors` row (this session's own real signed-in Entra object ID, previously provisioned nowhere)
+  mapped to a role and a real `actor_scope` entry, then that identity's own first authenticated
+  request shown succeeding where it previously got the real `403` above.
+
+**Not chosen**: a separate `access_level` column alongside `actors.role` (rejected — two role-shaped
+columns with no clear precedence rule, for no real benefit Now-scope needs); scoping the rate limit to
+the literal `portfolio_lead` role value only (rejected — a real, silent gap for every other Owner-tier
+role, see above); building `usage_ledger`'s real cost tracking in this phase (rejected — materially
+larger, separate scope, not required for the rate limit to work correctly); migrating the full
+rendering pipeline onto Blob Storage (rejected — the bar needed a real, working SAS mechanism to test
+isolation against, not a full storage migration; every existing `file://` report is unaffected and
+stays exactly as it was).
+
+---
+
+## ADR-028: The append-only guarantee on `approval_records` was correctly built and tested, incompletely described, and is now closed unconditionally by a trigger
+
+**Context**: while checking whether the newly-discovered "an admin-privileged connection can delete
+fixture rows" fact (surfaced incidentally during Phase 8's own reviewer-identity work, while deciding
+how to clean up historical test debris in `reports`) had any bearing on `approval_records`'
+append-only guarantee — the single most-tested guarantee in this project (Governance & Security
+Reference §2, three separate prior adversarial attempts, Task 31) — a direct, live check found that
+it does not hold against the real Postgres Entra Administrator role on this server, and has most
+likely never held there.
+
+**The investigation, including a real, corrected hypothesis, not the first one reached for**: the
+first plausible-looking explanation was that ADR-023's retroactive ownership transfer
+(`approval_records`'s owner moved from `app_role_local_dev` to `app_role`) gave the administrator a
+new path to `app_role`'s own privileges via role membership. **This was checked directly and is
+wrong**: `has_table_privilege('app_role', 'approval_records', 'DELETE')` and the same for
+`app_role_local_dev` both correctly return `false` — the explicit `REVOKE UPDATE, DELETE` from
+migration 0001, reasserted by ADR-023's own migration 0004, genuinely holds for both application
+roles, exactly as documented. The real mechanism, found by checking `has_table_privilege` for the
+administrator's own role name directly: `azure_pg_admin` — the role every Entra Administrator on this
+Postgres Flexible Server, including this project's own human operator, is a member of — is itself a
+member of PostgreSQL's built-in `pg_write_all_data` role. That predefined role grants `INSERT`/
+`UPDATE`/`DELETE`/`TRUNCATE` on every table in every schema, unconditionally, to every member, via a
+mechanism that never creates a corresponding row in `pg_class.relacl` or
+`information_schema.role_table_grants` — confirmed live: `pg_default_acl` for this database is
+completely empty (ruling out a default-privileges grant), and `azure_pg_admin`'s own `pg_auth_members`
+row shows direct membership in `pg_write_all_data` alongside `pg_read_all_data`, `pg_monitor`, and
+several other real built-in administrative roles. This is very likely present since this Postgres
+server was first provisioned — long before this project's own schema existed — not something any
+migration in this project introduced or changed.
+
+**Why this was never caught by three prior adversarial tests (Task 31) that specifically tried to
+defeat this guarantee**: every one of those tests connected as `app_role_local_dev` (matching this
+project's own established, correct discipline that local testing should use the real application
+role, not a human's own elevated session) or checked the ACL layer directly. None of them tested the
+guarantee against a connection authenticated as the raw administrator identity itself. The guarantee
+was real, and rigorously tested, for the identity class it was actually built to constrain — it was
+simply never tested against a different identity class that turns out to bypass it by a completely
+unrelated mechanism.
+
+**Confirmed the gap cannot be closed by revoking anything, not merely assumed**: a real, live
+`REVOKE DELETE, UPDATE ON approval_records FROM azure_pg_admin` was executed directly — it completes
+with no error (there was no ACL entry for `azure_pg_admin` to revoke in the first place) and
+`has_table_privilege` reports `true` immediately afterward, unchanged. `pg_write_all_data`'s grant is
+not a per-table ACL entry that a `REVOKE` can remove; it is a structural property of PostgreSQL's
+predefined-role system.
+
+**`verify_migration.py` now asserts this directly, and honestly fails today**: `check_real_privilege_
+denied` (using `has_table_privilege`, which accounts for every real grant path — ACL, ownership, and
+predefined-role membership — unlike the existing `check_privilege_revoked`, which only reads
+`information_schema.role_table_grants` and would report "safe" for `azure_pg_admin` on
+`approval_records` right now, since no ACL entry exists to find) is asserted against `azure_pg_admin`
+specifically. Demonstrated failing against the real, current, unfixed state before any decision was
+made about what to do next — per explicit instruction, this ADR records the finding and the real
+option set; it does not itself apply a fix.
+
+**Real fix options, none applied here — a decision, not a default**:
+
+1. **Accept and document this as an inherent platform boundary**, scoping the guarantee's own stated
+   claim precisely to "holds against the application's own service identity; does not and structurally
+   cannot hold against this server's designated super-administrator role" — the real, corrected
+   framing Governance & Security Reference §2 now states. A real, defensible position: an
+   append-only guarantee that even a legitimate database administrator could never override in a
+   genuine emergency (a legal hold, a compliance-mandated erasure, disaster recovery) would itself be
+   an operational risk, and `pg_write_all_data`-style administrative bypass is standard, expected
+   PostgreSQL/Azure behavior, not a defect specific to this project.
+2. **A `BEFORE DELETE OR UPDATE` trigger on `approval_records` that unconditionally raises an
+   exception.** Real, load-bearing distinction checked, not assumed: Postgres triggers fire for every
+   role executing DML against a table, independent of the ACL/predefined-role layer that grants
+   `pg_write_all_data`'s bypass — a trigger cannot be skipped by having broader read/write privilege
+   the way an ACL check can be. Disabling a trigger requires `ALTER TABLE`, which requires table
+   ownership (`app_role`, not `azure_pg_admin`) or genuine superuser (`azure_pg_admin` is confirmed
+   `rolsuper = false`) — meaning `azure_pg_admin` could not disable this trigger to route around it
+   without first being granted ownership or superuser, neither of which exists today. This would be
+   real, table-level, ACL-independent enforcement — a materially different and stronger mechanism than
+   another `REVOKE`, not evaluated further than this design note pending the user's decision.
+3. **Reduce membership in `azure_pg_admin` to the minimum real operators needed.** Does not close the
+   structural gap (anyone who legitimately needs to be the Entra Administrator still carries it), but
+   reduces blast radius. Likely already minimal today (one real human operator).
+4. **Real-time auditing** (e.g. `pgaudit`) to at least detect if this bypass is ever exercised against
+   `approval_records`, given it cannot be prevented at the grant level. Not currently installed on this
+   server (a real, pre-existing gap independently noted in CLAUDE.md Task 39's own "not determined"
+   finding about historical DELETE activity) — a heavier, likely Next-scope lift.
+
+**Not chosen, yet — this ADR reports the option set for a decision, not a conclusion.**
+
+---
+
+**Decided, built, and adversarially verified, 2026-09-11 — Option 2 (the trigger), with the framing
+corrected.** Option 2 was chosen: it closes the gap rather than describing it, and the alternative
+(Option 1, re-scoping the guarantee's own documented claim) would have left this project's own
+most-cited guarantee needing a permanent footnote about which identity it covers. Building it was
+judged worth that.
+
+**The framing itself needed correcting first, and it is a different kind of correction than every
+prior instance of this project's own "designed correctly, documented confidently, never exercised"
+pattern (Governance & Security Reference §6).** This ADR's own first draft (and the conversation that
+produced it) described the gap as the guarantee having "decayed" or been "undone by a later change."
+Neither is true. The `REVOKE UPDATE, DELETE` on `approval_records` held continuously, for the
+identity it was written to constrain, from Phase 2 onward — confirmed unchanged before and after
+ADR-023's ownership transfer, the specific change first (wrongly) suspected as the cause. **What
+actually happened: Task 31 asked and rigorously, adversarially answered a real, correctly-posed
+question — can the application (`app_role`/`app_role_local_dev`, the only identity any real code path
+in this project ever authenticates as) mutate this table — and this document's own conclusion then
+generalized that specific, well-tested answer into a claim about the guarantee overall, which the
+four tests underlying it never established.** The other five instances in Governance & Security
+Reference §6 are all guarantees nobody had exercised at all. This one was exercised thoroughly and
+correctly, against the right identity, for the right reason — the gap was one sentence claiming more
+than the tests behind it proved, not a lapse in testing rigor. Worth keeping distinct: the fix for
+"never tested" is running the test; the fix for "tested narrowly, described broadly" is narrowing the
+claim to match the evidence, or — as chosen here — widening the enforcement to actually match the
+broader claim that had already, if prematurely, been made.
+
+**Real implementation** (`scripts/migrations/0011_approval_records_append_only_trigger.sql`):
+`reject_approval_records_mutation()`, a trivial `plpgsql` function that unconditionally
+`RAISE EXCEPTION`s naming the real operation and the real calling role, attached as
+`approval_records_append_only`, `BEFORE UPDATE OR DELETE ... FOR EACH ROW`. **A second, real,
+previously-unknown consequence of ADR-023's own "REVOKE ALL then re-GRANT exact intended profile"
+fix, found while writing this migration, not assumed:** `app_role` — the real, current table owner —
+does not itself hold `TRIGGER` privilege on `approval_records`; `has_table_privilege('app_role',
+'approval_records', 'TRIGGER')` is `false`, confirmed live, because ADR-023's own REVOKE ALL stripped
+even the owner's default at-creation-time grant of it, and nothing re-granted it back (the intended
+profile never included it, since nothing before this needed it). `CREATE TRIGGER` genuinely requires
+that ACL bit, ownership alone is not sufficient once it has been explicitly revoked. Resolved with the
+minimal-footprint form: `SET ROLE app_role` (session-level, reachable since `gopi` is a real, confirmed
+member — no interactive AAD auth needed, unlike connecting AS `app_role` directly), `GRANT TRIGGER ...
+TO app_role`, create the trigger, `REVOKE TRIGGER ... FROM app_role` again in the same migration —
+`app_role`'s own real, documented, minimal profile (`verify_migration.py`'s `PUBLIC_TABLE_PROFILES`)
+is unchanged before and after; only the trigger's own continued existence and firing persists, which
+needs no standing privilege once created.
+
+**Adversarial verification, the same rigor Task 31 applied to the application roles, now applied to
+the one identity that had never been covered — a real mutation attempt against a real, existing row,
+not a zero-match probe** (a first attempt using a deliberately nonexistent `report_id` was a real,
+disclosed methodology mistake — `FOR EACH ROW` triggers do not fire when zero rows match, so that
+attempt "succeeded" vacuously and proved nothing; caught and redone against a real row before drawing
+any conclusion):
+
+- Connected as `gopi@gopdhagmail.onmicrosoft.com` (this server's real Entra Administrator identity).
+- `UPDATE approval_records SET notes = 'tampered' WHERE approval_id = <a real, existing row>` →
+  `RaiseError: approval_records is append-only: UPDATE is not permitted (role=gopi@gopdhagmail.onmicrosoft.com)`.
+- `DELETE FROM approval_records WHERE approval_id = <the same real row>` → the identical real error,
+  naming `DELETE`.
+- The real row independently re-queried afterward and confirmed byte-for-byte unchanged — not merely
+  that an exception was raised for some unrelated reason.
+- **Confirmed the trigger does not interfere with legitimate use:** the full `tests/test_human_
+  governance.py` suite (real `approve_report`/`reject_report` end-to-end, both of which `INSERT` into
+  `approval_records`) re-run and passing unchanged — the trigger is scoped to `UPDATE`/`DELETE` only,
+  `INSERT` was never touched.
+- Both proofs are now permanent, repeatable tests, not one-off manual checks:
+  `tests/test_human_governance.py::test_approval_records_append_only_holds_against_the_real_admin_identity`
+  (a new `admin_conn` fixture, authenticated as the real administrator role, same transactional-
+  rollback discipline as every other test in that file) and `tests/test_verify_migration.py`'s two new
+  cases for `check_trigger_exists_and_enabled`.
+
+**`verify_migration.py` now asserts the real, current enforcement mechanism, not an assertion that can
+never be satisfied.** The prior check (`check_real_privilege_denied` against `azure_pg_admin`) was
+replaced, not merely fixed — it was asserting the *absence* of a privilege that structurally cannot be
+absent (`pg_write_all_data` membership is unconditional; no `REVOKE` reaches it), so it would have
+failed forever regardless of any real fix. The new check, `check_trigger_exists_and_enabled`, asserts
+the thing that actually determines whether the guarantee holds: does the real trigger exist and remain
+armed. `check_real_privilege_denied` itself is kept, unchanged, as a correct, reusable function — used
+elsewhere for claims that are actually achievable at the ACL level, not removed just because one use of
+it turned out to be asserting an impossibility. **`verify_migration.py`: 122/122** — the one check that
+had been the sole, documented, expected failure now passes for the right reason (a real trigger exists
+and blocks it), not by weakening what it asserts.
+
+**Governance & Security Reference §2 rewritten** with the corrected framing above — not "the guarantee
+decayed," not "it holds for one identity and not another," but "it was proven exactly as far as it was
+tested, the tests were correctly chosen, and the document's own conclusion overstated their reach; both
+the test coverage and the claim now match, and the guarantee holds unconditionally."
