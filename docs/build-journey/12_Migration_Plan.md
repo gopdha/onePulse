@@ -324,7 +324,30 @@ deferred until all phases are otherwise complete (see above and ADR-031).
 ## Phase 10 — Serve the frontend
 
 FastAPI serves the built bundle from a single origin (ADR-015 amendment). Azure Static Web Apps
-considered and not chosen.
+considered and structurally excluded, not merely not chosen — Container Apps' own Easy Auth
+intercepts every request, preflight included, before this project's own code ever runs, which
+leaves same-origin serving as the only architecture that works here, not the better of two options.
+
+> **Checked 2026-09-12 (CLAUDE.md Task 52) — this was a check against the written Definition of
+> Done below, not an assumption from the fact that the deployed system already works.** The
+> architecture this phase asks for was already delivered in Phase 9's own work, pulled forward when
+> Easy Auth's CORS interception forced the question early (see ADR-015's own Phase 9 finding): `bff`
+> serves the real built frontend bundle from the same origin as the API, deployed and live at the
+> real production FQDN, with Azure Static Web Apps ruled out for the structural reason recorded
+> above, not a preference.
+>
+> **What is genuinely still outstanding, checked directly rather than assumed closed:** the one real
+> interactive sign-in completed so far (Phase 9/ADR-030) was performed in a private/incognito browser
+> window on the same physical machine used for development — the DoD's own wording, "a device that is
+> not the development machine," is not satisfied by a different browser profile on the same hardware,
+> only by genuinely different hardware. Separately, no full generate-and-download cycle has yet run
+> through an actual browser click end to end; the one real report download proven so far (Phase 9) was
+> verified via a direct `curl` against the issued SAS URL, confirming the mechanism works, but not the
+> same action as a browser's own download click. Neither gap is invented to justify this phase's
+> existence — both are the literal, unmet text of the Definition of Done below, and both are closeable
+> on demand: sign in from a genuinely different device (phone, tablet, or another computer), trigger a
+> real Generate run to completion through the UI, and download the resulting report through the
+> browser's own download action.
 
 **Definition of Done**: a real end-to-end run triggered from a browser on a device that is not the
 development machine, including a successful report download.

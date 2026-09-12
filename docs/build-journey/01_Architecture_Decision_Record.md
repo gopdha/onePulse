@@ -284,13 +284,21 @@ ADR records that the constraint changed, not that the earlier judgment was wrong
 **Amendment to ADR-010**: ADR-010 records Azure Static Web Apps as deferred Next-scope work. That is
 now incorrect in both directions. ASWA was never viable for Streamlit at all — it hosts static assets
 and Azure Functions, and cannot run a stateful Python websocket server — so it was never pending work
-to be resumed. It becomes viable again for a React build, which produces exactly static assets. It is
-nonetheless **not chosen**: FastAPI will serve the built bundle, because a single origin avoids a
-second deployment and a CORS surface, and a CDN provides no measurable benefit for an internal tool
-with a handful of users.
+to be resumed. It becomes viable again for a React build, which produces exactly static assets.
+
+**It is nonetheless not viable as a lasting architecture on this platform — not merely not chosen
+among reasonable options, but structurally excluded, confirmed live rather than reasoned about in
+the abstract (see the Phase 9 finding immediately below).** At the time this amendment was first
+written, before that finding existed, the stated reasoning was preference-shaped: FastAPI would
+serve the built bundle because a single origin avoids a second deployment and a CORS surface, and a
+CDN provides no measurable benefit for an internal tool with a handful of users. That framing
+undersold what turned out to be true. Same-origin serving is not the better of two workable options
+for this system — it is the only one Container Apps' own Easy Auth leaves standing, for any
+architecture that needs a credentialed, JSON-bodied cross-origin request to succeed, ASWA-hosted or
+otherwise.
 
 **Real finding, Migration Plan Phase 9, that turns "avoids a CORS surface" from a preference into a
-requirement**: a cross-origin architecture (the React build on one origin, `bff` on another) was tried
+structural requirement**: a cross-origin architecture (the React build on one origin, `bff` on another) was tried
 first, on the reasoning that Phase 10's same-origin serving could wait. It cannot. Container Apps' own
 Easy Auth intercepts every request — including a CORS preflight `OPTIONS` — before it ever reaches this
 project's own FastAPI code, and its own unauthenticated response carries no `Access-Control-*` headers
@@ -302,8 +310,11 @@ preflight with a real `Origin` header returned a bare `401` with zero CORS heade
 itself, before this project's own request handling ever ran. Same-origin serving was therefore pulled
 forward into Phase 9 itself, in minimal form (a `StaticFiles` mount in `bff/main.py`, not yet the full
 build/deploy pipeline Phase 10 will formalize) — not because the original reasoning above was wrong, but
-because "avoids a CORS surface" turned out to be load-bearing immediately, not merely a tidiness
-preference for later.
+because "avoids a CORS surface" turned out to be load-bearing immediately, and structurally forced, not
+merely a tidiness preference for later. **The record should read accordingly: same-origin serving is
+this platform's structural requirement, of which Phase 9's early adoption and Phase 10's own
+formalization are two instances of satisfying the same constraint, not two separate preferences that
+happened to agree.**
 
 ---
 
