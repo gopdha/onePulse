@@ -1683,3 +1683,130 @@ superseded status, correctly offered as historical context rather than omitted o
 exactly the behavior instruction 5 in `CHAT_INSTRUCTIONS` specifies. The reindex completing proves the
 mechanism; this answer picking the current week as primary, while still correctly surfacing the real
 history, proves the fix. Full detail recorded in CLAUDE.md's own phase-status log.
+
+---
+
+## ADR-030: A real permission grant for the deprecated Azure AD Graph API — accepted because the clean alternative is genuinely closed, not because it wasn't sought
+
+**Context**: the first real interactive Easy Auth sign-in against `onepulse-bff-signin` (Migration Plan
+Phase 9's own deferred bar item — every prior "Easy Auth works" proof in this project used bearer-token
+injection, which never exercises the actual browser `/authorize` redirect) failed twice, with two distinct,
+real, sequentially-discovered causes, each confirmed from the platform's own logs rather than inferred
+from the resulting `401`.
+
+**First failure, real and fixed**: `AADSTS700054: response_type 'id_token' is not enabled for the
+application`. The app registration's `implicitGrantSettings.enableIdTokenIssuance` was `false` — Easy
+Auth's real AAD login request is a hybrid flow (`response_type=code+id_token`), which Entra refuses to
+service without it. Fixed by setting it `true`. This was a real, necessary fix — it eliminated this exact
+error on retry — but not a sufficient one, exactly as anticipated before retrying: "one more theory
+applied without reading the real failure first" was the pattern being deliberately avoided by insisting on
+platform logs for what came next.
+
+**Second failure, real, from the platform's own `http-auth` sidecar log, not inferred from the `401`**:
+
+```
+An error of type 'access_denied' occurred during the login process: 'AADSTS650056: Misconfigured
+application. This could be due to one of the following: the client has not listed any permissions for
+'AAD Graph' in the requested permissions in the client's application registration. Or, the admin has not
+consented in the tenant. ... Client app ID: d0a5f79f-fbbd-4aac-aeca-cc8f7e485f35.'
+```
+
+Confirmed directly against the app registration: `requiredResourceAccess` was `[]` — completely empty,
+matching the error's own first stated cause exactly, not a guess at which of the error's several listed
+possibilities applied.
+
+**What was actually ruled out, and how — each a real check against the live system, not a documentation
+read:**
+
+- **The client secret (ADR-025).** `az ad app credential list` against the real app registration: expires
+  2027-09-10, not expired. Its `hint` (`zFm`) matches, character for character, the masked value
+  (`"zF****"`) the Easy Auth sidecar's own trace log reports reading via
+  `WEBSITE_AUTH_CLIENT_SECRET_SETTING_NAME` at the moment of the real failing request — the config
+  reference resolves to the real, current secret, at the real time of the attempt. Ruled out by direct
+  evidence, not by the secret's expiry date alone.
+- **Session cookie writing.** The failure occurs during the token exchange itself (`MiddlewareError` inside
+  callback processing, before any session is established) — structurally upstream of the point where Easy
+  Auth would ever attempt to write its encrypted session cookie. Its `EncryptionKey`/`SigningKey` are both
+  present and populated in the sidecar's own live trace log, so there is no evidence anything is wrong with
+  cookie writing — only that this specific failure never reaches far enough to exercise it. Ruled out by
+  where in the real request lifecycle the error actually occurs, not by assuming the cookie mechanism is
+  fine.
+- **Phase 9's `excludedPaths` change.** Ruled out on the *first* failure already, and reconfirmed on the
+  second: `/.auth/login/aad/callback` requests are logged reaching Easy Auth correctly
+  (`RequestCompleted`, real `SubStatusCode`s, never a routing miss), and the sidecar's own live config trace
+  shows the unchanged Phase 9 `excludedPaths` list (`/`, `/assets/*`, `/vite.svg`, `/favicon.svg`) on every
+  attempt — none of which touch `/.auth/*`. Easy Auth reserves that whole prefix for itself unconditionally,
+  before `excludedPaths` is ever consulted. Not a regression.
+- **`WEBSITE_AUTH_USE_LEGACY_CLAIMS` disablement — tried as a real deployed change, not a documentation
+  search.** This setting (visible, `"True"`, in the sidecar's own trace log on every attempt) is not part
+  of the documented `Microsoft.App/containerApps/authConfigs` ARM schema at any recent API version (checked
+  2024-03-01 through 2025-10-02-preview directly against Microsoft's own schema reference — no matching
+  property exists). Rather than stop at that gap, it was tested empirically: `WEBSITE_AUTH_USE_LEGACY_CLAIMS
+  =false` was set as a real environment variable on the `onepulse-bff` container app, a real new revision
+  (`onepulse-bff--0000008`) was deployed and confirmed at 100% traffic, and the sidecar's own trace log was
+  re-read. It still reported `"True"` — the override had no effect. The env var was removed and a further
+  clean revision (`onepulse-bff--0000009`) deployed and confirmed correctly gated
+  (`/api/v1/me` still `401` unauthenticated) before concluding anything from the experiment. This is a
+  hardcoded default in Container Apps' current Easy Auth sidecar runtime for the classic AAD identity
+  provider — not exposed for configuration by any documented property or environment variable override
+  found or tested.
+
+**The caveat that matters most here, stated precisely rather than smoothed into a clean story**: whether
+`WEBSITE_AUTH_USE_LEGACY_CLAIMS` is actually *what causes* Easy Auth to request the AAD Graph resource was
+never confirmed. Both facts — the setting reading `"True"`, and the AADSTS650056 failure naming AAD Graph —
+appeared together in the same trace log, on the same requests. That is correlation observed directly, not
+a documented or verified causal mechanism. No public documentation was found establishing this specific
+link, and it remains genuinely possible that Container Apps' classic `azureActiveDirectory` identity
+provider requests the AAD Graph resource unconditionally, independent of this setting entirely — in which
+case even a working way to disable legacy-claims mode would not have removed the AAD Graph dependency.
+This distinction is preserved deliberately: an ADR that states a causal story more confidently than the
+evidence supports is worse than one that names the limit of what was actually established, the same
+standard this project has held for every other real-cause investigation on record (ADR-028's own
+correction of a first, plausible-but-wrong hypothesis is the direct precedent).
+
+**Decision**: grant `onepulse-bff-signin` a delegated `User.Read` permission against "Windows Azure Active
+Directory" (AAD Graph, resource App ID `00000002-0000-0000-c000-000000000000`, scope ID
+`311a71cc-e848-46a1-bdf8-97ff7156d8e6` — the exact permission the real error names), and grant tenant
+admin consent for it.
+
+**This is a real, accepted, deprecated-API dependency, not a workaround chosen instead of a real fix.**
+Azure AD Graph has been in deprecation for years and Microsoft has stated intent to retire it; a resource
+this project now formally depends on, however narrowly, is expected to eventually stop working through no
+action of this project's own. This was not the preferred outcome — the disabling path was genuinely
+sought and genuinely tested, not assumed unavailable, before this was chosen. Recorded here as a real,
+present cost of using Container Apps' current classic Easy Auth AAD provider, the same discipline as
+ADR-024 (the ADO PAT) and ADR-025 (the Easy Auth client secret) apply to their own accepted exceptions:
+name the real trade-off plainly rather than let a permission grant sit unexplained for a future reader.
+
+**Exit condition — what would change this, so a future breakage finds reasoning, not just a permission
+grant with no context**: this dependency should be revisited, and this permission removed, if either of
+the following becomes true:
+
+1. **Container Apps exposes `WEBSITE_AUTH_USE_LEGACY_CLAIMS` (or equivalent claim-format control) as a
+   real, documented `authConfigs` property or a genuinely honored environment variable.** If disabling it
+   is ever actually possible — re-run the same empirical test this ADR already performed (set it, deploy a
+   real revision, re-read the sidecar's own trace log for the setting's real reported value) before
+   assuming it now works, and only remove this permission grant once that new evidence shows the AAD Graph
+   request itself stops, not merely that the setting appears accepted.
+2. **Microsoft ships a newer Easy Auth AAD provider path for Container Apps that doesn't request AAD Graph
+   at all** (a real, likely eventual change, given AAD Graph's own stated retirement) — at which point
+   reconfiguring `onepulse-bff-signin` to the newer provider and removing this permission is the correct,
+   real fix, not a defensive re-grant of the same deprecated permission when AAD Graph is finally retired
+   and this flow breaks for real.
+
+If AAD Graph is retired before either of the above happens, the real, observable symptom will be this
+exact interactive sign-in flow failing again — the fix at that point is not another permission grant (AAD
+Graph itself will no longer exist to grant access to), it is migrating off the classic `azureActiveDirectory`
+Easy Auth provider entirely, which Migration Plan Phase 10's own single-origin serving work is the natural
+place to reconsider, since it already touches how this app is served and authenticated.
+
+**Verification**: `requiredResourceAccess` confirmed non-empty after the grant (`00000002-0000-0000-c000-
+000000000000` / `311a71cc-e848-46a1-bdf8-97ff7156d8e6`, `User.Read`, `type: Scope`). A real tenant-wide
+admin consent grant confirmed via a direct `oauth2PermissionGrants` read, not assumed from the consent
+command's own silent success: `consentType: AllPrincipals`, `scope: User.Read`, `resourceId:
+f319546b-7678-4f96-b735-223768c8f045` — independently confirmed via `az ad sp show` to be the real AAD
+Graph service principal (`appId: 00000002-0000-0000-c000-000000000000`, `displayName: "Windows Azure
+Active Directory"`), not merely an ID assumed to be correct. The real interactive sign-in re-attempted and
+its result recorded in CLAUDE.md's own phase-status log once the user completes it — this ADR records the
+decision and its reasoning at the moment the grant was made, not a claim that the retry has already
+succeeded.
