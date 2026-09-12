@@ -315,6 +315,12 @@ class ProgramItem(BaseModel):
     name: str
 
 
+class MeResponse(BaseModel):
+    role: str
+    isOwner: bool
+    authorizedProgramIds: list[str]
+
+
 class ReportSummary(BaseModel):
     reportId: int
     programName: str
@@ -421,6 +427,29 @@ class ChatQueryResponse(BaseModel):
 # buried in middleware, so each route's real auth requirement is
 # visible in its own signature.
 # ---------------------------------------------------------------------
+
+
+@app.get("/api/v1/me")
+async def get_me(
+    _token=Depends(verify_service_token),
+    current_actor: CurrentActor = Depends(get_current_actor),
+) -> MeResponse:
+    """Migration Plan Phase 9: the one real gap Phase 8 left — no route
+    ever exposed the caller's own resolved role back to a client. React
+    needs this to decide what to render (Generate/Approve/Reject show
+    only for an owner); it changes nothing about what's actually
+    enforced. `get_current_actor` already 403s an unprovisioned or
+    unscoped identity before this line runs, so a response from here is
+    itself proof of real access — hiding a control client-side is
+    usability, not security, and stays true with this route in place:
+    every mutating route still runs its own real `_require_owner`/scope
+    check server-side regardless of what this response says.
+    """
+    return MeResponse(
+        role=current_actor.role,
+        isOwner=current_actor.is_owner,
+        authorizedProgramIds=list(current_actor.authorized_program_ids),
+    )
 
 
 @app.get("/api/v1/programs")

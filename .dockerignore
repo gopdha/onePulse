@@ -1,20 +1,15 @@
-# Real, load-bearing exclusion, not just build-speed hygiene: investigation/
-# node_modules must NEVER enter any image via COPY — the whole point of this
-# phase (Migration Plan Phase 5) is that @azure-devops/mcp is installed via
-# a real `npm ci` INSIDE the Investigation image's own build, from the
-# committed package.json/package-lock.json, never resolved or copied in at
-# spawn/build time from whatever happens to be on the host.
-investigation/node_modules
-
-.venv
-__pycache__
-*.pyc
+# Real, necessary fix (Migration Plan Phase 9): `az acr build ... .`
+# tars up this ENTIRE directory as the build context before any
+# Dockerfile's own COPY instructions ever run — without this file, that
+# included frontend/node_modules (a large, deeply-nested tree no
+# backend Dockerfile ever needs), making every core_api/bff/investigation
+# /reporting build needlessly slow the moment the frontend was scaffolded.
+# frontend/dist is NOT excluded — bff/Dockerfile's own COPY needs it
+# (the real React build, served same-origin — see bff/main.py).
 .git
-.pytest_cache
+.venv
+frontend/node_modules
+**/__pycache__
+**/*.pyc
 logs
 output
-*.log
-
-# Real historical rendered-report artifacts sitting at the repo root -
-# never real input decks a service reads, never something an image needs.
-onepulse_status_report_demo.pptx

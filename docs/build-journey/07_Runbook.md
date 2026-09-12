@@ -364,6 +364,29 @@ Empty output means it's genuinely never been committed.
   real constraint and error still fires, nothing is ever actually committed), or picking a row that
   has genuinely never been decided on and accepting the resulting permanent row as the real cost of
   testing against real infrastructure.
+- **This has now recurred a third time (report 1113, Migration Plan Phase 9) — not a third distinct
+  bug, the same one, once more.** Report 1113 was itself a real, deliberate diagnostic row (inserted
+  to verify Phase 9's own `persist_report()`/`set_config` type-mismatch fix) that was subsequently
+  approved for real during a live UI walkthrough — a human was directed into the deployed dashboard
+  to confirm the report table rendered correctly, and the row it landed on happened to carry a live
+  Approve button, which was clicked. **The cause is the instruction that put a test row in front of a
+  live control, not the click itself, and not any failure of the guarantee** — the guarantee did
+  exactly what it is designed to do: made the resulting `approval_records` row permanent, correctly,
+  the same as it did for 306/320/532/454. **The actual, recurring failure across all three real
+  instances (532, 454, 1113) is upstream of the guarantee entirely: treating a row that exists for
+  testing as disposable, when in this system a row stops being disposable the instant it is visible
+  anywhere a real approve/reject control can reach it** — a direct API call (532, 454) or a live UI
+  button (1113) are the same exposure, just reached by different means. **The practical rule this
+  implies, stated plainly so it doesn't need rediscovering a fourth time:** before pointing anyone —
+  human or automated — at a real UI or API surface to verify rendering, chat, or any other read-only
+  behavior, confirm first that any test/diagnostic row visible in that surface is either genuinely
+  safe to have acted on permanently, or already excluded from actionable views (`reports.is_test_fixture`,
+  Task 49 — set *before* the row can ever appear in `list_pending_reviews` or a live report table, not
+  after someone has already looked at it). The "verify against an already-reviewed row" guidance two
+  paragraphs above carries the identical caveat for the same reason: it reads as safe because nothing
+  *looks* clickable-and-dangerous about an already-decided row, and that is exactly what made report
+  454 possible — `approve_report`/`reject_report` never check current `reviewed` state, so an
+  already-reviewed row is not inert, it is just as live as an unreviewed one.
 - **Old pre-Task-40 test-fixture `reports` rows can have a `week_of` far outside any sane calendar
   range** (some from years like 4396 or 9853 — leftovers from the old `_random_week_of()` test
   helper, before `tests/test_human_governance.py` was rewritten around transactional rollback).
@@ -647,3 +670,90 @@ itself (real Easy Auth, deployed only), acquire a real token for `onepulse-bff-s
 `access_as_user` scope instead (`az account get-access-token --scope
 "api://<bff-signin-app-id>/access_as_user"`) — `bff` decodes the real `X-MS-CLIENT-PRINCIPAL` header
 Easy Auth injects and forwards the real `oid` claim on to `core_api`.
+
+## 9. The React Frontend (Migration Plan Phase 9)
+
+**No authentication library, no token in browser JavaScript, ever (ADR-018).** Every real API call
+from `frontend/src/api/client.ts` uses `credentials: "include"` and nothing else — the only real
+mechanism is the HttpOnly session cookie Container Apps' own Easy Auth sets after a real interactive
+sign-in. If a future change adds MSAL or reads/stores a token in this app, that is the exact silent
+reversal ADR-018 exists to prevent.
+
+**Real, load-bearing finding: this app must be served from the same origin as `bff`, not a separate
+dev-server origin — not a preference, a requirement.** Container Apps' Easy Auth intercepts every
+request, including a CORS preflight `OPTIONS`, before it ever reaches this project's own code, and its
+own unauthenticated response carries no `Access-Control-*` headers — confirmed live via a direct
+preflight request. That defeats every real POST this app makes (trigger/approve/reject/chat, all of
+which carry a JSON body and therefore force a preflight) regardless of sign-in state, no matter what
+CORS configuration lives inside `bff`'s own FastAPI app. `bff/main.py` therefore serves the real built
+bundle directly (`StaticFiles` mount at `/`, `frontend/dist`) — a minimal, real version of what
+Migration Plan Phase 10 formalizes, pulled forward because Phase 9's own real end-to-end verification
+needed it now. See ADR-015's own Phase 9 amendment for the full finding.
+
+**How to build and deploy:**
+
+```powershell
+# From the repo root — builds the real static bundle bff/main.py serves.
+cd frontend
+npm install
+npm run build
+cd ..
+
+# bff's own Dockerfile COPYs frontend/dist at build time — must exist
+# on disk first, not generated inside the image (no Node build stage
+# in a Python image, for a bundle already built separately).
+az acr build -r onepulseacrdev -t onepulse-bff:<tag> -f bff/Dockerfile .
+az containerapp update -g onepulse-gr -n onepulse-bff --image onepulseacrdev.azurecr.io/onepulse-bff:<tag>
+```
+
+**Real gotcha, found live: reusing the same image tag across two real deploys is not reliable.**
+`az containerapp update --image ...:<same-tag>` was observed to leave the *previous* revision serving
+100% of traffic even after the command reported success, on at least one real deploy this phase — the
+underlying digest had changed but Container Apps did not necessarily notice. **Always use a distinct
+tag per real deploy** (or check `az containerapp revision list ... --query "[].{name:name,
+traffic:properties.trafficWeight}"` and confirm the new revision shows `100` before trusting anything
+tested against it) — this is what actually caught it, not assumed from the deploy command's own exit
+code.
+
+**How to reach it**: `https://onepulse-bff.<environment-default-domain>.azurecontainerapps.io/` —
+signing in there for real (a genuine interactive Microsoft login, MFA included) sets the session cookie
+for that exact origin; the app then works from that same URL, no separate frontend URL to remember.
+
+**Local dev iteration** (`npm run dev`, Vite on `localhost:5173`) is real but limited: it is a
+different origin from `bff`, so every GET-driven view works once a valid session cookie already exists
+(the browser still sends it cross-site — Easy Auth's own cookies are `SameSite=None`, confirmed live),
+but every real POST hits the exact same preflight block described above, authenticated or not. This is
+a genuine, disclosed limitation of the dev workflow, not a bug to chase — full verification needs the
+real same-origin build.
+
+**Testing the real UI without a human completing MFA each time**: Easy Auth accepts a real delegated
+bearer token in the `Authorization` header as an alternative to the cookie (the same mechanism
+`api_client.py` already uses for Streamlit) — but the *shipped app itself* must never do this (see
+above). For external test automation specifically (a real headless browser session, driven the same
+way every prior UI verification in this project has been done), a real token
+(`az account get-access-token --resource "api://<bff-signin-app-id>"`) can be injected via
+`Network.setExtraHTTPHeaders` over the Chrome DevTools Protocol, outside the app's own code entirely —
+this drives real, unmodified app code end to end without needing an interactive sign-in for every
+check. The one thing this cannot substitute for is proving the real interactive cookie-based sign-in
+flow itself works — that needs a real human to complete it at least once.
+
+**That real human sign-in was completed, and it is the reason this section names a real cost, not a
+hypothetical one: two real bugs existed in the deployed Entra configuration that bearer-token injection
+had exercised around for the entire rest of Phase 9 without ever finding.** Both are recorded in full,
+with the platform log evidence for each, in ADR-030 (and the first, `enableIdTokenIssuance`, in that
+same ADR's own lead-in); ADR-025 records the real client secret's own role being independently ruled
+out along the way. The headline finding, worth restating here since it is exactly the risk this
+paragraph's own last sentence was warning about: bearer-token injection authenticates directly against
+the API and drives real, unmodified app code end to end, but it never drives the actual browser
+`/authorize` redirect or the real `/.auth/login/aad/callback` token-exchange callback — the exact place
+both real failures occurred. Neither would have surfaced without a real interactive attempt. The
+successful retry confirmed, live: full cookie-based sign-in through a real MFA challenge, `GET
+/api/v1/me` returning the caller's real role, "Signed in as owner" rendered from that response, and a
+correctly empty project selector matching the signed-in actor's real scope at the time.
+
+**The cold-start screen (`frontend/src/components/AuthGate.tsx`, "Waking up OnePulse") was also
+verified under real conditions on this same attempt, not simulated** — a genuine cold backend, a real
+per-second elapsed counter, and copy that sets the wait expectation against this project's own real,
+measured Phase 7 cold-start number (up to about a minute) rather than a hopeful guess. No fabricated
+percentage bar appeared at any point. This is the honest-cold-start-UX bar item from the original Phase
+9 kickoff, confirmed against a real deployed cold start, not a description of intent.

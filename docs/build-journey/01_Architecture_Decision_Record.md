@@ -289,6 +289,22 @@ nonetheless **not chosen**: FastAPI will serve the built bundle, because a singl
 second deployment and a CORS surface, and a CDN provides no measurable benefit for an internal tool
 with a handful of users.
 
+**Real finding, Migration Plan Phase 9, that turns "avoids a CORS surface" from a preference into a
+requirement**: a cross-origin architecture (the React build on one origin, `bff` on another) was tried
+first, on the reasoning that Phase 10's same-origin serving could wait. It cannot. Container Apps' own
+Easy Auth intercepts every request — including a CORS preflight `OPTIONS` — before it ever reaches this
+project's own FastAPI code, and its own unauthenticated response carries no `Access-Control-*` headers
+at all. That defeats every credentialed, preflight-requiring cross-origin request outright, regardless
+of sign-in state — every real POST this frontend makes (trigger, approve, reject, chat) sends a JSON
+body, which is exactly what forces a preflight. No `CORSMiddleware` inside this project's own app can
+fix this, because Easy Auth sits in front of the app, not behind it. Confirmed live: an `OPTIONS`
+preflight with a real `Origin` header returned a bare `401` with zero CORS headers, from Easy Auth
+itself, before this project's own request handling ever ran. Same-origin serving was therefore pulled
+forward into Phase 9 itself, in minimal form (a `StaticFiles` mount in `bff/main.py`, not yet the full
+build/deploy pipeline Phase 10 will formalize) — not because the original reasoning above was wrong, but
+because "avoids a CORS surface" turned out to be load-bearing immediately, not merely a tidiness
+preference for later.
+
 ---
 
 ## ADR-016: Azure Container Apps as the compute target
@@ -894,6 +910,16 @@ second entry at the same weight, not folded into a shorter note, precisely becau
 **permanent** by its own nature (the mechanism does not expire the way a diagnostic PAT does) where
 the ADO PAT is explicitly time-boxed — the two exceptions are not interchangeable instances of "one
 kind of thing," and the document should not read as though they are.
+
+**Verification**: the real interactive sign-in this secret exists to support was completed successfully
+once ADR-030's own separate, sibling fix (a real AAD Graph permission grant) closed the second of two
+independent causes blocking it — a full cookie-based sign-in through a real Microsoft MFA challenge,
+with Easy Auth's own confidential-client token-exchange callback succeeding and setting the real
+session cookie for the deployed origin. This closes the loop this ADR's own Decision left open: the
+secret was never the actual cause of either real failure along the way (ADR-030's own investigation
+independently ruled it out by matching its live-reported `hint` against the real, current value at the
+exact moment of each failing attempt), and the mechanism accepted here as unavoidable is now
+demonstrated, not merely configured, to work end to end on real deployed infrastructure.
 
 **Not chosen**: a certificate-based alternative (real, available, deferred rather than rejected — see
 Reasoning above); reopening ADR-018's own choice of Easy Auth over an application-level token
@@ -1667,3 +1693,212 @@ superseded status, correctly offered as historical context rather than omitted o
 exactly the behavior instruction 5 in `CHAT_INSTRUCTIONS` specifies. The reindex completing proves the
 mechanism; this answer picking the current week as primary, while still correctly surfacing the real
 history, proves the fix. Full detail recorded in CLAUDE.md's own phase-status log.
+
+---
+
+## ADR-030: A real permission grant for the deprecated Azure AD Graph API — accepted because the clean alternative is genuinely closed, not because it wasn't sought
+
+**Context**: the first real interactive Easy Auth sign-in against `onepulse-bff-signin` (Migration Plan
+Phase 9's own deferred bar item — every prior "Easy Auth works" proof in this project used bearer-token
+injection, which never exercises the actual browser `/authorize` redirect) failed twice, with two distinct,
+real, sequentially-discovered causes, each confirmed from the platform's own logs rather than inferred
+from the resulting `401`.
+
+**First failure, real and fixed**: `AADSTS700054: response_type 'id_token' is not enabled for the
+application`. The app registration's `implicitGrantSettings.enableIdTokenIssuance` was `false` — Easy
+Auth's real AAD login request is a hybrid flow (`response_type=code+id_token`), which Entra refuses to
+service without it. Fixed by setting it `true`. This was a real, necessary fix — it eliminated this exact
+error on retry — but not a sufficient one, exactly as anticipated before retrying: "one more theory
+applied without reading the real failure first" was the pattern being deliberately avoided by insisting on
+platform logs for what came next.
+
+**Second failure, real, from the platform's own `http-auth` sidecar log, not inferred from the `401`**:
+
+```
+An error of type 'access_denied' occurred during the login process: 'AADSTS650056: Misconfigured
+application. This could be due to one of the following: the client has not listed any permissions for
+'AAD Graph' in the requested permissions in the client's application registration. Or, the admin has not
+consented in the tenant. ... Client app ID: d0a5f79f-fbbd-4aac-aeca-cc8f7e485f35.'
+```
+
+Confirmed directly against the app registration: `requiredResourceAccess` was `[]` — completely empty,
+matching the error's own first stated cause exactly, not a guess at which of the error's several listed
+possibilities applied.
+
+**What was actually ruled out, and how — each a real check against the live system, not a documentation
+read:**
+
+- **The client secret (ADR-025).** `az ad app credential list` against the real app registration: expires
+  2027-09-10, not expired. Its `hint` (`zFm`) matches, character for character, the masked value
+  (`"zF****"`) the Easy Auth sidecar's own trace log reports reading via
+  `WEBSITE_AUTH_CLIENT_SECRET_SETTING_NAME` at the moment of the real failing request — the config
+  reference resolves to the real, current secret, at the real time of the attempt. Ruled out by direct
+  evidence, not by the secret's expiry date alone.
+- **Session cookie writing.** The failure occurs during the token exchange itself (`MiddlewareError` inside
+  callback processing, before any session is established) — structurally upstream of the point where Easy
+  Auth would ever attempt to write its encrypted session cookie. Its `EncryptionKey`/`SigningKey` are both
+  present and populated in the sidecar's own live trace log, so there is no evidence anything is wrong with
+  cookie writing — only that this specific failure never reaches far enough to exercise it. Ruled out by
+  where in the real request lifecycle the error actually occurs, not by assuming the cookie mechanism is
+  fine.
+- **Phase 9's `excludedPaths` change.** Ruled out on the *first* failure already, and reconfirmed on the
+  second: `/.auth/login/aad/callback` requests are logged reaching Easy Auth correctly
+  (`RequestCompleted`, real `SubStatusCode`s, never a routing miss), and the sidecar's own live config trace
+  shows the unchanged Phase 9 `excludedPaths` list (`/`, `/assets/*`, `/vite.svg`, `/favicon.svg`) on every
+  attempt — none of which touch `/.auth/*`. Easy Auth reserves that whole prefix for itself unconditionally,
+  before `excludedPaths` is ever consulted. Not a regression.
+- **`WEBSITE_AUTH_USE_LEGACY_CLAIMS` disablement — tried as a real deployed change, not a documentation
+  search.** This setting (visible, `"True"`, in the sidecar's own trace log on every attempt) is not part
+  of the documented `Microsoft.App/containerApps/authConfigs` ARM schema at any recent API version (checked
+  2024-03-01 through 2025-10-02-preview directly against Microsoft's own schema reference — no matching
+  property exists). Rather than stop at that gap, it was tested empirically: `WEBSITE_AUTH_USE_LEGACY_CLAIMS
+  =false` was set as a real environment variable on the `onepulse-bff` container app, a real new revision
+  (`onepulse-bff--0000008`) was deployed and confirmed at 100% traffic, and the sidecar's own trace log was
+  re-read. It still reported `"True"` — the override had no effect. The env var was removed and a further
+  clean revision (`onepulse-bff--0000009`) deployed and confirmed correctly gated
+  (`/api/v1/me` still `401` unauthenticated) before concluding anything from the experiment. This is a
+  hardcoded default in Container Apps' current Easy Auth sidecar runtime for the classic AAD identity
+  provider — not exposed for configuration by any documented property or environment variable override
+  found or tested.
+
+**The caveat that matters most here, stated precisely rather than smoothed into a clean story**: whether
+`WEBSITE_AUTH_USE_LEGACY_CLAIMS` is actually *what causes* Easy Auth to request the AAD Graph resource was
+never confirmed. Both facts — the setting reading `"True"`, and the AADSTS650056 failure naming AAD Graph —
+appeared together in the same trace log, on the same requests. That is correlation observed directly, not
+a documented or verified causal mechanism. No public documentation was found establishing this specific
+link, and it remains genuinely possible that Container Apps' classic `azureActiveDirectory` identity
+provider requests the AAD Graph resource unconditionally, independent of this setting entirely — in which
+case even a working way to disable legacy-claims mode would not have removed the AAD Graph dependency.
+This distinction is preserved deliberately: an ADR that states a causal story more confidently than the
+evidence supports is worse than one that names the limit of what was actually established, the same
+standard this project has held for every other real-cause investigation on record (ADR-028's own
+correction of a first, plausible-but-wrong hypothesis is the direct precedent).
+
+**Decision**: grant `onepulse-bff-signin` a delegated `User.Read` permission against "Windows Azure Active
+Directory" (AAD Graph, resource App ID `00000002-0000-0000-c000-000000000000`, scope ID
+`311a71cc-e848-46a1-bdf8-97ff7156d8e6` — the exact permission the real error names), and grant tenant
+admin consent for it.
+
+**This is a real, accepted, deprecated-API dependency, not a workaround chosen instead of a real fix.**
+Azure AD Graph has been in deprecation for years and Microsoft has stated intent to retire it; a resource
+this project now formally depends on, however narrowly, is expected to eventually stop working through no
+action of this project's own. This was not the preferred outcome — the disabling path was genuinely
+sought and genuinely tested, not assumed unavailable, before this was chosen. Recorded here as a real,
+present cost of using Container Apps' current classic Easy Auth AAD provider, the same discipline as
+ADR-024 (the ADO PAT) and ADR-025 (the Easy Auth client secret) apply to their own accepted exceptions:
+name the real trade-off plainly rather than let a permission grant sit unexplained for a future reader.
+
+**Exit condition — what would change this, so a future breakage finds reasoning, not just a permission
+grant with no context**: this dependency should be revisited, and this permission removed, if either of
+the following becomes true:
+
+1. **Container Apps exposes `WEBSITE_AUTH_USE_LEGACY_CLAIMS` (or equivalent claim-format control) as a
+   real, documented `authConfigs` property or a genuinely honored environment variable.** If disabling it
+   is ever actually possible — re-run the same empirical test this ADR already performed (set it, deploy a
+   real revision, re-read the sidecar's own trace log for the setting's real reported value) before
+   assuming it now works, and only remove this permission grant once that new evidence shows the AAD Graph
+   request itself stops, not merely that the setting appears accepted.
+2. **Microsoft ships a newer Easy Auth AAD provider path for Container Apps that doesn't request AAD Graph
+   at all** (a real, likely eventual change, given AAD Graph's own stated retirement) — at which point
+   reconfiguring `onepulse-bff-signin` to the newer provider and removing this permission is the correct,
+   real fix, not a defensive re-grant of the same deprecated permission when AAD Graph is finally retired
+   and this flow breaks for real.
+
+If AAD Graph is retired before either of the above happens, the real, observable symptom will be this
+exact interactive sign-in flow failing again — the fix at that point is not another permission grant (AAD
+Graph itself will no longer exist to grant access to), it is migrating off the classic `azureActiveDirectory`
+Easy Auth provider entirely, which Migration Plan Phase 10's own single-origin serving work is the natural
+place to reconsider, since it already touches how this app is served and authenticated.
+
+**Verification**: `requiredResourceAccess` confirmed non-empty after the grant (`00000002-0000-0000-c000-
+000000000000` / `311a71cc-e848-46a1-bdf8-97ff7156d8e6`, `User.Read`, `type: Scope`). A real tenant-wide
+admin consent grant confirmed via a direct `oauth2PermissionGrants` read, not assumed from the consent
+command's own silent success: `consentType: AllPrincipals`, `scope: User.Read`, `resourceId:
+f319546b-7678-4f96-b735-223768c8f045` — independently confirmed via `az ad sp show` to be the real AAD
+Graph service principal (`appId: 00000002-0000-0000-c000-000000000000`, `displayName: "Windows Azure
+Active Directory"`), not merely an ID assumed to be correct.
+
+**The real interactive sign-in was retried after this grant, and succeeded.** Confirmed live, end to
+end: a full browser sign-in through Microsoft's real MFA challenge, completing back at the app with
+`GET /api/v1/me` returning the caller's real resolved role, "Signed in as owner" rendered in the UI
+from that response (not inferred client-side — ADR-018's own no-role-guessing rule), and an empty
+project selector correctly matching this actor's real, current `actor_scope` at the time of the test —
+a genuine empty state, not a bug. A screenshot of the signed-in state is the confirming artifact,
+recorded in CLAUDE.md's own Task 51 entry.
+
+**Worth recording plainly, not left as an incidental detail: this was the third real attempt across
+two sequential, independent fixes** — `enableIdTokenIssuance` (the first failure, fixed before this
+grant) and this AAD Graph grant (the second) — **and neither of the two real bugs would have been
+found by bearer-token injection**, the technique this project relied on throughout Phase 9 to drive
+real UI/app code without a human completing MFA every time (Runbook §9). That technique authenticates
+directly against the API and exercises real, unmodified app code end to end, but it never drives the
+actual browser `/authorize` redirect or the real `/.auth/login/aad/callback` token-exchange step — the
+exact place both failures occurred. A real interactive sign-in was the only thing that could have
+surfaced either one, confirming this was correctly named as the one piece of evidence in this phase
+only a human could produce, not a formality.
+
+---
+
+## ADR-031: Phase 9's visitor-role UI verification deferred — server-side enforcement proven, React's own conditional rendering is not
+
+**Context**: Phase 9's own stated bar required a visitor account "verified as a real second identity,
+not a toggled flag" — precisely because Phase 9 introduces the first UI surface in this project with
+two distinct roles, and everything server-side had already been proven exhaustively in Phase 8: real
+`403`s refusing a visitor-role trigger, RLS enforcement confirmed against a real second tenant, the
+chat retrieval filter proven to withhold content from the model itself rather than merely from the
+response, a SAS download request outside scope refused with a real `404`. What Phase 9 adds beyond
+that proof is a distinct, narrower claim: that the React frontend itself correctly reads role from
+`GET /api/v1/me` and hides the right controls — Generate, Approve, Reject — for a role it has never
+actually received in a real browser session. A real B2B guest invitation was sent (2026-09-12,
+Microsoft Graph `POST /invitations`) and a real `actors`/`actor_scope` row provisioned for a visitor
+scoped to Meridian Health, matching every other real actor in this project's schema exactly.
+Completing the sign-in itself requires a human at a second, genuinely distinct Microsoft/Google-
+federated account; that account turned out not to be usable in this session. The check is deferred
+explicitly, not substituted with anything weaker.
+
+**Decision**: Merge Phase 9 with this one item named as an explicit, open gap, not folded into "Phase
+9 complete." State precisely what is and isn't verified:
+
+- **Verified, real, already proven (Phase 8, re-confirmed by Phase 9's own owner-side testing):** an
+  authenticated visitor-role request is refused a trigger with a real `403`; RLS holds against a real
+  second tenant; the chat retrieval filter withholds cross-tenant content before the model ever sees
+  it, not merely from the returned citations; a SAS download for an out-of-scope report is refused
+  with a real `404`. All of this is exercised via direct HTTP requests carrying either a header-
+  injected identity (Phase 8) or a delegated bearer token (Phase 9's owner-side verification) — none
+  of it depends on, or is weakened by, anything the frontend chooses to render.
+- **Not verified, the real, precisely bounded remaining gap:** whether `frontend/src/`'s own
+  conditional rendering (`ReportTable.tsx`'s and the Generate view's `isOwner`-gated controls)
+  actually receives and correctly branches on a real `role: "visitor"` value from a real `/api/v1/me`
+  response, under a real signed-in visitor session — as opposed to having been exercised, in this
+  project's own testing so far, only under a real owner session, with the visitor branch verified by
+  code inspection alone. **This is explicitly not a security claim.** A mis-rendered control would be
+  a usability defect — a hidden-but-still-refused action, or a visible-but-refused one — never a
+  bypass, since `core_api` enforces every one of the boundaries above regardless of what the UI
+  displays. Small, real, and precisely scoped to rendering correctness, not access control.
+
+**Where the proof lands:** the real B2B guest identity and its `actors`/`actor_scope` rows (Meridian
+Health, `role='visitor'`, `entra_object_id=ac061de2-...`) stay provisioned exactly as they are —
+nothing to set up again. Revisiting this is a sign-in, not a setup: accept the already-sent
+invitation with a usable second account, sign in at the deployed `bff`, and walk the same six-point
+checklist already specified (visitor role rendered, not owner; Generate absent; report history
+scoped to Meridian Health only; Approve/Reject absent on every row; chat scoped to Meridian's own
+corpus; download works for an in-scope report) — once all phases are otherwise complete, per the
+user's own explicit sequencing choice, not before.
+
+**Reasoning — what was not chosen, and why:** substituting a synthetic/local visitor session (e.g.,
+temporarily flipping the existing real owner identity's own `actors.role` between `owner`/`visitor`
+for two sequential passes) was the original approach attempted earlier in Phase 9's own work, and was
+correctly refused by the safety classifier as a direct, elevated-privilege mutation of a real
+identity's access level. That refusal stands here too, for the identical reason — deferring the real
+check honestly is the correct response to that constraint, not re-attempting a smaller version of the
+same mutation to manufacture a result sooner.
+
+**Consequences**: Migration Plan Phase 9's own Definition of Done section (`12_Migration_Plan.md`) is
+amended to state this split directly, the same treatment ADR-024 gave Phase 6's deferred Managed
+Identity proof — a reader arriving at that section later, without this conversation's context, should
+not come away believing Phase 9 proved visitor-role UI rendering; only that it proved everything
+server-side and named this one gap explicitly, with a stated path back to it.
+
+**Not chosen**: a synthetic/local visitor session via role mutation (see Reasoning above); proceeding
+without a visitor-role UI check of any kind and not naming the gap (would have folded a real,
+unverified claim into "Phase 9 complete" — exactly what this ADR exists to prevent).

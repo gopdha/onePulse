@@ -416,7 +416,18 @@ async def persist_report(
 
             try:
                 async with conn.transaction():
-                    await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+                    # Real bug found live (Migration Plan Phase 9's first
+                    # genuine fresh-INSERT run since Phase 8 added this
+                    # line — every prior AOP run had hit the existing
+                    # weekly collision first, so this INSERT path, and
+                    # this exact statement, had never actually executed):
+                    # `conn.fetchval` returns a UUID column as a real
+                    # Python `uuid.UUID` object, but `set_config`'s
+                    # second parameter is Postgres `text` — asyncpg
+                    # requires an exact type match, not an implicit cast,
+                    # the same real class of bug already fixed at
+                    # core_api/security.py's own `resolve_tenant_id`.
+                    await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant_id))
                     report_id = await conn.fetchval(
                         """
                         INSERT INTO reports (program_id, week_of, rag_status, quality_gate_outcome,

@@ -286,8 +286,38 @@ Three views matching the Ops Console: project selector plus report table with ap
 7-step progress view driven by polling the status table; and the chat assistant scoped to the
 selected project.
 
-**Definition of Done**: feature parity with the Ops Console, including the empty-by-default project
-selector and correct icon behaviour on `hard_stop_defect` outcomes.
+> **Amended 2026-09-12 (CLAUDE.md Task 51 follow-up, ADR-031) — the original Definition of Done below
+> did not anticipate that "a visitor account seeing only what a visitor should, verified as a real
+> second identity, not a toggled flag" would need a second, genuinely distinct human-owned account to
+> complete. A real B2B guest invitation was sent and a real `actors`/`actor_scope` visitor row
+> provisioned for Meridian Health; the second account turned out not to be usable in this session, and
+> the real sign-in was deferred explicitly rather than substituted with a synthetic session (role-
+> flipping a real identity was tried once already this phase and correctly refused by the safety
+> classifier as an elevated-privilege identity mutation). See ADR-031 for the full decision.**
+>
+> **What this phase actually proved, real and complete:** every server-side enforcement boundary a
+> visitor session depends on — a visitor-role trigger refused with a real `403`, RLS holding against a
+> real second tenant, the chat retrieval filter withholding cross-tenant content before the model ever
+> sees it, a SAS download outside scope refused with a real `404` — all exercised via direct requests
+> carrying a real identity (Phase 8's header injection, Phase 9's own delegated bearer token), none of
+> it dependent on anything the frontend renders. Full owner-side feature parity against the deployed
+> backend, real interactive sign-in (ADR-025/030), all four terminal outcomes, a real SAS download
+> from the browser, a real chat answer with citations, no MSAL/token in JS.
+>
+> **What remains genuinely unproven, deferred until all phases are otherwise complete, not silently:**
+> whether the React frontend's own conditional rendering (`isOwner`-gated controls) correctly hides
+> Generate/Approve/Reject for a role it has never actually received in a real browser session — a
+> rendering-correctness question, not a security one, since `core_api` enforces every boundary above
+> regardless of what the UI shows. The real B2B guest identity stays provisioned; revisiting this is a
+> sign-in, not a setup — see ADR-031.
+
+**Definition of Done, revised**: feature parity with the Ops Console for an owner, verified against
+the deployed backend; a real interactive sign-in completed and its two real Entra misconfigurations
+found and fixed (ADR-025/030); all four terminal outcomes rendering distinctly; a real report
+downloaded through the SAS flow from the browser; a real chat answer with citations; no MSAL, no
+token in JavaScript, demonstrable; full suite green. **Not** part of this phase's Definition of Done,
+by explicit decision: a real signed-in visitor session exercised through the actual React UI —
+deferred until all phases are otherwise complete (see above and ADR-031).
 
 ---
 
