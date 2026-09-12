@@ -354,9 +354,13 @@ async def persist_report(
     findings: list[dict],
     status_analysis: dict,
     credential: AsyncDefaultAzureCredential,
+    is_test_fixture: bool = False,
 ) -> tuple[int, bool]:
     """Real persistence, Phase 2's schema (onepulse-pg-dev) — the
-    pipeline's own genuine output, not seeded/test data.
+    pipeline's own genuine output, not seeded/test data (unless
+    `is_test_fixture=True` — Task 55's real `force` re-run path, see
+    below; still a real pipeline run and a real upload, just marked so
+    it never appears in a real-facing view).
 
     Migration Plan Phase 10 (CLAUDE.md Task 55): a real, live diagnostic
     against the deployed system — a genuine desktop-generated report,
@@ -472,8 +476,9 @@ async def persist_report(
                     report_id = await conn.fetchval(
                         """
                         INSERT INTO reports (program_id, week_of, rag_status, quality_gate_outcome,
-                                              executive_summary, attempts, rendered_artifact_uri)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                              executive_summary, attempts, rendered_artifact_uri,
+                                              is_test_fixture)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                         RETURNING report_id
                         """,
                         program_id,
@@ -483,6 +488,7 @@ async def persist_report(
                         executive_summary,
                         attempts,
                         rendered_uri,
+                        is_test_fixture,
                     )
 
                     finding_id_by_item_ref: dict[str, int] = {}
@@ -672,6 +678,7 @@ async def run_reporting_stages(
     status_deck_path: str,
     pptx_mcp_server_path: str,
     output_dir: str = "output",
+    force: bool = False,
     on_stage: Callable[[int, int, str], None] = noop_stage,
     on_detail: Callable[[str], None] = noop_detail,
 ) -> PipelineResult:
@@ -810,8 +817,16 @@ async def run_reporting_stages(
         findings=findings,
         status_analysis=status_analysis,
         credential=async_credential,
+        is_test_fixture=force,
     )
     on_detail("Real blob upload succeeded (Task 55) — this report has a real, SAS-downloadable blob:// URI.")
+    if force:
+        on_detail(
+            "force=true (Task 55): persisted with is_test_fixture=TRUE — a real pipeline run and a "
+            "real upload, excluded from list_recent_reports/list_pending_reviews/the RAG index like "
+            "every other test-fixture row, and never colliding with the real weekly report for this "
+            "program (migration 0014's partial unique index)."
+        )
     if persisted:
         on_detail(f"Persisted as report_id={report_id} (reviewed=FALSE — Human Governance, FR-7, still applies).")
     else:

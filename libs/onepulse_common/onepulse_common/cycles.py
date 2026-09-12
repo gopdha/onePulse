@@ -47,21 +47,36 @@ def terminal_status_from_result(result: PipelineResult) -> str:
 
 
 async def create_cycle(
-    conn: asyncpg.Connection, program_id: str, requested_by_actor_id: str, trace_context: str | None
+    conn: asyncpg.Connection,
+    program_id: str,
+    requested_by_actor_id: str,
+    trace_context: str | None,
+    force: bool = False,
 ) -> dict:
     """LLD 2.1's real trigger contract: inserts a real `queued` row and
     returns immediately — this function itself never executes the
     pipeline; that's the worker's job, entirely out of the request path.
+
+    `force` (Task 55, migration 0015): an owner-only, default-off
+    real bypass of the real weekly `UNIQUE(program_id, week_of)`
+    collision — carried on this row (not duplicated into the
+    report-cycles queue envelope, since `get_cycle_for_execution`
+    already re-reads the full row before Reporting acts on it) all the
+    way to `persist_report`, which marks the resulting row
+    `is_test_fixture=TRUE` and lets the real partial unique index
+    (migration 0014, `WHERE NOT is_test_fixture`) admit it alongside
+    the real one for that week rather than colliding with it.
     """
     row = await conn.fetchrow(
         """
-        INSERT INTO cycles (program_id, requested_by_actor_id, trace_context)
-        VALUES ($1, $2, $3)
+        INSERT INTO cycles (program_id, requested_by_actor_id, trace_context, force)
+        VALUES ($1, $2, $3, $4)
         RETURNING cycle_id, status
         """,
         program_id,
         requested_by_actor_id,
         trace_context,
+        force,
     )
     return {"cycle_id": row["cycle_id"], "status": row["status"]}
 
@@ -92,7 +107,7 @@ async def get_cycle_for_execution(conn: asyncpg.Connection, cycle_id: str) -> di
         FROM programs p
         WHERE c.cycle_id = $1 AND p.program_id = c.program_id
         RETURNING c.cycle_id, c.program_id, p.name AS program_name, c.trace_context,
-                  c.requested_by_actor_id
+                  c.requested_by_actor_id, c.force
         """,
         cycle_id,
     )

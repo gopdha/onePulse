@@ -224,7 +224,7 @@ async def list_programs(request: Request) -> Response:
 
 
 @app.post("/api/v1/programs/{program_id}/reports")
-async def trigger_report(request: Request, program_id: str) -> Response:
+async def trigger_report(request: Request, program_id: str, force: bool = False) -> Response:
     """Migration Plan Phase 3: proxies the real trigger endpoint. No
     request body forwarded — identity travels via the same real header
     _core_headers() already sets on every route (see core_api/main.py's
@@ -232,10 +232,14 @@ async def trigger_report(request: Request, program_id: str) -> Response:
     body-supplied requestedBy field). The real `202` status the core API
     returns is preserved as-is by _proxy_response, not silently
     rewritten to `200`.
+
+    `force` (Task 55): forwarded as-is — core_api's own `_require_owner`
+    is the real enforcement for who can use it, not anything checked
+    here.
     """
     headers = await _core_headers(request)
     resp = await request.app.state.http_client.post(
-        f"/api/v1/programs/{program_id}/reports", headers=headers
+        f"/api/v1/programs/{program_id}/reports", headers=headers, params={"force": force}
     )
     return _proxy_response(resp)
 

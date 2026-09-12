@@ -482,6 +482,7 @@ async def _execute_cycle(
                         status_deck_path=status_deck_path,
                         pptx_mcp_server_path=PPTX_MCP_SERVER_PATH,
                         output_dir=OUTPUT_DIR,
+                        force=bool(cycle.get("force", False)),
                         on_stage=on_stage,
                         on_detail=on_detail,
                     )

@@ -327,6 +327,26 @@ async def check_policy_definition_contains(
     return qual is not None and expected_substring in qual
 
 
+async def check_index_definition_contains(
+    conn: asyncpg.Connection, table_name: str, index_name: str, expected_substring: str
+) -> bool:
+    """Task 55: `reports_program_id_week_of_key` (a plain table-level
+    `UNIQUE`) was replaced with a partial unique index scoped `WHERE NOT
+    is_test_fixture`, so a real forced/test re-run never collides with
+    the real weekly report and vice versa. A bare existence check would
+    pass for a index of this name with any definition at all — this
+    checks the real `indexdef` text for the partial-index marker itself,
+    the same discipline `check_policy_definition_contains` already
+    applies to a policy that could silently regress to a weaker shape.
+    """
+    indexdef = await conn.fetchval(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND tablename = $1 AND indexname = $2",
+        table_name,
+        index_name,
+    )
+    return indexdef is not None and expected_substring in indexdef
+
+
 async def check_schema_exists(conn: asyncpg.Connection, schema_name: str) -> bool:
     """Real, live-discovered subtlety (Phase 4): information_schema.schemata
     is itself subject to the connecting role's own USAGE visibility —
@@ -649,6 +669,12 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
          await check_constraint_exists(conn, "reports", "reports_week_of_is_monday"))
     )
     results.append(
+        ("Partial unique index (0014): reports(program_id, week_of) real-only, is_test_fixture rows excluded",
+         await check_index_definition_contains(
+             conn, "reports", "reports_program_id_week_of_real_key", "WHERE (NOT is_test_fixture)"
+         ))
+    )
+    results.append(
         ("CHECK constraint: approval_records rejected decisions require notes (0002)",
          await check_constraint_exists(conn, "approval_records", "approval_records_rejected_notes_required"))
     )
@@ -709,6 +735,7 @@ async def run_all_checks(conn: asyncpg.Connection) -> list[tuple[str, bool]]:
     )
     results.append(("column exists: cycles.trace_context", await check_column_exists(conn, "cycles", "trace_context")))
     results.append(("column exists: cycles.stages", await check_column_exists(conn, "cycles", "stages")))
+    results.append(("column exists: cycles.force (0015)", await check_column_exists(conn, "cycles", "force")))
 
     results.append(("schema exists: investigation (0004)", await check_schema_exists(conn, "investigation")))
     results.append(

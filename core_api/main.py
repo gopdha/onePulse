@@ -558,6 +558,7 @@ async def list_programs(
 async def trigger_report(
     request: Request,
     program_id: str,
+    force: bool = False,
     _token=Depends(verify_service_token),
     current_actor: CurrentActor = Depends(get_current_actor),
 ) -> TriggerResponse:
@@ -591,6 +592,21 @@ async def trigger_report(
     can be woken from a real scaled-to-zero state — `cycles` itself
     stays the source of truth for program_name/requested_by_actor_id/
     trace_context, so nothing needs duplicating into the envelope.
+
+    `force` (Task 55, migration 0014/0015): default-off, owner-only
+    (already true of this whole route via `_require_owner` — no
+    separate check needed) real bypass of the real weekly
+    `UNIQUE(program_id, week_of)` collision, for testing a real
+    generate against the same real program twice in one week without
+    manually backdating a row afterward. Persists via `persist_report`
+    with `is_test_fixture=TRUE`, so the resulting row is real pipeline
+    output but never shows up in `list_recent_reports`/
+    `list_pending_reviews`/the RAG index — the identical, already-proven
+    invisibility every other test-fixture row already gets, not a
+    second mechanism. Does not change what the real, non-forced weekly
+    guarantee protects: the partial unique index (migration 0014)
+    enforces `UNIQUE(program_id, week_of)` exactly as before for every
+    row where `is_test_fixture` is false.
     Real, disclosed, accepted gap: if the publish itself fails after the
     INSERT already committed, the cycle row is left `queued` with
     nothing to ever wake Reporting for it — no distributed transaction
@@ -608,7 +624,7 @@ async def trigger_report(
     async with request.app.state.pg_client.pool.acquire() as conn:
         await _check_rate_limit(conn, current_actor.actor_id)
         try:
-            result = await create_cycle(conn, program_id, current_actor.actor_id, trace_context)
+            result = await create_cycle(conn, program_id, current_actor.actor_id, trace_context, force=force)
         except asyncpg.exceptions.ForeignKeyViolationError:
             raise HTTPException(status_code=404, detail={"error": "program_not_found"})
 
