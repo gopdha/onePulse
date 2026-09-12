@@ -69,6 +69,7 @@ from core_api.security import CurrentActor, get_current_actor, verify_service_to
 from onepulse_common.blob_storage import issue_download_sas, parse_blob_uri
 from onepulse_common.chat_assistant import ask_question
 from onepulse_common.config import PostgresSettings
+from onepulse_common.constants import ON_DEMAND_RATE_LIMIT_PER_LEAD_PER_DAY
 from onepulse_common.cycles import create_cycle, get_cycle
 from onepulse_common.db import PostgresClient
 from onepulse_common.embeddings import build_embedding_client
@@ -114,7 +115,21 @@ DEPLOYMENT_NAME = os.environ.get("ONEPULSE_FOUNDRY_DEPLOYMENT_NAME", "onePulse-g
 # (cost-based governance) is a separate, real, NOT-built concern —
 # this rate limit stands alone, keyed on a plain count of `cycles` rows,
 # not on any real cost figure `usage_ledger` would need to carry.
-RATE_LIMIT_TRIGGERS_PER_DAY = 2
+#
+# The default reads from the same canonical LLD §3 constant CLAUDE.md's
+# own Configuration Values table reproduces verbatim
+# (`ON_DEMAND_RATE_LIMIT_PER_LEAD_PER_DAY`), not a second, independently
+# -typed "2" that would silently drift from it — the requirement is 2,
+# stated once. `ONEPULSE_RATE_LIMIT_TRIGGERS_PER_DAY` exists ONLY as a
+# real deployed testing override (see CLAUDE.md's dated open item); it
+# must be reverted before this URL goes to anyone external — raising it
+# here does not change FR-11 itself, only how it's enforced today.
+RATE_LIMIT_TRIGGERS_PER_DAY = int(
+    os.environ.get(
+        "ONEPULSE_RATE_LIMIT_TRIGGERS_PER_DAY",
+        str(ON_DEMAND_RATE_LIMIT_PER_LEAD_PER_DAY),
+    )
+)
 
 _tracer = trace.get_tracer(__name__)
 
@@ -226,6 +241,33 @@ async def tracing_middleware(request: Request, call_next):
             response = await call_next(request)
             span.set_attribute("http.status_code", response.status_code)
     return response
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Real bug found live during Phase 10 device testing (CLAUDE.md Task
+    53), not by inspection: every `raise HTTPException(status_code=...,
+    detail={"error": ..., "message": ...})` in this file — 403, 404,
+    429, and the direct-HTTPException 400 for notes_required — was
+    shipping a body shaped `{"detail": {"error": ..., "message": ...}}`,
+    because FastAPI's own default HTTPException handler wraps whatever
+    `detail` is passed as `{"detail": <detail>}`. It was never the flat
+    `{"error": ..., "message": ...}` shape this API's own contract
+    already uses everywhere else (see `validation_exception_handler`
+    below, which reshapes into exactly that flat shape for its own
+    Pydantic-validation branch). `frontend/src/api/client.ts` reads
+    `body.error`/`body.message` at the top level — with the real extra
+    `detail` nesting, `code` was always `undefined` for every
+    HTTPException-raised error in this entire API, and every caller fell
+    through to a generic "Request failed with {status}" message,
+    collapsing a 403 (not permitted, ever) and a 429 (permitted, out of
+    quota for now) into an identical, uninformative shape. Overriding the
+    default handler here — one real fix, at the one real source, not a
+    per-call-site patch — matches every raise site's own intended shape
+    instead of asking each one to route around FastAPI's default.
+    """
+    content = exc.detail if isinstance(exc.detail, dict) else {"error": "http_error", "message": str(exc.detail)}
+    return JSONResponse(status_code=exc.status_code, content=jsonable_encoder(content), headers=exc.headers)
 
 
 @app.exception_handler(RequestValidationError)

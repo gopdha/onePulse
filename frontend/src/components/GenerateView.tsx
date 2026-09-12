@@ -7,8 +7,33 @@
 
 import { useEffect, useState } from "react";
 import { Alert, Box, Button, Group, Progress, Stack, Text, Title } from "@mantine/core";
+import { ApiError } from "../api/client";
 import { useCycleStatus, useTriggerReport } from "../api/hooks";
 import type { CycleStatus, StageState } from "../api/types";
+
+// A 403 (not permitted, ever, for this role) and a 429 (permitted, but
+// this actor's own quota is used up for now) are different situations
+// with different correct next actions — collapsing both into a generic
+// "Request failed with {status}" (what `String(err)` on a bare ApiError
+// produces) told the user nothing they could act on. Real bug found
+// live during Phase 10 device testing (CLAUDE.md Task 53): the
+// underlying cause was in core_api's own error responses, not just this
+// rendering — see core_api/main.py's new `http_exception_handler`.
+function describeTriggerError(err: unknown): string {
+  if (err instanceof ApiError) {
+    if (err.status === 429) {
+      return "You've used your report generations for today. Try again tomorrow.";
+    }
+    if (err.status === 403) {
+      return "You don't have permission to generate reports for this project.";
+    }
+    if (err.status === 404) {
+      return "This project isn't available to you.";
+    }
+    return err.message;
+  }
+  return err instanceof Error ? err.message : "Something went wrong.";
+}
 
 const STAGE_NAMES: Record<number, string> = {
   1: "ADO Investigation",
@@ -153,7 +178,7 @@ export function GenerateView({ programId, isOwner }: { programId: string; isOwne
 
       {trigger.isError && (
         <Alert color="red" title="Could not start">
-          {String(trigger.error)}
+          {describeTriggerError(trigger.error)}
         </Alert>
       )}
 
