@@ -502,6 +502,22 @@ Empty output means it's genuinely never been committed.
   hit it. If a permissive-when-unset RLS policy checks `current_setting(x, true) IS NULL`, treat both
   representations as "unset" from the start rather than discovering this live.
 
+**Open item, dated 2026-09-12 (CLAUDE.md Task 53) — a real, live deviation from the FR-11 default,
+revert before the URL goes to anyone external.** `onepulse-core-api`'s deployed container currently
+carries `ONEPULSE_RATE_LIMIT_TRIGGERS_PER_DAY=10`, a testing override raised from the real
+requirement (2 triggers/actor/day, `onepulse_common.constants.ON_DEMAND_RATE_LIMIT_PER_LEAD_PER_DAY`)
+while device testing was tripping the limit constantly. FR-11 itself hasn't changed — only how it's
+enforced on this one deployed environment, today. **To revert:**
+
+```powershell
+az containerapp update -g onepulse-gr -n onepulse-core-api --remove-env-vars ONEPULSE_RATE_LIMIT_TRIGGERS_PER_DAY
+```
+
+Removing the variable, not setting it back to `2` explicitly, lets the code's own real default
+(sourced from the canonical constant, not a second hardcoded literal) take over — the same
+distinction the code comment at `core_api/main.py`'s `RATE_LIMIT_TRIGGERS_PER_DAY` makes. Check this
+item is still open before any real external invite goes out.
+
 ---
 
 ## 7. Deploying to Azure Container Apps (Migration Plan Phase 7)

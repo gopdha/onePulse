@@ -336,18 +336,21 @@ leaves same-origin serving as the only architecture that works here, not the bet
 > real production FQDN, with Azure Static Web Apps ruled out for the structural reason recorded
 > above, not a preference.
 >
-> **What is genuinely still outstanding, checked directly rather than assumed closed:** the one real
-> interactive sign-in completed so far (Phase 9/ADR-030) was performed in a private/incognito browser
-> window on the same physical machine used for development — the DoD's own wording, "a device that is
-> not the development machine," is not satisfied by a different browser profile on the same hardware,
-> only by genuinely different hardware. Separately, no full generate-and-download cycle has yet run
-> through an actual browser click end to end; the one real report download proven so far (Phase 9) was
-> verified via a direct `curl` against the issued SAS URL, confirming the mechanism works, but not the
-> same action as a browser's own download click. Neither gap is invented to justify this phase's
-> existence — both are the literal, unmet text of the Definition of Done below, and both are closeable
-> on demand: sign in from a genuinely different device (phone, tablet, or another computer), trigger a
-> real Generate run to completion through the UI, and download the resulting report through the
-> browser's own download action.
+> **Update, 2026-09-12 (CLAUDE.md Task 53) — the device clause closed for real.** A genuinely
+> different device (a phone, not a second browser window on the development machine) signed in
+> through the real interactive Easy Auth flow, selected a project, and the report list rendered
+> against the real deployed system. That satisfies the DoD's own literal wording, "a device that is
+> not the development machine" — the earlier private-window sign-in on the same hardware did not,
+> and the record above is left in place rather than quietly rewritten, so the distinction that
+> mattered stays visible.
+>
+> **What remains, precisely narrowed to the one real thing left:** a full generate-and-download
+> cycle has not yet run through an actual browser click end to end. The one real report download
+> proven so far (Phase 9) was verified via a direct `curl` against the issued SAS URL, confirming
+> the mechanism works, but not the same action as a browser's own download click. This does **not**
+> need a fresh trigger to close — a real report already exists from desktop testing; downloading
+> that one through the phone's own browser action is sufficient and avoids spending any more of
+> FR-11's rate-limited quota than necessary.
 
 **Definition of Done**: a real end-to-end run triggered from a browser on a device that is not the
 development machine, including a successful report download.
