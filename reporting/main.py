@@ -374,6 +374,7 @@ async def _execute_cycle(
     pg_client: PostgresClient,
     cycle: dict,
     credential: DefaultAzureCredential,
+    async_credential: AsyncDefaultAzureCredential,
     arize_space_id: str,
     investigation_requests_client,
     findings_ready_client,
@@ -476,6 +477,7 @@ async def _execute_cycle(
                         project_endpoint=PROJECT_ENDPOINT,
                         deployment_name=DEPLOYMENT_NAME,
                         credential=credential,
+                        async_credential=async_credential,
                         ado_project_name=program_name,
                         status_deck_path=status_deck_path,
                         pptx_mcp_server_path=PPTX_MCP_SERVER_PATH,
@@ -533,6 +535,7 @@ async def _handle_report_cycle_message(
     message: QueueMessage,
     pg_client: PostgresClient,
     credential: DefaultAzureCredential,
+    async_credential: AsyncDefaultAzureCredential,
     arize_space_id: str,
     investigation_requests_client,
     findings_ready_client,
@@ -566,7 +569,7 @@ async def _handle_report_cycle_message(
     renewal_task = asyncio.create_task(_renew_cycle_lease(queue_client, message_holder))
     try:
         await _execute_cycle(
-            pg_client, cycle, credential, arize_space_id,
+            pg_client, cycle, credential, async_credential, arize_space_id,
             investigation_requests_client, findings_ready_client, findings_ready_poison_client,
             http_client,
         )
@@ -591,7 +594,8 @@ async def _handle_report_cycle_message(
 async def _consume_loop(
     report_cycles_client, report_cycles_poison_client,
     investigation_requests_client, findings_ready_client, findings_ready_poison_client,
-    pg_client: PostgresClient, credential: DefaultAzureCredential, arize_space_id: str,
+    pg_client: PostgresClient, credential: DefaultAzureCredential,
+    async_credential: AsyncDefaultAzureCredential, arize_space_id: str,
     http_client: httpx.AsyncClient,
 ) -> None:
     print(f"[reporting] polling '{REPORT_CYCLES_QUEUE}' every {POLL_INTERVAL_SECONDS}s (Ctrl+C to stop)")
@@ -603,7 +607,7 @@ async def _consume_loop(
             received_any = True
             await _handle_report_cycle_message(
                 report_cycles_client, report_cycles_poison_client, message,
-                pg_client, credential, arize_space_id,
+                pg_client, credential, async_credential, arize_space_id,
                 investigation_requests_client, findings_ready_client, findings_ready_poison_client,
                 http_client,
             )
@@ -631,7 +635,7 @@ async def main() -> None:
             await _consume_loop(
                 report_cycles_client, report_cycles_poison_client,
                 investigation_requests_client, findings_ready_client, findings_ready_poison_client,
-                pg_client, credential, arize_space_id, http_client,
+                pg_client, credential, async_credential, arize_space_id, http_client,
             )
     finally:
         await pg_client.close()

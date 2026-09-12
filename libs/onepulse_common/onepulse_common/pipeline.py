@@ -78,9 +78,11 @@ import asyncpg
 from agent_framework import Agent
 from agent_framework.foundry import FoundryChatClient
 from azure.identity import DefaultAzureCredential
+from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from onepulse_common.blob_storage import upload_report_blob
 from onepulse_common.config import PostgresSettings
 from onepulse_common.db import PostgresClient
 from onepulse_common.heartbeat import heartbeat, noop_detail, noop_stage
@@ -351,9 +353,40 @@ async def persist_report(
     rendered_path: str,
     findings: list[dict],
     status_analysis: dict,
+    credential: AsyncDefaultAzureCredential,
 ) -> tuple[int, bool]:
     """Real persistence, Phase 2's schema (onepulse-pg-dev) — the
     pipeline's own genuine output, not seeded/test data.
+
+    Migration Plan Phase 10 (CLAUDE.md Task 55): a real, live diagnostic
+    against the deployed system — a genuine desktop-generated report,
+    real 404 on download — found that no real pipeline run had ever
+    uploaded its rendered file to Blob Storage, since ADR-021/Phase 8
+    designed and built the SAS download mechanism without ever wiring
+    the upload half into this function. `rendered_path` still names the
+    local file `render_status_report`/`render_tower_report` just wrote
+    (container-ephemeral, gone the moment that container recycles) —
+    this function now reads those real bytes and uploads them for real
+    via `upload_report_blob` BEFORE opening any database connection,
+    storing the resulting real `blob://` URI, never a `file://` one, for
+    every report persisted from this point on. Every historical
+    `file://` row (Tasks 1 through 54's own real output) is left
+    exactly as it is — not backfilled, not fabricated; those files are
+    genuinely gone with the containers that wrote them, and the
+    download route now says so with a distinct, honest message rather
+    than the generic "no artifact" one.
+
+    Deliberately loud, not swallowed: a real upload failure (a
+    transient Blob Storage error, an RBAC/credential problem) raises
+    here, before the INSERT, and propagates all the way to
+    `reporting/main.py`'s own outer handler, which marks the real cycle
+    `status='failed'` with the real error text — the same treatment
+    `hard_stop_defect` already gets ("nothing rendered or persisted").
+    Persisting a `reports` row with a `file://` URI as a silent
+    fallback would just reproduce, for real, the exact three-phase-old
+    gap this fix exists to close — not chosen, per the explicit
+    instruction to fail loudly rather than let the report look
+    successful while quietly missing its real download path.
 
     `week_of` must be the real Monday-of-week bucket (see
     `run_pipeline_cycle`'s use of `report_rendering.week_of()`), not the
@@ -387,6 +420,16 @@ async def persist_report(
     Returns (report_id, persisted) — `persisted` is False when a report
     for this program/week already existed and nothing new was written.
     """
+    # Real upload, first, before any DB connection is opened — a failure
+    # here must not leave a half-persisted row or a silent file://
+    # fallback (see the module docstring above for why loud is the
+    # deliberate choice). blob_name mirrors the existing local
+    # <ProjectName>/<ProjectName>_<Date>.pptx structure so the two
+    # storage shapes stay easy to reason about side by side.
+    blob_name = f"{program_name}/{Path(rendered_path).name}"
+    rendered_bytes = Path(rendered_path).read_bytes()
+    rendered_uri = await upload_report_blob(credential, blob_name, rendered_bytes)
+
     client = await PostgresClient.connect(PG_SETTINGS, min_size=1, max_size=1)
     try:
         async with client.pool.acquire() as conn:
@@ -411,8 +454,6 @@ async def persist_report(
                 "WHERE p.program_id = $1",
                 program_id,
             )
-
-            rendered_uri = Path(rendered_path).resolve().as_uri()
 
             try:
                 async with conn.transaction():
@@ -626,6 +667,7 @@ async def run_reporting_stages(
     project_endpoint: str,
     deployment_name: str,
     credential: DefaultAzureCredential,
+    async_credential: AsyncDefaultAzureCredential,
     ado_project_name: str,
     status_deck_path: str,
     pptx_mcp_server_path: str,
@@ -756,7 +798,7 @@ async def run_reporting_stages(
             "review before it would be considered approved (FR-7/FR-13, Human Governance)."
         )
 
-    on_stage(7, TOTAL_STAGES, "Persisting report to Postgres (Phase 2 schema)")
+    on_stage(7, TOTAL_STAGES, "Uploading rendered report to Blob Storage, then persisting to Postgres (Phase 2 schema)")
     report_id, persisted = await persist_report(
         program_name=ado_project_name,
         week_of=report_week_of,
@@ -767,7 +809,9 @@ async def run_reporting_stages(
         rendered_path=output_path,
         findings=findings,
         status_analysis=status_analysis,
+        credential=async_credential,
     )
+    on_detail("Real blob upload succeeded (Task 55) — this report has a real, SAS-downloadable blob:// URI.")
     if persisted:
         on_detail(f"Persisted as report_id={report_id} (reviewed=FALSE — Human Governance, FR-7, still applies).")
     else:

@@ -839,14 +839,32 @@ async def download_report(
     a real `blob://` URI (every report rendered before this phase, and
     any rendered since without a real blob upload) has no SAS-
     downloadable artifact — a real, honest `404`, not a broken link.
+
+    Migration Plan Phase 10 (CLAUDE.md Task 55): now that
+    `persist_report` always uploads for real (or fails the whole cycle
+    loudly — see its own docstring), a `file://` URI can only mean one
+    real thing: a report rendered before this fix, whose file lived
+    only inside a `reporting` container that has since recycled — it is
+    genuinely, permanently gone, not a transient or fixable gap. That is
+    a different real situation from `artifact_not_available` (no URI at
+    all — e.g. `hard_stop_defect`, which never renders or persists
+    anything), and the two get distinct error codes so the UI can say
+    the true thing in each case rather than one generic message
+    covering both.
     """
     async with request.app.state.pg_client.pool.acquire() as conn:
         info = await get_report_download_info(conn, report_id, current_actor.tenant_id)
     if info is None or info["program_id"] not in current_actor.authorized_program_ids:
         raise HTTPException(status_code=404, detail={"error": "report_not_found"})
 
-    parsed = parse_blob_uri(info["rendered_artifact_uri"]) if info["rendered_artifact_uri"] else None
+    uri = info["rendered_artifact_uri"]
+    if uri is None:
+        raise HTTPException(status_code=404, detail={"error": "artifact_not_available"})
+
+    parsed = parse_blob_uri(uri)
     if parsed is None:
+        if uri.startswith("file://"):
+            raise HTTPException(status_code=404, detail={"error": "artifact_predates_blob_storage"})
         raise HTTPException(status_code=404, detail={"error": "artifact_not_available"})
     container, blob_name = parsed
 

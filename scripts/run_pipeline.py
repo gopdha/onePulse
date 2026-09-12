@@ -69,6 +69,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from agent_framework.foundry import FoundryChatClient
 from arize.otel import set_routing_context
 from azure.identity import DefaultAzureCredential
+from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential
 from dotenv import load_dotenv
 from opentelemetry import trace
 
@@ -120,6 +121,12 @@ async def main(ado_project_name: str) -> None:
     ado_pat_b64 = load_ado_pat()
 
     credential = DefaultAzureCredential()
+    # Task 55: `run_reporting_stages`/`persist_report` now upload the
+    # real rendered file to Blob Storage before persisting — the same
+    # real mechanism this CLI's own reporting run must exercise, not a
+    # second, weaker path just because this is the disclosed CLI
+    # exception rather than the deployed service.
+    async_credential = AsyncDefaultAzureCredential()
     arize_space_id = enable_observability(credential, PROJECT_ENDPOINT)
 
     print(f"OnePulse real pipeline run — org '{ADO_ORG_NAME}', project '{ado_project_name}'")
@@ -193,6 +200,7 @@ async def main(ado_project_name: str) -> None:
                     project_endpoint=PROJECT_ENDPOINT,
                     deployment_name=DEPLOYMENT_NAME,
                     credential=credential,
+                    async_credential=async_credential,
                     ado_project_name=ado_project_name,
                     status_deck_path=STATUS_DECK_PATH,
                     pptx_mcp_server_path=PPTX_MCP_SERVER_PATH,
@@ -216,6 +224,7 @@ async def main(ado_project_name: str) -> None:
         # a generous timeout, and print the real result.
         flushed = trace.get_tracer_provider().force_flush(timeout_millis=30000)
         print(f"\nTelemetry flush before exit: {'OK' if flushed else 'TIMED OUT OR FAILED'}")
+        await async_credential.close()
 
 
 if __name__ == "__main__":
