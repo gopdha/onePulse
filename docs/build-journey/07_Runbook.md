@@ -364,6 +364,29 @@ Empty output means it's genuinely never been committed.
   real constraint and error still fires, nothing is ever actually committed), or picking a row that
   has genuinely never been decided on and accepting the resulting permanent row as the real cost of
   testing against real infrastructure.
+- **This has now recurred a third time (report 1113, Migration Plan Phase 9) — not a third distinct
+  bug, the same one, once more.** Report 1113 was itself a real, deliberate diagnostic row (inserted
+  to verify Phase 9's own `persist_report()`/`set_config` type-mismatch fix) that was subsequently
+  approved for real during a live UI walkthrough — a human was directed into the deployed dashboard
+  to confirm the report table rendered correctly, and the row it landed on happened to carry a live
+  Approve button, which was clicked. **The cause is the instruction that put a test row in front of a
+  live control, not the click itself, and not any failure of the guarantee** — the guarantee did
+  exactly what it is designed to do: made the resulting `approval_records` row permanent, correctly,
+  the same as it did for 306/320/532/454. **The actual, recurring failure across all three real
+  instances (532, 454, 1113) is upstream of the guarantee entirely: treating a row that exists for
+  testing as disposable, when in this system a row stops being disposable the instant it is visible
+  anywhere a real approve/reject control can reach it** — a direct API call (532, 454) or a live UI
+  button (1113) are the same exposure, just reached by different means. **The practical rule this
+  implies, stated plainly so it doesn't need rediscovering a fourth time:** before pointing anyone —
+  human or automated — at a real UI or API surface to verify rendering, chat, or any other read-only
+  behavior, confirm first that any test/diagnostic row visible in that surface is either genuinely
+  safe to have acted on permanently, or already excluded from actionable views (`reports.is_test_fixture`,
+  Task 49 — set *before* the row can ever appear in `list_pending_reviews` or a live report table, not
+  after someone has already looked at it). The "verify against an already-reviewed row" guidance two
+  paragraphs above carries the identical caveat for the same reason: it reads as safe because nothing
+  *looks* clickable-and-dangerous about an already-decided row, and that is exactly what made report
+  454 possible — `approve_report`/`reject_report` never check current `reviewed` state, so an
+  already-reviewed row is not inert, it is just as live as an unreviewed one.
 - **Old pre-Task-40 test-fixture `reports` rows can have a `week_of` far outside any sane calendar
   range** (some from years like 4396 or 9853 — leftovers from the old `_random_week_of()` test
   helper, before `tests/test_human_governance.py` was rewritten around transactional rollback).
@@ -713,3 +736,24 @@ way every prior UI verification in this project has been done), a real token
 this drives real, unmodified app code end to end without needing an interactive sign-in for every
 check. The one thing this cannot substitute for is proving the real interactive cookie-based sign-in
 flow itself works — that needs a real human to complete it at least once.
+
+**That real human sign-in was completed, and it is the reason this section names a real cost, not a
+hypothetical one: two real bugs existed in the deployed Entra configuration that bearer-token injection
+had exercised around for the entire rest of Phase 9 without ever finding.** Both are recorded in full,
+with the platform log evidence for each, in ADR-030 (and the first, `enableIdTokenIssuance`, in that
+same ADR's own lead-in); ADR-025 records the real client secret's own role being independently ruled
+out along the way. The headline finding, worth restating here since it is exactly the risk this
+paragraph's own last sentence was warning about: bearer-token injection authenticates directly against
+the API and drives real, unmodified app code end to end, but it never drives the actual browser
+`/authorize` redirect or the real `/.auth/login/aad/callback` token-exchange callback — the exact place
+both real failures occurred. Neither would have surfaced without a real interactive attempt. The
+successful retry confirmed, live: full cookie-based sign-in through a real MFA challenge, `GET
+/api/v1/me` returning the caller's real role, "Signed in as owner" rendered from that response, and a
+correctly empty project selector matching the signed-in actor's real scope at the time.
+
+**The cold-start screen (`frontend/src/components/AuthGate.tsx`, "Waking up OnePulse") was also
+verified under real conditions on this same attempt, not simulated** — a genuine cold backend, a real
+per-second elapsed counter, and copy that sets the wait expectation against this project's own real,
+measured Phase 7 cold-start number (up to about a minute) rather than a hopeful guess. No fabricated
+percentage bar appeared at any point. This is the honest-cold-start-UX bar item from the original Phase
+9 kickoff, confirmed against a real deployed cold start, not a description of intent.

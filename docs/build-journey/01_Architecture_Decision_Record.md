@@ -911,6 +911,16 @@ second entry at the same weight, not folded into a shorter note, precisely becau
 the ADO PAT is explicitly time-boxed — the two exceptions are not interchangeable instances of "one
 kind of thing," and the document should not read as though they are.
 
+**Verification**: the real interactive sign-in this secret exists to support was completed successfully
+once ADR-030's own separate, sibling fix (a real AAD Graph permission grant) closed the second of two
+independent causes blocking it — a full cookie-based sign-in through a real Microsoft MFA challenge,
+with Easy Auth's own confidential-client token-exchange callback succeeding and setting the real
+session cookie for the deployed origin. This closes the loop this ADR's own Decision left open: the
+secret was never the actual cause of either real failure along the way (ADR-030's own investigation
+independently ruled it out by matching its live-reported `hint` against the real, current value at the
+exact moment of each failing attempt), and the mechanism accepted here as unavoidable is now
+demonstrated, not merely configured, to work end to end on real deployed infrastructure.
+
 **Not chosen**: a certificate-based alternative (real, available, deferred rather than rejected — see
 Reasoning above); reopening ADR-018's own choice of Easy Auth over an application-level token
 validator, which would trade this exception for a different, larger scope of code this project would
@@ -1806,7 +1816,89 @@ admin consent grant confirmed via a direct `oauth2PermissionGrants` read, not as
 command's own silent success: `consentType: AllPrincipals`, `scope: User.Read`, `resourceId:
 f319546b-7678-4f96-b735-223768c8f045` — independently confirmed via `az ad sp show` to be the real AAD
 Graph service principal (`appId: 00000002-0000-0000-c000-000000000000`, `displayName: "Windows Azure
-Active Directory"`), not merely an ID assumed to be correct. The real interactive sign-in re-attempted and
-its result recorded in CLAUDE.md's own phase-status log once the user completes it — this ADR records the
-decision and its reasoning at the moment the grant was made, not a claim that the retry has already
-succeeded.
+Active Directory"`), not merely an ID assumed to be correct.
+
+**The real interactive sign-in was retried after this grant, and succeeded.** Confirmed live, end to
+end: a full browser sign-in through Microsoft's real MFA challenge, completing back at the app with
+`GET /api/v1/me` returning the caller's real resolved role, "Signed in as owner" rendered in the UI
+from that response (not inferred client-side — ADR-018's own no-role-guessing rule), and an empty
+project selector correctly matching this actor's real, current `actor_scope` at the time of the test —
+a genuine empty state, not a bug. A screenshot of the signed-in state is the confirming artifact,
+recorded in CLAUDE.md's own Task 51 entry.
+
+**Worth recording plainly, not left as an incidental detail: this was the third real attempt across
+two sequential, independent fixes** — `enableIdTokenIssuance` (the first failure, fixed before this
+grant) and this AAD Graph grant (the second) — **and neither of the two real bugs would have been
+found by bearer-token injection**, the technique this project relied on throughout Phase 9 to drive
+real UI/app code without a human completing MFA every time (Runbook §9). That technique authenticates
+directly against the API and exercises real, unmodified app code end to end, but it never drives the
+actual browser `/authorize` redirect or the real `/.auth/login/aad/callback` token-exchange step — the
+exact place both failures occurred. A real interactive sign-in was the only thing that could have
+surfaced either one, confirming this was correctly named as the one piece of evidence in this phase
+only a human could produce, not a formality.
+
+---
+
+## ADR-031: Phase 9's visitor-role UI verification deferred — server-side enforcement proven, React's own conditional rendering is not
+
+**Context**: Phase 9's own stated bar required a visitor account "verified as a real second identity,
+not a toggled flag" — precisely because Phase 9 introduces the first UI surface in this project with
+two distinct roles, and everything server-side had already been proven exhaustively in Phase 8: real
+`403`s refusing a visitor-role trigger, RLS enforcement confirmed against a real second tenant, the
+chat retrieval filter proven to withhold content from the model itself rather than merely from the
+response, a SAS download request outside scope refused with a real `404`. What Phase 9 adds beyond
+that proof is a distinct, narrower claim: that the React frontend itself correctly reads role from
+`GET /api/v1/me` and hides the right controls — Generate, Approve, Reject — for a role it has never
+actually received in a real browser session. A real B2B guest invitation was sent (2026-09-12,
+Microsoft Graph `POST /invitations`) and a real `actors`/`actor_scope` row provisioned for a visitor
+scoped to Meridian Health, matching every other real actor in this project's schema exactly.
+Completing the sign-in itself requires a human at a second, genuinely distinct Microsoft/Google-
+federated account; that account turned out not to be usable in this session. The check is deferred
+explicitly, not substituted with anything weaker.
+
+**Decision**: Merge Phase 9 with this one item named as an explicit, open gap, not folded into "Phase
+9 complete." State precisely what is and isn't verified:
+
+- **Verified, real, already proven (Phase 8, re-confirmed by Phase 9's own owner-side testing):** an
+  authenticated visitor-role request is refused a trigger with a real `403`; RLS holds against a real
+  second tenant; the chat retrieval filter withholds cross-tenant content before the model ever sees
+  it, not merely from the returned citations; a SAS download for an out-of-scope report is refused
+  with a real `404`. All of this is exercised via direct HTTP requests carrying either a header-
+  injected identity (Phase 8) or a delegated bearer token (Phase 9's owner-side verification) — none
+  of it depends on, or is weakened by, anything the frontend chooses to render.
+- **Not verified, the real, precisely bounded remaining gap:** whether `frontend/src/`'s own
+  conditional rendering (`ReportTable.tsx`'s and the Generate view's `isOwner`-gated controls)
+  actually receives and correctly branches on a real `role: "visitor"` value from a real `/api/v1/me`
+  response, under a real signed-in visitor session — as opposed to having been exercised, in this
+  project's own testing so far, only under a real owner session, with the visitor branch verified by
+  code inspection alone. **This is explicitly not a security claim.** A mis-rendered control would be
+  a usability defect — a hidden-but-still-refused action, or a visible-but-refused one — never a
+  bypass, since `core_api` enforces every one of the boundaries above regardless of what the UI
+  displays. Small, real, and precisely scoped to rendering correctness, not access control.
+
+**Where the proof lands:** the real B2B guest identity and its `actors`/`actor_scope` rows (Meridian
+Health, `role='visitor'`, `entra_object_id=ac061de2-...`) stay provisioned exactly as they are —
+nothing to set up again. Revisiting this is a sign-in, not a setup: accept the already-sent
+invitation with a usable second account, sign in at the deployed `bff`, and walk the same six-point
+checklist already specified (visitor role rendered, not owner; Generate absent; report history
+scoped to Meridian Health only; Approve/Reject absent on every row; chat scoped to Meridian's own
+corpus; download works for an in-scope report) — once all phases are otherwise complete, per the
+user's own explicit sequencing choice, not before.
+
+**Reasoning — what was not chosen, and why:** substituting a synthetic/local visitor session (e.g.,
+temporarily flipping the existing real owner identity's own `actors.role` between `owner`/`visitor`
+for two sequential passes) was the original approach attempted earlier in Phase 9's own work, and was
+correctly refused by the safety classifier as a direct, elevated-privilege mutation of a real
+identity's access level. That refusal stands here too, for the identical reason — deferring the real
+check honestly is the correct response to that constraint, not re-attempting a smaller version of the
+same mutation to manufacture a result sooner.
+
+**Consequences**: Migration Plan Phase 9's own Definition of Done section (`12_Migration_Plan.md`) is
+amended to state this split directly, the same treatment ADR-024 gave Phase 6's deferred Managed
+Identity proof — a reader arriving at that section later, without this conversation's context, should
+not come away believing Phase 9 proved visitor-role UI rendering; only that it proved everything
+server-side and named this one gap explicitly, with a stated path back to it.
+
+**Not chosen**: a synthetic/local visitor session via role mutation (see Reasoning above); proceeding
+without a visitor-role UI check of any kind and not naming the gap (would have folded a real,
+unverified claim into "Phase 9 complete" — exactly what this ADR exists to prevent).
