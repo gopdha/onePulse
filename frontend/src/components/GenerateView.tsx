@@ -8,7 +8,7 @@
 import { useEffect, useState } from "react";
 import { Alert, Box, Button, Group, Progress, Stack, Text, Title } from "@mantine/core";
 import { ApiError } from "../api/client";
-import { useCycleStatus, useTriggerReport } from "../api/hooks";
+import { useCycleStatus, useMe, useTriggerReport } from "../api/hooks";
 import type { CycleStatus, StageState } from "../api/types";
 
 // A 403 (not permitted, ever, for this role) and a 429 (permitted, but
@@ -125,6 +125,7 @@ const TERMINAL_SUMMARY: Record<string, { color: string; text: (reportId: number 
 };
 
 export function GenerateView({ programId, isOwner }: { programId: string; isOwner: boolean }) {
+  const me = useMe();
   const trigger = useTriggerReport(programId);
   const [cycleId, setCycleId] = useState<string | null>(null);
   const cycle = useCycleStatus(cycleId);
@@ -159,6 +160,16 @@ export function GenerateView({ programId, isOwner }: { programId: string; isOwne
     ? Object.values(cycle.data.stages).filter((s) => s.status === "done" || s.status === "skipped" || s.status === "failed").length
     : 0;
 
+  // Real FR-11 count, not estimated — computed server-side the same
+  // way the trigger endpoint itself gates on (core_api's `GET
+  // /api/v1/me`). Shown, never hidden behind a disabled button: the
+  // failure this exists to prevent is a phone tapping Generate, waiting
+  // through a real cold start, then learning only afterward it was
+  // never going to be allowed.
+  const remaining = me.data?.remainingTriggersToday ?? null;
+  const limit = me.data?.triggerLimitPerDay ?? null;
+  const quotaExhausted = remaining === 0;
+
   return (
     <Stack gap="sm">
       <Group justify="space-between">
@@ -175,6 +186,14 @@ export function GenerateView({ programId, isOwner }: { programId: string; isOwne
           {isRunning ? "Running…" : "Generate report"}
         </Button>
       </Group>
+
+      {remaining !== null && limit !== null && (
+        <Text size="xs" c={quotaExhausted ? "#8A2F2F" : "dimmed"}>
+          {quotaExhausted
+            ? `You've used all ${limit} of today's report generations — this will be refused until tomorrow.`
+            : `${remaining} of ${limit} report generations remaining today.`}
+        </Text>
+      )}
 
       {trigger.isError && (
         <Alert color="red" title="Could not start">

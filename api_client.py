@@ -198,13 +198,17 @@ async def approve_report_via_api(report_id: int, actor_id: str | None) -> dict:
     resolves the real (today, stubbed) identity itself now and forwards
     it to the core API; nothing sent from here is used for that. If the
     BFF's own stubbed identity doesn't resolve to a real `actors` row,
-    the core API returns `401 {"error": "actor_not_found"}`, surfaced
-    here as `ActorIdRequiredError` so `Home.py`'s existing exception
-    handling (unchanged since Phase 1) still catches it correctly.
+    the core API returns `403 {"error": "no_access"}` (Phase 8, ADR-027
+    — corrected from the pre-Phase-8 `401 actor_not_found` this check
+    originally matched; found stale live during Task 54, alongside the
+    real HTTPException-detail-wrapping bug that made the check doubly
+    wrong regardless of which status/code it looked for), surfaced here
+    as `ActorIdRequiredError` so `Home.py`'s existing exception handling
+    (unchanged since Phase 1) still catches it correctly.
     """
     async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0, headers=await _auth_headers()) as client:
         resp = await client.post(f"/api/v1/reviews/{report_id}/approve")
-    if resp.status_code == 401 and resp.json().get("error") == "actor_not_found":
+    if resp.status_code == 403 and resp.json().get("error") == "no_access":
         raise ActorIdRequiredError("the BFF's identity did not resolve to a real actor")
     resp.raise_for_status()
     return resp.json()
@@ -219,7 +223,7 @@ async def reject_report_via_api(report_id: int, actor_id: str | None, notes: str
         resp = await client.post(f"/api/v1/reviews/{report_id}/reject", json={"notes": notes})
     if resp.status_code == 400 and resp.json().get("error") == "notes_required":
         raise NotesRequiredError("notes_required")
-    if resp.status_code == 401 and resp.json().get("error") == "actor_not_found":
+    if resp.status_code == 403 and resp.json().get("error") == "no_access":
         raise ActorIdRequiredError("the BFF's identity did not resolve to a real actor")
     resp.raise_for_status()
     return resp.json()

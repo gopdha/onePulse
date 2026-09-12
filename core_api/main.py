@@ -134,11 +134,19 @@ RATE_LIMIT_TRIGGERS_PER_DAY = int(
 _tracer = trace.get_tracer(__name__)
 
 
-async def _check_rate_limit(conn: asyncpg.Connection, actor_id: str) -> None:
-    count = await conn.fetchval(
+async def _count_recent_triggers(conn: asyncpg.Connection, actor_id: str) -> int:
+    """The one real query FR-11's enforcement and its own status display
+    both need — shared so the number a caller sees before clicking
+    Generate (`GET /api/v1/me`) can never disagree with the number that
+    actually gates the click (`_check_rate_limit`, below)."""
+    return await conn.fetchval(
         "SELECT count(*) FROM cycles WHERE requested_by_actor_id = $1 AND created_at >= now() - interval '24 hours'",
         actor_id,
     )
+
+
+async def _check_rate_limit(conn: asyncpg.Connection, actor_id: str) -> None:
+    count = await _count_recent_triggers(conn, actor_id)
     if count >= RATE_LIMIT_TRIGGERS_PER_DAY:
         raise HTTPException(
             status_code=429,
@@ -361,6 +369,15 @@ class MeResponse(BaseModel):
     role: str
     isOwner: bool
     authorizedProgramIds: list[str]
+    # Real Migration Plan Phase 10 finding (CLAUDE.md Task 54): FR-11's
+    # count already exists server-side on every trigger request — these
+    # two fields surface it, not a new mechanism, computed the same way
+    # `_check_rate_limit` computes it (`_count_recent_triggers`, above),
+    # so the number shown here can never disagree with the number that
+    # actually gates the click. `None` for a visitor, who can't trigger
+    # a run regardless of quota, per `_require_owner`.
+    remainingTriggersToday: int | None = None
+    triggerLimitPerDay: int | None = None
 
 
 class ReportSummary(BaseModel):
@@ -473,6 +490,7 @@ class ChatQueryResponse(BaseModel):
 
 @app.get("/api/v1/me")
 async def get_me(
+    request: Request,
     _token=Depends(verify_service_token),
     current_actor: CurrentActor = Depends(get_current_actor),
 ) -> MeResponse:
@@ -486,11 +504,30 @@ async def get_me(
     usability, not security, and stays true with this route in place:
     every mutating route still runs its own real `_require_owner`/scope
     check server-side regardless of what this response says.
+
+    Migration Plan Phase 10 (CLAUDE.md Task 54): also surfaces FR-11's
+    real remaining-trigger count for an owner, computed via the same
+    `_count_recent_triggers` query `_check_rate_limit` itself uses — one
+    real number, read here and enforced there, never two. Real cost:
+    one extra `SELECT count(*)` on this route, only for an owner (a
+    visitor can never trigger regardless of quota, so it isn't computed
+    for one) — cheap against a `cycles` row count this small, and this
+    route is already a real Postgres round trip for `current_actor`
+    itself.
     """
+    remaining_today: int | None = None
+    limit_per_day: int | None = None
+    if current_actor.is_owner:
+        limit_per_day = RATE_LIMIT_TRIGGERS_PER_DAY
+        async with request.app.state.pg_client.pool.acquire() as conn:
+            used = await _count_recent_triggers(conn, current_actor.actor_id)
+        remaining_today = max(0, limit_per_day - used)
     return MeResponse(
         role=current_actor.role,
         isOwner=current_actor.is_owner,
         authorizedProgramIds=list(current_actor.authorized_program_ids),
+        remainingTriggersToday=remaining_today,
+        triggerLimitPerDay=limit_per_day,
     )
 
 

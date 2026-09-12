@@ -57,6 +57,12 @@ export function useTriggerReport(programId: string) {
     mutationFn: () => apiPost<TriggerResponse>(`/api/v1/programs/${programId}/reports`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["reports", programId] });
+      // A real trigger just consumed one of FR-11's own counted slots —
+      // refetch "me" so the remaining-count display doesn't sit stale
+      // against `useMe`'s own 5-minute staleTime until the next
+      // unrelated remount. A refused (429) attempt never reaches
+      // onSuccess, correctly: nothing was actually consumed.
+      queryClient.invalidateQueries({ queryKey: ["me"] });
     },
   });
 }

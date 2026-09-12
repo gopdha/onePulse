@@ -12,6 +12,11 @@ export interface MeResponse {
   role: string;
   isOwner: boolean;
   authorizedProgramIds: string[];
+  // FR-11's own real count, surfaced not invented (core_api's `GET
+  // /api/v1/me` computes it the same way the trigger endpoint itself
+  // does) — both null for a visitor, who never sees Generate anyway.
+  remainingTriggersToday: number | null;
+  triggerLimitPerDay: number | null;
 }
 
 export interface ProgramItem {
