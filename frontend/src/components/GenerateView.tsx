@@ -8,7 +8,8 @@
 import { useEffect, useState } from "react";
 import { Alert, Box, Button, Group, Progress, Stack, Text, Title } from "@mantine/core";
 import { ApiError } from "../api/client";
-import { useCycleStatus, useMe, useThisWeekStatus, useTriggerReport } from "../api/hooks";
+import { downloadReportOrNotify } from "../api/download";
+import { useCycleStatus, useDownloadReport, useMe, useThisWeekStatus, useTriggerReport } from "../api/hooks";
 import type { CycleStatus, StageState } from "../api/types";
 
 // A 403 (not permitted, ever, for this role) and a 429 (permitted, but
@@ -135,6 +136,7 @@ export function GenerateView({ programId, isOwner }: { programId: string; isOwne
   const thisWeek = useThisWeekStatus(isOwner ? programId : null);
   const [cycleId, setCycleId] = useState<string | null>(null);
   const cycle = useCycleStatus(cycleId);
+  const download = useDownloadReport();
   const [nowMs, setNowMs] = useState(Date.now());
 
   // Real per-second visual tick for the running-stage elapsed timers —
@@ -267,6 +269,27 @@ export function GenerateView({ programId, isOwner }: { programId: string; isOwne
               {summary.text(cycle.data.reportId)}
             </Alert>
           )}
+          {(status === "persisted" || status === "persisted_route_to_human_review") &&
+            cycle.data.reportId !== null && (
+              // Task 57: a forced run's own report is correctly excluded
+              // from the table below (is_test_fixture) — that's the
+              // constraint working as designed, not a gap — but it left
+              // the report this exact run just produced unreachable from
+              // anywhere. The completed cycle already carries its own
+              // real reportId (confirmed live, GET /api/v1/cycles/{id}),
+              // so this needs no new data, only a control that reads it —
+              // shown for every completed run, not only forced ones,
+              // since "download what I just generated" is a real,
+              // independent convenience over finding it in the table.
+              <Button
+                size="xs"
+                variant="light"
+                loading={download.isPending}
+                onClick={() => downloadReportOrNotify(cycle.data!.reportId!, download.mutateAsync)}
+              >
+                Download this report
+              </Button>
+            )}
           {status === "failed" && cycle.data.errorDetail && (
             <Text size="xs" c="dimmed" ff="monospace">
               {cycle.data.errorDetail}
