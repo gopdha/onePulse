@@ -40,6 +40,8 @@ This index maps the **original design documents** (created early in the project 
 | "What's done, and what's still open — a full status ledger, task by task?" | Project Plan (Updated) — every task across both the original Build Plan and the Migration Plan, each marked Done/Open/Partial as verified |
 | "For anything that's still open, what do I actually need to do about it?" | Deferred Items and Open Follow-Ups — not a second status list; it names a concrete next step for each open item the Project Plan marks as anything other than Done |
 | "What does this system actually look like right now — services, data flow, deployment?" | Current-State Architecture |
+| "I want to actually learn this codebase — what's in each module, and how does a request/a trigger flow through it?" | Code Map — module-by-module, with the two real request paths traced file by file, and what's vestigial/overlapping/hard to understand flagged plainly |
+| "What design patterns does this codebase actually use, and where?" | Pattern Inventory — real file/function citations only, including where a pattern is used inconsistently or was deliberately not used |
 | "What should I show in a live demo?" | Demo Narrative |
 | "What was the target architecture, and is this actually it now?" | Current-State Architecture — the target (React SPA → FastAPI BFF → core API → Investigation/Reporting workers over a Storage Queue, on Azure Container Apps) was reached as of Migration Phase M11 (2026-09-13); Architecture Decision Record (ADR-014 through ADR-031) for the individual decisions, Migration Plan for how they were sequenced to get there |
 | "Why is the Streamlit UI being replaced?" | ADR-015 — the reasoning (multi-user auth, a durable execution boundary, escaping the rerun model) and its direct amendment of ADR-010, which had deferred Azure Static Web Apps as Next-scope work that (per ADR-015) was never actually viable for Streamlit in the first place |
@@ -47,4 +49,4 @@ This index maps the **original design documents** (created early in the project 
 
 ---
 
-*This index will itself go stale the moment something else changes. Treat it as a snapshot, not a live document. Last brought current 2026-09-13 (Migration Plan Phase 11 — Streamlit retired, the React frontend and four-service backend are current), against ADR-001 through ADR-031, Trade-offs Log entries 1-21, and the Migration Plan.*
+*This index will itself go stale the moment something else changes. Treat it as a snapshot, not a live document. Last brought current 2026-09-13 (Migration Plan Phase 11 — Streamlit retired, the React frontend and four-service backend are current; the Project Plan brought current across both the original Build Plan and the Migration Plan; the Code Map and Pattern Inventory added as learning references, verified directly against the code the same day), against ADR-001 through ADR-031, Trade-offs Log entries 1-21, and the Migration Plan.*
