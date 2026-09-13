@@ -20,7 +20,7 @@ This index maps the **original design documents** (created early in the project 
 | **High-Level Design (HLD)** | Section 3's revision-cap decision logic (approved / route_to_human_review / hard_stop_defect) — this logic is unchanged and has been proven live in all three branches | The *framework* executing this logic changed twice — see ADR-001, ADR-002 |
 | **Low-Level Design (LLD)** | Most schema intent; §10.2's server-side scope-resolution requirement for the Chat Assistant | Real schema deviates in specific, tested ways — see Data Model & Schema Reference for the exact diff. §10.2's endpoint contract is not yet implemented but is not new design work either — ADR-015/022 point back to it as the real spec for the endpoints the migration builds |
 | **DevOps Setup** | CI/CD gate philosophy | Actual bootstrap sequence differed in real, documented ways (see Challenges doc — the ADO identity saga, the Postgres role bootstrap) |
-| **Build Plan** | 8-phase structure, Now/Next scoping discipline | Real completion state is far along — see Project Plan (Updated) for current status per phase. A **second**, later-scope phase sequence now exists on top of it — the Migration Plan (React/FastAPI/Container Apps/microservices) — governed by ADR-014 through ADR-022 and not yet started |
+| **Build Plan** | 8-phase structure, Now/Next scoping discipline | See Project Plan (Updated) for current per-phase status. A **second**, later-scope phase sequence was layered on top of it — the Migration Plan (React/FastAPI/Container Apps/microservices), governed by ADR-015 through ADR-031 — and, as of 2026-09-13, has itself run to completion (Phases M0–M11); Project Plan (Updated) carries both sequences side by side |
 | **Product Discovery & Adoption Plan** | Not materially affected | — |
 | **Technical Assessment (pptx)** | Original POC framing | Superseded in spirit by the actual built system — see Demo Narrative for the current story |
 
@@ -37,12 +37,13 @@ This index maps the **original design documents** (created early in the project 
 | "What trade-offs did you knowingly accept?" | Trade-offs Log — entries 5, 6, and 12 are now superseded/resolved by the migration architecture (ADR-015/016, the Migration Plan, and ADR-021 respectively); see the log for the replacement trade-offs (15-21) each one bought |
 | "How do I actually run this system?" | Runbook |
 | "What security/governance guarantees are actually proven, not just designed?" | Governance & Security Reference |
-| "What's actually done vs. still open, today, in the running system?" | Deferred Items and Open Follow-Ups (the consolidated, current list) — Project Plan (Updated) is a historical, pre-migration snapshot, now superseded for this question |
+| "What's done, and what's still open — a full status ledger, task by task?" | Project Plan (Updated) — every task across both the original Build Plan and the Migration Plan, each marked Done/Open/Partial as verified |
+| "For anything that's still open, what do I actually need to do about it?" | Deferred Items and Open Follow-Ups — not a second status list; it names a concrete next step for each open item the Project Plan marks as anything other than Done |
+| "What does this system actually look like right now — services, data flow, deployment?" | Current-State Architecture |
 | "What should I show in a live demo?" | Demo Narrative |
-| "What is the target architecture — what is this system supposed to become?" | Architecture Decision Record (ADR-014 through ADR-022) for the individual decisions; Migration Plan for how they compose into one coherent target (React SPA → FastAPI BFF → core API → Investigation/Reporting workers over a Storage Queue, on Azure Container Apps) |
+| "What was the target architecture, and is this actually it now?" | Current-State Architecture — the target (React SPA → FastAPI BFF → core API → Investigation/Reporting workers over a Storage Queue, on Azure Container Apps) was reached as of Migration Phase M11 (2026-09-13); Architecture Decision Record (ADR-014 through ADR-031) for the individual decisions, Migration Plan for how they were sequenced to get there |
 | "Why is the Streamlit UI being replaced?" | ADR-015 — the reasoning (multi-user auth, a durable execution boundary, escaping the rerun model) and its direct amendment of ADR-010, which had deferred Azure Static Web Apps as Next-scope work that (per ADR-015) was never actually viable for Streamlit in the first place |
-| "What's the real migration sequence, and what has to be true before public ingress opens?" | Migration Plan — phased, each phase with a real Definition of Done; no public ingress until reviewer identity is real (Phase 8) |
-| "What's left, scattered across a lot of task entries and ADRs, that someone picking this up should know about?" | Deferred Items and Open Follow-Ups — one place, each item with its current state and a concrete next step |
+| "What was the real migration sequence, and what had to be true before public ingress opened?" | Migration Plan — phased, each phase with a real Definition of Done; public ingress opened only once reviewer identity was real (Phase M8, 2026-09-11) |
 
 ---
 
