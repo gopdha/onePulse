@@ -8,7 +8,7 @@
 import { useEffect, useState } from "react";
 import { Alert, Box, Button, Group, Progress, Stack, Text, Title } from "@mantine/core";
 import { ApiError } from "../api/client";
-import { useCycleStatus, useMe, useTriggerReport } from "../api/hooks";
+import { useCycleStatus, useMe, useThisWeekStatus, useTriggerReport } from "../api/hooks";
 import type { CycleStatus, StageState } from "../api/types";
 
 // A 403 (not permitted, ever, for this role) and a 429 (permitted, but
@@ -127,6 +127,12 @@ const TERMINAL_SUMMARY: Record<string, { color: string; text: (reportId: number 
 export function GenerateView({ programId, isOwner }: { programId: string; isOwner: boolean }) {
   const me = useMe();
   const trigger = useTriggerReport(programId);
+  // Task 56: real, before-the-click legibility for the real weekly
+  // collision — no more waiting through a full ~4-minute run only to
+  // learn afterward that nothing was going to persist. Not fetched for
+  // a visitor (`isOwner` false) — this component's own visitor branch
+  // never renders the banner that would use it.
+  const thisWeek = useThisWeekStatus(isOwner ? programId : null);
   const [cycleId, setCycleId] = useState<string | null>(null);
   const cycle = useCycleStatus(cycleId);
   const [nowMs, setNowMs] = useState(Date.now());
@@ -170,22 +176,57 @@ export function GenerateView({ programId, isOwner }: { programId: string; isOwne
   const limit = me.data?.triggerLimitPerDay ?? null;
   const quotaExhausted = remaining === 0;
 
+  // Task 56: the real collision, known before the click — the same
+  // fact an ordinary trigger would otherwise only surface after a full
+  // real run ends in `not_persisted_already_exists`.
+  const existingReportId = thisWeek.data?.existingReportId ?? null;
+
   return (
     <Stack gap="sm">
       <Group justify="space-between">
         <Title order={5}>Generate Status Report</Title>
         <Button
           size="sm"
-          loading={trigger.isPending}
+          loading={trigger.isPending && trigger.variables !== true}
           disabled={isRunning}
           onClick={async () => {
-            const result = await trigger.mutateAsync();
+            const result = await trigger.mutateAsync(false);
             setCycleId(result.cycleId);
           }}
         >
           {isRunning ? "Running…" : "Generate report"}
         </Button>
       </Group>
+
+      {existingReportId !== null && (
+        <Alert color="blue" title={`A report already exists for this program this week (#${existingReportId})`}>
+          <Stack gap={6}>
+            <Text size="sm">
+              An ordinary Generate will run the full pipeline and then correctly report "not
+              persisted" — the real weekly guarantee working as designed, not a bug. To get a fresh
+              report for this week anyway, use a forced test run instead.
+            </Text>
+            <Text size="xs" c="dimmed">
+              A forced run creates a real report marked as a test — it will not appear in Previous
+              Status Reports, search, or approval, and it won't count as a real weekly report for
+              this program. It's for verifying the pipeline itself, not for real review.
+            </Text>
+            <Button
+              size="xs"
+              variant="light"
+              color="blue"
+              loading={trigger.isPending && trigger.variables === true}
+              disabled={isRunning}
+              onClick={async () => {
+                const result = await trigger.mutateAsync(true);
+                setCycleId(result.cycleId);
+              }}
+            >
+              Force a test run instead
+            </Button>
+          </Stack>
+        </Alert>
+      )}
 
       {remaining !== null && limit !== null && (
         <Text size="xs" c={quotaExhausted ? "#8A2F2F" : "dimmed"}>

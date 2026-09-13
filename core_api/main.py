@@ -47,6 +47,7 @@ Run: uvicorn core_api.main:app --port 8000 (from the repo root).
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -86,6 +87,7 @@ from onepulse_common.human_governance import (
 )
 from onepulse_common.observability import ARIZE_PROJECT_NAME, enable_observability
 from onepulse_common.pipeline import list_recent_reports
+from onepulse_common.report_rendering import week_of as monday_of_week
 from onepulse_common.search_index import build_search_client
 from trace_debug import enable_debug_span_log
 
@@ -431,6 +433,11 @@ class TriggerResponse(BaseModel):
     status: str
 
 
+class ThisWeekStatus(BaseModel):
+    weekOf: str
+    existingReportId: int | None
+
+
 class DownloadResponse(BaseModel):
     downloadUrl: str
     expiresInMinutes: int
@@ -552,6 +559,42 @@ async def list_programs(
             list(current_actor.authorized_program_ids),
         )
     return [ProgramItem(programId=str(r["program_id"]), name=r["name"]) for r in rows]
+
+
+@app.get("/api/v1/programs/{program_id}/reports/this-week")
+async def get_this_week_status(
+    request: Request,
+    program_id: str,
+    _token=Depends(verify_service_token),
+    current_actor: CurrentActor = Depends(get_current_actor),
+) -> ThisWeekStatus:
+    """Migration Plan Phase 10 (CLAUDE.md Task 56): makes the real weekly
+    collision legible *before* a click, not after a full ~4-minute run
+    ends in `not_persisted_already_exists`. Computes the real week bucket
+    with the identical `report_rendering.week_of()` helper
+    `run_pipeline_cycle`/`persist_report` themselves use — the frontend
+    must never reimplement Monday-of-week bucketing itself, which would
+    risk disagreeing with the server over a timezone or a day-boundary
+    edge case, undermining the entire point of asking here first. Scoped
+    to program membership only (`_require_program_in_scope`), not
+    `_require_owner` — this is a real read, not a mutation, and a
+    visitor could legitimately want to know a report already exists for
+    this week even though only an owner can act on it.
+
+    Deliberately excludes `is_test_fixture` rows from the check (the
+    real partial unique index, migration 0014, does the same) — a
+    forced/test row for this week does not mean a real one exists, and
+    must not be reported as if it does.
+    """
+    _require_program_in_scope(current_actor, program_id)
+    real_week_of = monday_of_week(dt.date.today())
+    async with request.app.state.pg_client.pool.acquire() as conn:
+        existing_report_id = await conn.fetchval(
+            "SELECT report_id FROM reports WHERE program_id = $1 AND week_of = $2 AND NOT is_test_fixture",
+            program_id,
+            real_week_of,
+        )
+    return ThisWeekStatus(weekOf=real_week_of.isoformat(), existingReportId=existing_report_id)
 
 
 @app.post("/api/v1/programs/{program_id}/reports", status_code=202)

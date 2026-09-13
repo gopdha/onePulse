@@ -75,6 +75,15 @@ export interface TriggerResponse {
   status: string;
 }
 
+// Task 56: the real pre-click collision check, computed server-side
+// with the identical week-bucketing helper the pipeline itself uses —
+// never reimplemented here, to avoid disagreeing with the server over
+// a timezone/day-boundary edge case.
+export interface ThisWeekStatus {
+  weekOf: string;
+  existingReportId: number | null;
+}
+
 export interface DownloadResponse {
   downloadUrl: string;
   expiresInMinutes: number;

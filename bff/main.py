@@ -223,6 +223,16 @@ async def list_programs(request: Request) -> Response:
     return _proxy_response(resp)
 
 
+@app.get("/api/v1/programs/{program_id}/reports/this-week")
+async def get_this_week_status(request: Request, program_id: str) -> Response:
+    """Task 56: proxies the real pre-click collision check."""
+    headers = await _core_headers(request)
+    resp = await request.app.state.http_client.get(
+        f"/api/v1/programs/{program_id}/reports/this-week", headers=headers
+    )
+    return _proxy_response(resp)
+
+
 @app.post("/api/v1/programs/{program_id}/reports")
 async def trigger_report(request: Request, program_id: str, force: bool = False) -> Response:
     """Migration Plan Phase 3: proxies the real trigger endpoint. No

@@ -11,6 +11,7 @@ import type {
   ProgramItem,
   ReportDetailResponse,
   ReportSummary,
+  ThisWeekStatus,
   TriggerResponse,
 } from "./types";
 
@@ -53,8 +54,13 @@ export function useReportDetail(reportId: number | null) {
 
 export function useTriggerReport(programId: string) {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: () => apiPost<TriggerResponse>(`/api/v1/programs/${programId}/reports`),
+  // Task 56: explicit generics — inference alone left `variables` typed
+  // as `void` because the mutation fn's own `force = false` default
+  // made a bare `mutateAsync()` (no argument) look valid, which
+  // widened the inferred parameter type away from `boolean`.
+  return useMutation<TriggerResponse, Error, boolean>({
+    mutationFn: (force) =>
+      apiPost<TriggerResponse>(`/api/v1/programs/${programId}/reports?force=${force}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["reports", programId] });
       // A real trigger just consumed one of FR-11's own counted slots —
@@ -63,7 +69,16 @@ export function useTriggerReport(programId: string) {
       // unrelated remount. A refused (429) attempt never reaches
       // onSuccess, correctly: nothing was actually consumed.
       queryClient.invalidateQueries({ queryKey: ["me"] });
+      queryClient.invalidateQueries({ queryKey: ["this-week", programId] });
     },
+  });
+}
+
+export function useThisWeekStatus(programId: string | null) {
+  return useQuery({
+    queryKey: ["this-week", programId],
+    queryFn: () => apiGet<ThisWeekStatus>(`/api/v1/programs/${programId}/reports/this-week`),
+    enabled: programId !== null,
   });
 }
 
