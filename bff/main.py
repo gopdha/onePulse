@@ -202,10 +202,9 @@ def _proxy_response(upstream: httpx.Response) -> Response:
 
 
 # ---------------------------------------------------------------------
-# Routes — identical real paths and response shapes to core_api/main.py
-# (Streamlit's own api_client.py needs no change beyond which base URL
-# it targets). Every one forwards a real service token + the real
-# (stubbed) identity; none of them touch a data store directly.
+# Routes — identical real paths and response shapes to core_api/main.py.
+# Every one forwards a real service token + the real (Easy-Auth-derived)
+# identity; none of them touch a data store directly.
 # ---------------------------------------------------------------------
 
 

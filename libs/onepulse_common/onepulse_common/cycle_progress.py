@@ -10,18 +10,18 @@ UI file because the UI was, until now, the only process ever calling
 `run_pipeline_cycle`. Now the worker is, and it needs the identical
 curation to build the `stages` JSONB it persists to the real `cycles`
 status table — one real implementation, not two that could drift.
-Streamlit's own rendering (`_render_stage_ui` in `Home.py` — HTML,
-color, icons) stays presentation-only and now reads this exact
-structure back from the database via polling instead of building it
-live in-process.
+The UI's own rendering (originally `_render_stage_ui` in Streamlit's
+`Home.py`, now `GenerateView.tsx` in the React frontend, Migration Plan
+Phase 9) stays presentation-only and reads this exact structure back
+from the database via polling instead of building it live in-process.
 
 Real, necessary change from the original in-process version: every
 timestamp here is real wall-clock (`time.time()`), not
 `time.monotonic()`. Monotonic time is only meaningful within one
 process's own lifetime and cannot be serialized to JSON and read back
 by a different process later — which is exactly what happens now: the
-worker writes these timestamps, and Streamlit (a different process)
-reads them back over HTTP.
+worker writes these timestamps, and the UI (a different process,
+reached over HTTP) reads them back.
 """
 
 from __future__ import annotations

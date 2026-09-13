@@ -351,9 +351,20 @@ leaves same-origin serving as the only architecture that works here, not the bet
 > need a fresh trigger to close — a real report already exists from desktop testing; downloading
 > that one through the phone's own browser action is sufficient and avoids spending any more of
 > FR-11's rate-limited quota than necessary.
+>
+> **Closed 2026-09-13.** A real forced run, triggered from the browser (the "Force a test run
+> instead" control wired in Task 56), completed end to end and was downloaded through the browser's
+> own action via the "Download this report" button (Task 57) — no `curl`, no manual `week_of`
+> backdating. Real evidence, confirmed by direct query: `report_id=1226`, `force=TRUE`,
+> `is_test_fixture=TRUE`, `status='persisted'`, `rendered_artifact_uri='blob://reports/Agentic AI
+> Observability Platform/Agentic AI Observability Platform_2026-09-13.pptx'`, created 2026-09-13
+> 04:58:11 UTC — the most recent forced cycle on record, immediately following Task 57's own deploy
+> of the download button. This is the literal action the DoD's second clause names; Task 53 had
+> already closed the device clause (the phone sign-in). **Phase 10 is complete.**
 
 **Definition of Done**: a real end-to-end run triggered from a browser on a device that is not the
-development machine, including a successful report download.
+development machine, including a successful report download. **— Met, both clauses, as of
+2026-09-13 (see above).**
 
 ---
 
@@ -365,8 +376,69 @@ development machine, including a successful report download.
 - Trade-offs Log: entries 5, 6, 12 resolved or superseded; 15–21 added
 - Build a `reindex` command alongside `migrate.py` and `verify_migration.py` (ADR-022)
 
+> **Done 2026-09-13.** `Home.py`, `api_client.py`, `streamlit_app_common.py`, and `.streamlit/`
+> deleted outright (in git history if ever needed — kept dormant would have meant a second, silently
+> drifting frontend, and it already had drifted once: `api_client.py`'s own error-shape checks sat
+> broken against Phase 8's renamed `403 no_access` response for two full tasks before anyone noticed,
+> exactly the risk of keeping code around that nothing exercises). The `streamlit` dependency and its
+> `[ui]` extra removed from `libs/onepulse_common/pyproject.toml` entirely — nothing remaining in the
+> codebase needs it. `onepulse_common` and `scripts/run_pipeline.py` untouched, confirmed by full
+> suite: **153/153 passing**, unchanged.
+>
+> **Trade-offs Log entries 5, 6, and 12 were already marked resolved/superseded** (Phase 3/Migration
+> Plan work done ahead of this phase in the plan's own sequence) — checked directly, not re-done.
+>
+> **The `reindex` command was also already built** (Task 50/ADR-029, ahead of this phase) — checked,
+> not re-implemented. Two real gaps found live while confirming it still works, neither invented.
+> First: the corpus had grown to 1,422 documents since its last run, crossing the prune step's
+> original 1,000-document single-page listing cap — it correctly, loudly refused rather than
+> computing a wrong deletion set, exactly the failure mode it was designed to guard against. Fixed
+> with real `$skip`/`$top` pagination, ordered by the already-sortable `report_id` field (`id`
+> itself isn't marked sortable, and Azure AI Search can't add that without a full rebuild — not
+> chased for a pagination convenience alone). Second, hit immediately after: `onepulse-search-dev`
+> is Free tier (a hard 50MB cap), and a full, unscoped re-upload of the real corpus genuinely failed
+> with `Storage quota has been exceeded` — real growth plus internal overhead from several earlier
+> ingest attempts had pushed usage to ~58.6MB. The real, working recovery: running the prune step
+> alone (deletes only) reclaimed ~34MB by removing 5 genuinely stale documents; a second full
+> unscoped re-upload attempt *still* failed identically even with real headroom confirmed, showing
+> the constraint is the size of a single write, not the corpus's steady-state footprint. The real
+> fix was scoping the upload to just the one report Postgres showed as missing
+> (`--report-ids 1172`) — succeeded cleanly, and a final direct comparison confirmed the index
+> exactly matches Postgres: 1,422 documents, zero missing, zero stale. See Runbook §6 for the full
+> account, including the new operational rule (prefer `--report-ids` for routine re-indexing; check
+> real headroom before an unscoped run).
+>
+> **Current-State Architecture rewritten in full**, not only §1/§6 as originally scoped — the
+> strengthened bar below ("no section... still describes the local Streamlit architecture as
+> current") reached further than those two sections once checked directly: §4 (observability) still
+> described `@st.cache_resource`, §5/§7 needed the real post-migration facts folded in. New §2
+> (Service Topology) and §8 (Deployment) added to describe what didn't exist when this document was
+> first written.
+>
+> **Runbook updated**: §1's ADO PAT description was already current (Phase 6 rewrote it for Key
+> Vault); §2's "Via the UI" section rewritten for the real React/`bff` same-origin flow, replacing
+> `streamlit run Home.py`; §7/§9's own "reach it as Streamlit" instructions corrected to the real
+> current caller; the stale RAG-index gotcha in §6 replaced with the real pagination finding above.
+>
+> **Consolidated `11_Deferred_Items_and_Open_Follow_Ups.md` created** — every open item named across
+> CLAUDE.md task entries, ADRs, and the Trade-offs Log gathered into one place, each with its current
+> state and a concrete next step, cross-referenced from the Documentation Index. This is the intended
+> first read for anyone picking this project back up.
+>
+> **One real, live design question answered, not silently left as a side effect:** a forced test
+> report is reachable only within the browser session that created it (its `cycleId` lives in React
+> component state; the report itself is permanently excluded from the report table). Recommendation
+> given, not yet implemented: accept this rather than building a second visibility mechanism, but
+> disclose it plainly in the existing pre-click banner rather than leaving it a silent gap — see
+> `11_Deferred_Items_and_Open_Follow_Ups.md`.
+>
+> **Deployed environment confirmed still working from merged `main`** — no backend code changed this
+> phase (frontend/Streamlit-adjacent files and documentation only), so no redeploy was required; the
+> real forced-run-and-download evidence closing Phase 10 (report 1226, 2026-09-13) and this phase's
+> own live reindex run are both against the same already-deployed services.
+
 **Definition of Done**: no section of the documentation set still describes the local-only
-architecture as current.
+architecture as current. **— Met, 2026-09-13.**
 
 ---
 

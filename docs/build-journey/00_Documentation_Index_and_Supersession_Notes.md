@@ -37,12 +37,13 @@ This index maps the **original design documents** (created early in the project 
 | "What trade-offs did you knowingly accept?" | Trade-offs Log — entries 5, 6, and 12 are now superseded/resolved by the migration architecture (ADR-015/016, the Migration Plan, and ADR-021 respectively); see the log for the replacement trade-offs (15-21) each one bought |
 | "How do I actually run this system?" | Runbook |
 | "What security/governance guarantees are actually proven, not just designed?" | Governance & Security Reference |
-| "What's actually done vs. still open, today, in the running system?" | Project Plan (Updated) |
+| "What's actually done vs. still open, today, in the running system?" | Deferred Items and Open Follow-Ups (the consolidated, current list) — Project Plan (Updated) is a historical, pre-migration snapshot, now superseded for this question |
 | "What should I show in a live demo?" | Demo Narrative |
 | "What is the target architecture — what is this system supposed to become?" | Architecture Decision Record (ADR-014 through ADR-022) for the individual decisions; Migration Plan for how they compose into one coherent target (React SPA → FastAPI BFF → core API → Investigation/Reporting workers over a Storage Queue, on Azure Container Apps) |
 | "Why is the Streamlit UI being replaced?" | ADR-015 — the reasoning (multi-user auth, a durable execution boundary, escaping the rerun model) and its direct amendment of ADR-010, which had deferred Azure Static Web Apps as Next-scope work that (per ADR-015) was never actually viable for Streamlit in the first place |
 | "What's the real migration sequence, and what has to be true before public ingress opens?" | Migration Plan — phased, each phase with a real Definition of Done; no public ingress until reviewer identity is real (Phase 8) |
+| "What's left, scattered across a lot of task entries and ADRs, that someone picking this up should know about?" | Deferred Items and Open Follow-Ups — one place, each item with its current state and a concrete next step |
 
 ---
 
-*This index will itself go stale the moment something else changes. Treat it as a snapshot, not a live document. Last brought current 2026-09-09, against ADR-001 through ADR-022, Trade-offs Log entries 1-21, and the Migration Plan.*
+*This index will itself go stale the moment something else changes. Treat it as a snapshot, not a live document. Last brought current 2026-09-13 (Migration Plan Phase 11 — Streamlit retired, the React frontend and four-service backend are current), against ADR-001 through ADR-031, Trade-offs Log entries 1-21, and the Migration Plan.*

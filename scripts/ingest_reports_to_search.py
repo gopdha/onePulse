@@ -29,6 +29,27 @@ actually hold: it computes the real, full set of document IDs Postgres
 says should exist and deletes anything in the index that isn't in it.
 
 Run: python scripts/ingest_reports_to_search.py --target dev
+
+Real, live-hit operational constraint (Migration Plan Phase 11, 2026-09-13):
+`onepulse-search-dev` is Free tier — a hard 50MB total storage cap, no
+usage-based scaling. "Idempotent" above is true for correctness (the same
+content re-uploaded produces the same documents), but NOT free: a full,
+unscoped re-upload of the entire real corpus was observed live to push
+storage from ~27MB back over the 50MB cap and fail with a genuine
+`Storage quota has been exceeded` error, even though the resulting
+document count and content were unchanged from before the attempt —
+most likely Azure AI Search's own merge-write path holds both the old
+and new version of a touched document until a background segment merge
+reclaims the space, so a full re-upload transiently costs close to
+double the touched documents' real footprint. **The real, working
+recovery, live-confirmed:** `prune_stale_documents` alone (deletes only,
+no upload) reclaimed ~34MB by removing 5 genuinely stale documents,
+without ever needing to re-upload anything — and a real, minimal fix
+only needs `--report-ids <the specific new/changed report_id(s)>`, not
+an unscoped run, to add new content afterward. Prefer that scoping for
+routine re-indexing; reserve the unscoped default for when you actually
+need a full reconciliation and have confirmed real headroom first
+(`SearchIndexClient.get_service_statistics()`).
 """
 
 from __future__ import annotations
@@ -59,23 +80,31 @@ from onepulse_common.search_index import build_index_client, build_index_definit
 EMBEDDING_BATCH_SIZE = 16
 EMBEDDING_RETRY_SECONDS = 60
 
-# The real, documented Azure AI Search per-request $top cap. A single
-# search_text="*" listing call is only a complete enumeration of the
-# index below this — at or beyond it, some real documents are silently
-# missing from the page, and computing a prune set from that partial
-# list risks deleting documents that are still genuinely valid (they
-# just didn't fit on the page). See `prune_stale_documents`.
+# The real, documented Azure AI Search per-request $top cap — a single
+# page. Pruning now pages through the full index (see
+# `_list_all_index_ids`) rather than treating this as a hard ceiling on
+# corpus size; it's the page size, not the limit.
 MAX_INDEX_LISTING_PAGE = 1000
+
+# The real, documented Azure AI Search ceiling on $skip + $top combined
+# (100,000) — beyond this, skip-based pagination itself is no longer a
+# valid enumeration strategy and a keyset (orderby a stable field,
+# filter past the last-seen value) would be needed instead. Real,
+# deliberately deferred: this project's actual corpus (low thousands of
+# documents, confirmed live 2026-09-13 when the per-page cap above was
+# first genuinely crossed) is nowhere near it.
+MAX_SKIP_PLUS_TOP = 100_000
 
 
 class IndexListingTooLargeError(RuntimeError):
-    """Raised when the real index has grown to (or past) Azure AI
-    Search's own per-request $top cap — pruning refuses to proceed
-    against a listing that can no longer be trusted to be complete,
-    rather than silently computing a wrong (over-broad) deletion set.
-    Real pagination ($skip, or an orderby-based keyset) needs to be
-    added deliberately once the real corpus actually reaches this —
-    not guessed at in advance for a scale this project isn't at.
+    """Raised when the real index has grown enough that even paged
+    $skip/$top enumeration can no longer reach every document (the real
+    Azure AI Search 100,000 skip+top ceiling) — pruning refuses to
+    proceed against a listing that can no longer be trusted to be
+    complete, rather than silently computing a wrong (over-broad)
+    deletion set. A keyset-based enumeration would need to be added
+    deliberately once the real corpus actually reaches this — not
+    guessed at in advance for a scale this project isn't at.
     """
 
 load_dotenv()
@@ -181,6 +210,52 @@ async def fetch_real_document_ids(conn) -> set[str]:
     }
 
 
+async def _list_all_index_ids(search_client) -> list[str]:
+    """Enumerates every document ID currently in the real index via
+    real $skip/$top pagination — not a single, silently-partial
+    `top=MAX_INDEX_LISTING_PAGE` call, which is only a complete listing
+    below that page size. Real, live-hit case (Task 50 follow-up,
+    2026-09-13): this project's own corpus crossed exactly this cap on
+    its first full reindex after Migration Plan Phase 1's scope change,
+    when it was still a single, unpaginated call.
+
+    Real, live-discovered constraint: the real `id` key field is not
+    marked `sortable` (confirmed live — `order_by=["id asc"]` was
+    rejected with "'id' is not a sortable field"), and Azure AI Search
+    does not support adding `sortable` to an existing field without a
+    full index rebuild (the "deferred alias-based rebuild" ADR-029
+    already names for exactly this class of schema change) — not
+    justified here for a pagination convenience alone. `report_id` is
+    already real, sortable field; ordering by it is sufficient for a
+    correct, non-overlapping listing during this script's own
+    single-pass, read-after-upload run (no concurrent index writes are
+    happening while this listing executes), even though it does not
+    uniquely order a report chunk against its own finding chunks.
+    """
+    all_ids: list[str] = []
+    skip = 0
+    while True:
+        if skip + MAX_INDEX_LISTING_PAGE > MAX_SKIP_PLUS_TOP:
+            raise IndexListingTooLargeError(
+                f"Index listing has reached {skip} documents with more remaining — the next page "
+                f"would exceed Azure AI Search's real {MAX_SKIP_PLUS_TOP} skip+top ceiling. "
+                "Refusing to prune against a listing that can no longer be trusted to be complete."
+            )
+        results = await search_client.search(
+            search_text="*",
+            top=MAX_INDEX_LISTING_PAGE,
+            skip=skip,
+            order_by=["report_id asc"],
+            select=["id"],
+        )
+        page = [doc["id"] async for doc in results]
+        all_ids.extend(page)
+        if len(page) < MAX_INDEX_LISTING_PAGE:
+            break
+        skip += MAX_INDEX_LISTING_PAGE
+    return all_ids
+
+
 async def prune_stale_documents(search_client, real_ids: set[str]) -> int:
     """Deletes every document in the real index that the real, current
     Postgres state no longer accounts for. This is the property that
@@ -188,15 +263,7 @@ async def prune_stale_documents(search_client, real_ids: set[str]) -> int:
     means reconcilable back to the source of truth, not just
     rebuildable-in-principle by adding whatever's missing.
     """
-    results = await search_client.search(search_text="*", top=MAX_INDEX_LISTING_PAGE, select=["id"])
-    index_ids = [doc["id"] async for doc in results]
-    if len(index_ids) >= MAX_INDEX_LISTING_PAGE:
-        raise IndexListingTooLargeError(
-            f"Index listing returned {len(index_ids)} documents, at or beyond the real "
-            f"{MAX_INDEX_LISTING_PAGE}-document Azure AI Search per-request cap — refusing to prune "
-            "against a listing that can no longer be trusted to be complete."
-        )
-
+    index_ids = await _list_all_index_ids(search_client)
     stale_ids = set(index_ids) - real_ids
     if not stale_ids:
         print("Prune: no stale documents found — index already matches Postgres.")

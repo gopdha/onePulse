@@ -75,18 +75,6 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
-# Real, load-bearing separation found at Phase 5 (containerization):
-# streamlit was previously a hard dependency of this shared package, so
-# every one of the four backend service images (none of which import
-# streamlit at all — only Home.py does) paid its real, substantial size
-# cost (streamlit itself plus pandas/numpy/pyarrow/altair/pydeck)
-# unconditionally. Host-side local development installs this extra
-# (`pip install -e libs/onepulse_common[ui]`, or it's already present in
-# an existing venv from before this split — nothing to redo there);
-# every Dockerfile in this project deliberately does not request it.
-ui = [
-    "streamlit>=1.63.0",
-]
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -1,6 +1,14 @@
 # OnePulse — Project Plan (Updated)
 
-This formalizes the live tracker (maintained day-to-day in Google Sheets and `CLAUDE.md`) into a structured document. Status reflects the real, verified state — not aspirational completion.
+This formalizes the live tracker (maintained day-to-day in Google Sheets and `CLAUDE.md`) into a structured document. Status reflects the real, verified state as of when it was last brought current — not aspirational completion.
+
+> **Historical snapshot, superseded for "what's open today" as of Migration Plan Phase 11
+> (2026-09-13).** This document's own phase numbering is the original Build Plan's, predating the
+> Migration Plan (React/FastAPI/Container Apps/microservices) entirely, and its "## UI (Streamlit)"
+> section below describes a client retired in Phase 11 — Streamlit no longer exists in this
+> repository; see Current-State Architecture §6 for the real, current React frontend. For what is
+> genuinely still open right now, see `11_Deferred_Items_and_Open_Follow_Ups.md` — its own "Real,
+> Open Follow-Up Items" section below is not maintained and should not be read as current.
 
 ---
 
@@ -92,7 +100,7 @@ This formalizes the live tracker (maintained day-to-day in Google Sheets and `CL
 | Flush-on-exit bug | Found and fixed |
 | Cosmetic root-span display quirk | Investigated in depth; accepted, non-fatal limitation |
 
-## UI (Streamlit)
+## UI (Streamlit) — historical; retired Migration Plan Phase 11, see the note at the top of this document
 | Task | Status |
 |---|---|
 | Full Ops Console redesign | Done, multiple real bugs found and fixed via live screenshot review |
@@ -102,7 +110,7 @@ This formalizes the live tracker (maintained day-to-day in Google Sheets and `CL
 
 ---
 
-## Real, Open Follow-Up Items
+## Real, Open Follow-Up Items — not maintained; see `11_Deferred_Items_and_Open_Follow_Ups.md` for the current list
 
 | Item | Status |
 |---|---|

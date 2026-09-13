@@ -13,10 +13,14 @@
 # convention) that the PAT is reachable only by that container — the same
 # standard already used for the BFF's no-data-access guarantee.
 #
-# Streamlit is deliberately NOT in this file — see the Runbook for the
-# reasoning (it stays a host process, unaffected by this phase; Phase 9
-# replaces it with a real React frontend rather than ever containerizing
-# it).
+# The frontend is not a separate service here. As of Migration Plan
+# Phase 9, `bff` itself serves the built React bundle same-origin
+# (`bff/Dockerfile` COPYs `frontend/dist`) — build it first with
+# `npm run build` in `frontend/`, then rebuild this image, before
+# expecting a real UI at bff's own port. The retired Streamlit client
+# (Migration Plan Phase 11) was never in this file either, for the same
+# reason it no longer exists at all: it stayed a host process, outside
+# this compose-managed set of services.
 #
 # az login credentials: real Managed Identity is Migration Plan Phase 6
 # work — and Phase 6 (CLAUDE.md Task 45) found, by direct test, that it

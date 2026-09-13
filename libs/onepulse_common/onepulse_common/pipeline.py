@@ -177,8 +177,9 @@ Respond only with JSON matching the required schema: tone_conciseness_pass (true
 
 
 # No-op defaults so every callback parameter below is always callable —
-# callers (CLI, Streamlit) opt in to progress reporting by passing their
-# own, rather than this module ever printing or touching UI state itself.
+# callers (the CLI, `reporting`'s own worker loop) opt in to progress
+# reporting by passing their own, rather than this module ever printing
+# or touching UI state itself.
 async def analyze_status_deck(
     chat_client: FoundryChatClient,
     findings: list[dict],

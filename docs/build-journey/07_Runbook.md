@@ -54,9 +54,19 @@ pipeline — see §6 for the failure signature when it has lapsed.
 (repo root) is the real source of truth for the process shape — not this document.** It defines all
 four service images, their dependency order, env var wiring, and port mapping directly; read it
 rather than looking here for the literal startup sequence, which this Runbook no longer restates.
-Streamlit stays a host process, deliberately not in the compose file — see its own header comment
-for why (still local-first, and Phase 9 replaces it with a real frontend rather than ever
-containerizing it).
+
+**As of Migration Plan Phase 9/11, the UI is the real React frontend, served same-origin by `bff` —
+Streamlit is retired and no longer exists in this repository.** `bff`'s own Dockerfile `COPY`s
+`frontend/dist` at build time; it does not build the frontend itself (no Node stage in a Python
+image for a bundle already built separately). Before the first `docker compose up --build` (and
+after any real frontend change), build it once from the repo root:
+
+```powershell
+cd frontend
+npm install   # first time only
+npm run build
+cd ..
+```
 
 **One-time setup, before the first `docker compose up`:** real Managed Identity is Phase 6 work: for
 now, every container falls back to `DefaultAzureCredential`'s `AzureCliCredential`, same as every
@@ -75,10 +85,13 @@ one-time step — not per-service, and not per-restart.
 
 ```powershell
 docker compose up --build     # core_api, bff, investigation, reporting — in the order the file declares
-streamlit run Home.py         # separate terminal, host process, unchanged
 ```
 
-Select a project from the dropdown (nothing loads until you do), then click Generate Status Report.
+Open `http://localhost:8100` (`bff`'s published port) — the real React SPA, served from the same
+origin as the API it calls. Locally there is no Easy Auth in front of it (that's a real Container
+Apps feature, Migration Plan Phase 7), so `bff`'s own local-dev identity stub applies — see §8 for
+what that means for role/scope. Select a project from the dropdown (nothing loads until you do),
+then click "Generate report".
 
 **What actually happens now, Phase 4 (ADR-019/020):** Reporting claims a queued cycle exactly as in
 Phase 3 (`FOR UPDATE SKIP LOCKED`, unchanged), but instead of calling `investigate()` in-process, it
@@ -396,18 +409,49 @@ Empty output means it's genuinely never been committed.
   and fails with a genuine `CheckViolationError`, not a bug in the code doing the updating. Confirmed
   live during Phase 2 BFF verification (report 489). If a review action 500s with this error, check
   the row's actual `week_of` before assuming the service layer broke.
-- **The RAG index is stale and contains no data for the project this system now tests against.**
-  Confirmed live by direct query against the real Azure AI Search index: 57 total documents, 100%
-  `program_name = 'singleSlide'`, zero for Agentic AI Observability Platform or Leave Tracker —
-  51 report-level + 6 finding-level chunks, report_ids 1 through 51, matching Task 17's own last
-  real `ingest_reports_to_search.py` run exactly and never re-run since (predates AOP being
-  registered as a program at all). Asking the Chat Assistant anything about AOP today will get an
-  honest "not found in any generated report" — correctly, since the index genuinely has nothing to
-  retrieve, not because retrieval is broken. Don't read that as a chat quality problem. The fix is
-  re-running `ingest_reports_to_search.py`, but not yet, and not naively: that script currently has
-  no filter at all and would also pull in the accumulated `test_human_governance.py` fixture rows
-  wholesale — the reindex is planned for a later migration phase (Migration Plan Phase 11 /
-  ADR-022), alongside adding that filter, not as a standalone fix today.
+- **The RAG index's own per-request listing cap ($top=1000) is a real, page-size limit, not a hard
+  ceiling — the corpus crossed it live for the first time on 2026-09-13 (Migration Plan Phase 11).**
+  `scripts/ingest_reports_to_search.py` (the real `reindex` command ADR-022 called for, built in
+  Task 50/ADR-029) originally listed the index in one unpaginated `search_text="*", top=1000` call
+  before pruning — correct while the corpus stayed under that page size, but the real corpus reached
+  1,422 documents (23 report + 1,399 finding chunks) by this task, and the prune step correctly,
+  loudly refused rather than silently computing a wrong deletion set from a partial listing —
+  exactly the failure mode it was designed to guard against, per its own module docstring. Fixed
+  with real `$skip`/`$top` pagination (`_list_all_index_ids`), ordered by the already-sortable
+  `report_id` field (`id`, the real key field, is not marked `sortable` and Azure AI Search cannot
+  add that attribute to an existing field without a full index rebuild — not chased here for a
+  pagination convenience alone), with a second, higher real ceiling (Azure AI Search's own
+  documented 100,000 skip+top limit) as the new, much-further-off refusal point. **Not stale
+  otherwise** — Task 50 already closed the "no filter at all" gap this bullet used to describe
+  (`is_test_fixture` excludes every `test_human_governance.py` fixture row unconditionally, whether
+  or not `--report-ids` scopes a run).
+- **`onepulse-search-dev` is Free tier — a hard 50MB total storage cap — and a full, unscoped
+  re-upload of the real corpus can itself push storage back over that cap, even when the resulting
+  content is unchanged.** Hit live immediately after the pagination fix above: the index's real
+  storage usage was already at ~58.6MB (over the 50MB quota) from a combination of the corpus's real
+  growth and internal segment overhead from several earlier, since-superseded ingest attempts;
+  `merge_or_upload_documents` on the full ~1,422-document corpus failed outright with a genuine
+  `Storage quota has been exceeded` error before writing anything — not a partial or corrupting
+  failure, but a real, hard block on `merge_or_upload_documents` calls that size while over quota.
+  **The real, working recovery, live-confirmed, not a guess:** run `prune_stale_documents` alone
+  first (deletes only, no upload — this is exactly what the existing prune step already does, no new
+  code needed) to reclaim space; it removed 5 genuinely stale documents (two Phase 8 seed reports
+  since reclassified `is_test_fixture`, `report-997`/`998`, plus their 3 finding chunks) and dropped
+  real usage from ~58.6MB to ~27MB — a disproportionately large recovery for 5 documents, consistent
+  with reclaiming accumulated internal overhead, not just their own literal content size. With real
+  headroom confirmed (`SearchIndexClient.get_service_statistics()`), a second full unscoped
+  re-upload attempt **still failed identically** — confirming the constraint is about the *size of
+  the write*, not the corpus's steady-state footprint: re-uploading all ~1,422 documents in one call
+  transiently costs close to double their real footprint (most likely Azure AI Search's own
+  merge-write path holding both the old and new version of each touched document until a background
+  segment merge reclaims the space). **The real fix: scope the upload.** `--report-ids
+  <report_id>` against just the one real report Postgres showed as missing (`report-1172` and its
+  115 real findings — 116 documents, a small write) succeeded cleanly on the first attempt, and a
+  final direct comparison confirmed the index exactly matches Postgres: 1,422 real documents, zero
+  missing, zero stale. **Operational rule going forward, now stated in the script's own module
+  docstring too:** prefer `--report-ids` scoped to whatever changed for routine re-indexing; reserve
+  the unscoped default for a full reconciliation, and check real headroom via
+  `get_service_statistics()` first when doing one.
 - **A new Entra RBAC/app-role assignment does not retroactively affect an already-issued, not-yet-
   expired access token.** Found live during Migration Plan Phase 6 (Task 45): adding core_api's
   `Service.Access` app role and assigning it did not fix BFF's real service-to-service call, which
@@ -573,16 +617,17 @@ core_api's `Service.Access` app role). `ONEPULSE_PG_ROLE`/`ONEPULSE_INVESTIGATIO
 because these containers authenticate via real Managed Identity, confirmed live (see below), not the
 shared `az login` session local `docker compose` containers use.
 
-**How to reach it, as the intended caller (Streamlit):** `.env`'s `ONEPULSE_BFF_BASE_URL` points at
-the real deployed FQDN (`https://onepulse-bff.<environment-default-domain>.azurecontainerapps.io`),
-and `ONEPULSE_BFF_SIGNIN_APP_ID` names the real Entra app registration (`onepulse-bff-signin`) whose
-`access_as_user` delegated scope `api_client.py`'s own `_auth_headers()` acquires a real bearer token
-for on every request, via the same already-authenticated `az login` session every other local script
-in this project uses — not a static token in `.env`. Run Streamlit exactly as before
-(`streamlit run Home.py`); it now talks to real deployed compute instead of local containers, with no
-other code change. A caller whose own machine isn't in `bff`'s IP allow-list, or who hasn't been
-granted the `access_as_user` scope, is correctly refused — see the Easy Auth gotcha above for what
-that setup actually requires.
+**How to reach it, as the real, intended caller (Migration Plan Phase 9/10 — the React frontend, not
+Streamlit, which is retired):** open a browser to the real deployed FQDN
+(`https://onepulse-bff.<environment-default-domain>.azurecontainerapps.io`) directly. `bff` serves
+the built SPA same-origin (§9 below) and Easy Auth gates every `/api/v1/*` route with a real,
+interactive sign-in — an unauthenticated request gets a real `401` and the SPA's own sign-in gate
+renders; there is no separate `.env`/bearer-token configuration to maintain for a human using the
+product this way, unlike the disclosed test-automation technique in §9. A caller whose own machine
+isn't in `bff`'s IP allow-list (a restriction removed for real as of Migration Plan Phase 8's public-
+ingress step — confirmed via `az containerapp ingress show` showing an empty
+`ipSecurityRestrictions`), or who hasn't been provisioned an `actors`/`actor_scope` row, is correctly
+refused with a clean `403 no_access` rather than a crash — see §8 for the real provisioning recipe.
 
 **Warm it before every demo. This is a required step, not a nicety — skipping it means a real
 stakeholder watches a blank screen for the better part of a minute before anything visibly starts.**
@@ -743,9 +788,9 @@ a genuine, disclosed limitation of the dev workflow, not a bug to chase — full
 real same-origin build.
 
 **Testing the real UI without a human completing MFA each time**: Easy Auth accepts a real delegated
-bearer token in the `Authorization` header as an alternative to the cookie (the same mechanism
-`api_client.py` already uses for Streamlit) — but the *shipped app itself* must never do this (see
-above). For external test automation specifically (a real headless browser session, driven the same
+bearer token in the `Authorization` header as an alternative to the cookie — but the *shipped app
+itself* must never do this (see above). For external test automation specifically (a real headless
+browser session, driven the same
 way every prior UI verification in this project has been done), a real token
 (`az account get-access-token --resource "api://<bff-signin-app-id>"`) can be injected via
 `Network.setExtraHTTPHeaders` over the Chrome DevTools Protocol, outside the app's own code entirely —
